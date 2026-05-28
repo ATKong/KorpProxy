@@ -1,0 +1,84 @@
+name: fork-sync
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git + upstream
+        run: |
+          git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/router-for-me/CLIProxyAPI.git
+          git fetch upstream main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Attempt merge
+        id: merge
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "status=uptodate" >> "$GITHUB_OUTPUT"
+            echo "Nothing to sync."
+            exit 0
+          fi
+          branch="sync/upstream-$(date -u +%Y%m%d-%H%M%S)"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          git checkout -B "$branch" origin/main
+          if git merge --no-edit upstream/main; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Go
+        if: steps.merge.outputs.status == 'clean'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build + test
+        if: steps.merge.outputs.status == 'clean'
+        id: verify
+        continue-on-error: true
+        run: |
+          go build ./cmd/server
+          go test ./...
+
+      - name: Push branch + open PR
+        if: steps.merge.outputs.status == 'clean'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push -u origin "${{ steps.merge.outputs.branch }}"
+          gh pr create \
+            --base main \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "sync: merge upstream/main ($(date -u +%Y-%m-%d))" \
+            --body "Automated upstream sync. build/test outcome: ${{ steps.verify.outcome }}. Review before merging; fix any breakage on this branch." \
+            || echo "PR may already exist"
+
+      - name: Flag conflict
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Upstream sync needs manual merge ($(date -u +%Y-%m-%d))" \
+            --body "Auto-merge of upstream/main hit conflicts. Run \`./scripts/sync-upstream.sh\` locally to resolve (rerere remembers resolutions), then push the branch to open a PR." \
+            || echo "issue may already exist"
+          exit 1
