@@ -57,25 +57,30 @@ struct ModelsView: View {
         for m in app.customModels.models {
             guard byID[m.modelID] == nil else { continue }
             let custAnthropic = m.provider == "claude"
+            let fe = FactoryExport.fastEligible(modelID: m.modelID, isAnthropic: custAnthropic)
             byID[m.modelID] = ExportModel(
-                include: false, modelID: m.modelID, displayName: m.displayName,
+                modelID: m.modelID, displayName: m.displayName,
                 isAnthropic: custAnthropic,
                 maxOutputTokens: m.maxCompletionTokens,
                 levels: m.thinkingLevels,
-                fastEligible: FactoryExport.fastEligible(modelID: m.modelID, isAnthropic: custAnthropic),
-                sourceLabel: "Custom")
+                fastEligible: fe,
+                sourceLabel: "Custom",
+                variants: ExportModel.makeVariants(levels: m.thinkingLevels, fastEligible: fe))
             order.append(m.modelID)
         }
         for group in available.groups {
             for sm in group.models where byID[sm.id] == nil {
                 let isAnthropic = (sm.ownedBy?.lowercased().contains("anthropic") ?? false)
                     || sm.id.hasPrefix("claude")
+                let lv = available.levels(for: sm.id) ?? ["low", "medium", "high"]
+                let fe = FactoryExport.fastEligible(modelID: sm.id, isAnthropic: isAnthropic)
                 byID[sm.id] = ExportModel(
-                    include: false, modelID: sm.id, displayName: "",
+                    modelID: sm.id, displayName: "",
                     isAnthropic: isAnthropic, maxOutputTokens: 0,
-                    levels: available.levels(for: sm.id) ?? ["low", "medium", "high"],
-                    fastEligible: FactoryExport.fastEligible(modelID: sm.id, isAnthropic: isAnthropic),
-                    sourceLabel: group.provider)
+                    levels: lv,
+                    fastEligible: fe,
+                    sourceLabel: group.provider,
+                    variants: ExportModel.makeVariants(levels: lv, fastEligible: fe))
                 order.append(sm.id)
             }
         }
@@ -317,7 +322,7 @@ private struct FactoryExportView: View {
     let apiKey: String
 
     @State private var rows: [ExportModel]
-    @State private var includeFast = true
+    @State private var expanded: Set<UUID> = []
     @State private var resultText: String?
     @State private var errorText: String?
 
@@ -327,13 +332,8 @@ private struct FactoryExportView: View {
         _rows = State(initialValue: models)
     }
 
-    private var selectedCount: Int { rows.filter(\.include).count }
-    private var entryCount: Int {
-        rows.filter(\.include).reduce(0) { sum, row in
-            let mult = (includeFast && row.fastEligible) ? 2 : 1
-            return sum + row.baseEntryCount * mult
-        }
-    }
+    private var selectedCount: Int { rows.filter { $0.includedCount > 0 }.count }
+    private var entryCount: Int { rows.reduce(0) { $0 + $1.includedCount } }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -343,16 +343,10 @@ private struct FactoryExportView: View {
                     Spacer()
                     Button("Done") { dismiss() }
                 }
-                Text("Each model is exported once per reasoning level. Factory can’t pick reasoning for custom models, so the level is encoded in the model name (e.g. \u{2026}-4-8(high)) and KorpProxy applies it.")
+                Text("Expand a model and pick exactly which variants to export. Each reasoning level becomes its own Factory entry (the level is encoded in the model name, e.g. \u{2026}-4-8(high)); Fast adds the priority/speed tier for eligible models (Opus 4.6+ · GPT-5.4/5.5).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                Toggle(isOn: $includeFast) {
-                    Text("Add Fast variants (Opus 4.6+ · GPT-5.4/5.5) — doubles those models’ entries with the priority/speed tier")
-                        .font(.caption)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .toggleStyle(.checkbox)
             }
             .padding(14)
             Divider()
@@ -397,46 +391,123 @@ private struct FactoryExportView: View {
             List {
                 ForEach(grouped, id: \.0) { label, indices in
                     Section(label) {
-                        ForEach(indices, id: \.self) { i in
-                            HStack(spacing: 10) {
-                                Toggle("", isOn: $rows[i].include).labelsHidden()
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(rows[i].displayName.isEmpty ? rows[i].modelID : rows[i].displayName)
-                                    Text(rows[i].modelID)
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Text(rows[i].isAnthropic ? "anthropic" : "openai")
-                                    .font(.caption2).foregroundStyle(.tertiary)
-                                if rows[i].levels.isEmpty {
-                                    Text("NO REASONING")
-                                        .font(.caption2.weight(.medium))
-                                        .foregroundStyle(.secondary)
-                                        .padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background(.secondary.opacity(0.12), in: Capsule())
-                                } else {
-                                    ForEach(rows[i].levels, id: \.self) { level in
-                                        Text(level.uppercased())
-                                            .font(.caption2.weight(.medium))
-                                            .padding(.horizontal, 6).padding(.vertical, 2)
-                                            .background(.tint.opacity(0.15), in: Capsule())
-                                    }
-                                }
-                                if rows[i].fastEligible {
-                                    Text("FAST")
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(includeFast ? Color.orange : .secondary)
-                                        .padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background((includeFast ? Color.orange : Color.secondary).opacity(0.15), in: Capsule())
-                                }
-                            }
-                        }
+                        ForEach(indices, id: \.self) { i in modelRow(i) }
                     }
                 }
             }
             .listStyle(.inset)
         }
+    }
+
+    /// One model: a header (master toggle + name + summary) that expands to a
+    /// grid of individually selectable variants.
+    @ViewBuilder private func modelRow(_ i: Int) -> some View {
+        let isOpen = expanded.contains(rows[i].id)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Button { toggleAll(i) } label: {
+                    Image(systemName: masterSymbol(i))
+                        .foregroundStyle(rows[i].includedCount > 0 ? Color.accentColor : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Select or clear every variant for this model")
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(rows[i].displayName.isEmpty ? rows[i].modelID : rows[i].displayName)
+                    Text(rows[i].modelID)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+                Text(rows[i].isAnthropic ? "anthropic" : "openai")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                if rows[i].includedCount > 0 {
+                    Text("\(rows[i].includedCount)/\(rows[i].variants.count)")
+                        .font(.caption2.weight(.medium))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(.tint.opacity(0.18), in: Capsule())
+                }
+                Button { toggleExpanded(rows[i].id) } label: {
+                    Image(systemName: "chevron.right")
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { toggleExpanded(rows[i].id) }
+
+            if isOpen { variantPicker(i) }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// Selectable chips for every variant, split into Reasoning and Fast rows.
+    @ViewBuilder private func variantPicker(_ i: Int) -> some View {
+        let std = rows[i].variants.indices.filter { !rows[i].variants[$0].fast }
+        let fast = rows[i].variants.indices.filter { rows[i].variants[$0].fast }
+        VStack(alignment: .leading, spacing: 6) {
+            chipRow(i, label: "Reasoning", indices: std, accent: .accentColor)
+            if !fast.isEmpty {
+                chipRow(i, label: "Fast", indices: fast, accent: .orange)
+            }
+        }
+        .padding(.leading, 28)
+        .padding(.bottom, 2)
+    }
+
+    @ViewBuilder private func chipRow(_ i: Int, label: String, indices: [Int], accent: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Button { toggleRow(i, indices) } label: {
+                Text(label)
+                    .font(.caption2.weight(.medium))
+                    .frame(width: 66, alignment: .leading)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Toggle all \(label.lowercased()) variants")
+
+            HStack(spacing: 6) {
+                ForEach(indices, id: \.self) { j in
+                    let on = rows[i].variants[j].include
+                    Button { rows[i].variants[j].include.toggle() } label: {
+                        Text(chipLabel(rows[i].variants[j]))
+                            .font(.caption2.weight(.medium))
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .foregroundStyle(on ? Color.white : Color.primary)
+                            .background(on ? accent : Color.secondary.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func chipLabel(_ v: ExportVariant) -> String {
+        (v.level ?? "default").uppercased()
+    }
+
+    private func masterSymbol(_ i: Int) -> String {
+        let c = rows[i].includedCount
+        if c == 0 { return "square" }
+        if c == rows[i].variants.count { return "checkmark.square.fill" }
+        return "minus.square.fill"
+    }
+
+    private func toggleAll(_ i: Int) {
+        let turnOn = rows[i].includedCount == 0
+        for j in rows[i].variants.indices { rows[i].variants[j].include = turnOn }
+        if turnOn { expanded.insert(rows[i].id) }
+    }
+
+    private func toggleRow(_ i: Int, _ indices: [Int]) {
+        let turnOn = !indices.allSatisfy { rows[i].variants[$0].include }
+        for j in indices { rows[i].variants[j].include = turnOn }
+    }
+
+    private func toggleExpanded(_ id: UUID) {
+        if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
     }
 
     /// Row indices grouped by source label, preserving order.
@@ -452,7 +523,7 @@ private struct FactoryExportView: View {
 
     private func runExport() {
         do {
-            let (models, entries, backup) = try FactoryExport.export(rows, includeFast: includeFast, port: port, apiKey: apiKey)
+            let (models, entries, backup) = try FactoryExport.export(rows, port: port, apiKey: apiKey)
             resultText = "Exported \(entries) entries from \(models) model(s). Backup: \(backup.lastPathComponent)"
             errorText = nil
         } catch {

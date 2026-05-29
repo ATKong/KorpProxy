@@ -6,19 +6,43 @@ import Foundation
 /// one entry per reasoning level and encode the level as a `model(level)` suffix
 /// (e.g. `claude-opus-4-8(high)`). KorpProxy's engine reads that suffix and
 /// applies the thinking level regardless of what Factory sends.
+/// One selectable export target: a specific reasoning level (or none) optionally
+/// at the Fast/priority tier. The user picks exactly which of these to export.
+struct ExportVariant: Identifiable, Hashable {
+    let id: String        // stable key, e.g. "high|fast" or "none|std"
+    let level: String?    // nil = no reasoning
+    let fast: Bool
+    var include: Bool
+}
+
 struct ExportModel: Identifiable {
     let id = UUID()
-    var include: Bool
     let modelID: String
     let displayName: String
     let isAnthropic: Bool
     let maxOutputTokens: Int
-    let levels: [String]           // reasoning levels to emit; empty = one no-thinking entry
+    let levels: [String]           // reasoning levels this model accepts
     let fastEligible: Bool         // model supports a Fast/priority tier
     let sourceLabel: String        // "Custom" or provider group (for the sheet)
+    var variants: [ExportVariant]  // every (level × fast) target, each individually selectable
 
-    /// Entries per reasoning level (Fast doubling is applied at export time).
-    var baseEntryCount: Int { max(1, levels.count) }
+    var includedCount: Int { variants.filter(\.include).count }
+
+    /// Builds the full set of selectable variants for a model. Fast twins are
+    /// only offered for fast-eligible models. All start deselected so the user
+    /// opts in to exactly what they want.
+    static func makeVariants(levels: [String], fastEligible: Bool) -> [ExportVariant] {
+        let ordered: [String?] = levels.isEmpty ? [nil] : levels.map { Optional($0) }
+        var out: [ExportVariant] = []
+        for level in ordered {
+            let key = level ?? "none"
+            out.append(ExportVariant(id: "\(key)|std", level: level, fast: false, include: false))
+            if fastEligible {
+                out.append(ExportVariant(id: "\(key)|fast", level: level, fast: true, include: false))
+            }
+        }
+        return out
+    }
 }
 
 /// Writes selected KorpProxy models into ~/.factory/settings.json → customModels,
@@ -97,23 +121,16 @@ enum FactoryExport {
         return d
     }
 
-    /// All Factory entries for one model: one per reasoning level (plus a Fast
-    /// twin for each when the model is fast-eligible and Fast is enabled).
-    static func factoryEntries(_ m: ExportModel, includeFast: Bool, port: Int, apiKey: String) -> [[String: Any]] {
-        let levels: [String?] = m.levels.isEmpty ? [nil] : m.levels.map { Optional($0) }
-        var out: [[String: Any]] = []
-        for level in levels {
-            out.append(entry(m, level: level, fast: false, port: port, apiKey: apiKey))
-            if includeFast && m.fastEligible {
-                out.append(entry(m, level: level, fast: true, port: port, apiKey: apiKey))
-            }
-        }
-        return out
+    /// Factory entries for one model: exactly the variants the user selected.
+    static func factoryEntries(_ m: ExportModel, port: Int, apiKey: String) -> [[String: Any]] {
+        m.variants
+            .filter(\.include)
+            .map { entry(m, level: $0.level, fast: $0.fast, port: port, apiKey: apiKey) }
     }
 
     /// Returns (modelCount, entryCount, backupURL).
     @discardableResult
-    static func export(_ models: [ExportModel], includeFast: Bool, port: Int, apiKey: String) throws -> (Int, Int, URL) {
+    static func export(_ models: [ExportModel], port: Int, apiKey: String) throws -> (Int, Int, URL) {
         let url = settingsURL()
         guard let data = try? Data(contentsOf: url) else { throw ExportError.notFound(url.path) }
         guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
@@ -129,8 +146,8 @@ enum FactoryExport {
         var entries = (root["customModels"] as? [[String: Any]]) ?? []
         entries.removeAll { ($0["id"] as? String)?.hasPrefix("custom:korpproxy:") == true }
 
-        let selected = models.filter(\.include)
-        let added = selected.flatMap { factoryEntries($0, includeFast: includeFast, port: port, apiKey: apiKey) }
+        let selected = models.filter { $0.includedCount > 0 }
+        let added = selected.flatMap { factoryEntries($0, port: port, apiKey: apiKey) }
         entries.append(contentsOf: added)
 
         // Reindex for stable ordering.
