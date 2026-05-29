@@ -13,12 +13,24 @@ struct CustomModel: Codable, Identifiable, Sendable, Hashable {
     var contextLength: Int = 0
     var maxCompletionTokens: Int = 0
     var modelDescription: String = ""
+    /// Discrete reasoning levels the model supports (maps to catalog thinking.levels).
+    var thinkingLevels: [String] = []
 
     var id: UUID { uuid }
 
+    /// Canonical reasoning ladder (low → xhigh), matching Factory's reasoningEffort.
+    static let reasoningLadder = ["low", "medium", "high", "max", "xhigh"]
+
+    /// Levels supported "up to" a chosen effort (e.g. high → [low, medium, high]).
+    static func levels(upTo effort: String) -> [String] {
+        let e = effort.lowercased()
+        guard let idx = reasoningLadder.firstIndex(of: e) else { return e.isEmpty ? [] : [e] }
+        return Array(reasoningLadder[0...idx])
+    }
+
     enum CodingKeys: String, CodingKey {
         case uuid, modelID, provider, displayName, type, ownedBy
-        case contextLength, maxCompletionTokens, modelDescription
+        case contextLength, maxCompletionTokens, modelDescription, thinkingLevels
     }
 
     init(modelID: String, provider: String) {
@@ -38,6 +50,7 @@ struct CustomModel: Codable, Identifiable, Sendable, Hashable {
         contextLength = (try? c.decode(Int.self, forKey: .contextLength)) ?? 0
         maxCompletionTokens = (try? c.decode(Int.self, forKey: .maxCompletionTokens)) ?? 0
         modelDescription = (try? c.decode(String.self, forKey: .modelDescription)) ?? ""
+        thinkingLevels = (try? c.decode([String].self, forKey: .thinkingLevels)) ?? []
     }
 
     /// The catalog entry (matches the engine's ModelInfo JSON keys).
@@ -53,6 +66,7 @@ struct CustomModel: Codable, Identifiable, Sendable, Hashable {
         if !modelDescription.isEmpty { d["description"] = modelDescription }
         if contextLength > 0 { d["context_length"] = contextLength }
         if maxCompletionTokens > 0 { d["max_completion_tokens"] = maxCompletionTokens }
+        if !thinkingLevels.isEmpty { d["thinking"] = ["levels": thinkingLevels] }
         return d
     }
 }
@@ -109,6 +123,20 @@ final class CustomModelsStore {
 
     func remove(_ model: CustomModel) {
         models.removeAll { $0.uuid == model.uuid }
+        save()
+    }
+
+    /// Upsert imported models, matching existing entries by (provider, modelID)
+    /// so re-importing updates in place instead of duplicating.
+    func importModels(_ incoming: [CustomModel]) {
+        for var model in incoming {
+            if let idx = models.firstIndex(where: { $0.provider == model.provider && $0.modelID == model.modelID }) {
+                model.uuid = models[idx].uuid
+                models[idx] = model
+            } else {
+                models.append(model)
+            }
+        }
         save()
     }
 

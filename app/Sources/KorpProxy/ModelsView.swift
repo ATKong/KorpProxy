@@ -8,10 +8,12 @@ struct ModelsView: View {
     private enum ModelSheet: Identifiable {
         case add
         case edit(CustomModel)
+        case importFactory
         var id: String {
             switch self {
             case .add: return "add"
             case .edit(let m): return m.uuid.uuidString
+            case .importFactory: return "import"
             }
         }
     }
@@ -39,6 +41,11 @@ struct ModelsView: View {
                 ModelEditor(existing: nil) { saved in app.customModels.add(saved); applyAndRefresh() }
             case .edit(let model):
                 ModelEditor(existing: model) { saved in app.customModels.add(saved); applyAndRefresh() }
+            case .importFactory:
+                FactoryImportView { imported in
+                    app.customModels.importModels(imported)
+                    applyAndRefresh()
+                }
             }
         }
     }
@@ -118,8 +125,12 @@ struct ModelsView: View {
     }
 
     private var footer: some View {
-        HStack {
+        HStack(spacing: 8) {
             Button { sheet = .add } label: { Label("Add Model", systemImage: "plus") }
+            Button { sheet = .importFactory } label: {
+                Label("Import from Factory", systemImage: "square.and.arrow.down")
+            }
+            .help("Import custom models from ~/.factory/settings.json")
             Spacer()
             Button { applyAndRefresh() } label: { Label("Restart engine", systemImage: "arrow.clockwise") }
                 .help("Re-apply the catalog and restart the engine now")
@@ -178,6 +189,7 @@ private struct ModelEditor: View {
     @State private var contextLength: String
     @State private var maxCompletionTokens: String
     @State private var modelDescription: String
+    @State private var thinkingLevels: Set<String>
 
     init(existing: CustomModel?, onSave: @escaping (CustomModel) -> Void) {
         self.existing = existing
@@ -190,6 +202,7 @@ private struct ModelEditor: View {
         _contextLength = State(initialValue: (existing?.contextLength).flatMap { $0 > 0 ? String($0) : nil } ?? "")
         _maxCompletionTokens = State(initialValue: (existing?.maxCompletionTokens).flatMap { $0 > 0 ? String($0) : nil } ?? "")
         _modelDescription = State(initialValue: existing?.modelDescription ?? "")
+        _thinkingLevels = State(initialValue: Set(existing?.thinkingLevels ?? []))
     }
 
     private var isValid: Bool {
@@ -216,6 +229,22 @@ private struct ModelEditor: View {
                 TextField("Context length", text: $contextLength, prompt: Text("e.g. 200000"))
                 TextField("Max completion tokens", text: $maxCompletionTokens)
                 TextField("Description", text: $modelDescription, axis: .vertical)
+
+                Section("Thinking / reasoning levels") {
+                    HStack(spacing: 6) {
+                        ForEach(CustomModel.reasoningLadder, id: \.self) { level in
+                            let on = thinkingLevels.contains(level)
+                            Button(level) {
+                                if on { thinkingLevels.remove(level) } else { thinkingLevels.insert(level) }
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(on ? .accentColor : .gray)
+                            .controlSize(.small)
+                        }
+                    }
+                    Text("Levels this model accepts. Leave all off for a non-thinking model.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
             }
             .formStyle(.grouped)
 
@@ -229,7 +258,7 @@ private struct ModelEditor: View {
             }
             .padding(12)
         }
-        .frame(width: 460, height: 460)
+        .frame(width: 460, height: 560)
     }
 
     private func save() {
@@ -242,7 +271,109 @@ private struct ModelEditor: View {
         model.contextLength = Int(contextLength.filter(\.isNumber)) ?? 0
         model.maxCompletionTokens = Int(maxCompletionTokens.filter(\.isNumber)) ?? 0
         model.modelDescription = modelDescription
+        model.thinkingLevels = CustomModel.reasoningLadder.filter { thinkingLevels.contains($0) }
         onSave(model)
         dismiss()
+    }
+}
+
+/// Lists models found in ~/.factory/settings.json and imports the selected ones.
+private struct FactoryImportView: View {
+    @Environment(\.dismiss) private var dismiss
+    let onImport: ([CustomModel]) -> Void
+
+    @State private var rows: [Row] = []
+    @State private var errorText: String?
+    @State private var loaded = false
+
+    struct Row: Identifiable {
+        let id = UUID()
+        var include = true
+        let model: CustomModel
+    }
+
+    private var selectedCount: Int { rows.filter(\.include).count }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Import from Factory").font(.headline)
+                Spacer()
+                Button("Cancel") { dismiss() }
+            }
+            .padding(14)
+            Divider()
+            content
+            Divider()
+            HStack {
+                Text(rows.isEmpty ? "" : "\(selectedCount) of \(rows.count) selected")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Import \(selectedCount)") {
+                    onImport(rows.filter(\.include).map(\.model))
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedCount == 0)
+            }
+            .padding(14)
+        }
+        .frame(width: 520, height: 560)
+        .task { load() }
+    }
+
+    @ViewBuilder private var content: some View {
+        if let errorText {
+            ContentUnavailableView {
+                Label("Couldn’t import", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(errorText)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if !loaded {
+            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            List {
+                Section {
+                    ForEach($rows) { $row in
+                        HStack(spacing: 10) {
+                            Toggle("", isOn: $row.include).labelsHidden()
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(row.model.displayName.isEmpty ? row.model.modelID : row.model.displayName)
+                                HStack(spacing: 6) {
+                                    Text(row.model.modelID)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                    Text("→ \(ModelProvider.label(row.model.provider))")
+                                        .font(.caption2).foregroundStyle(.tertiary)
+                                }
+                            }
+                            Spacer()
+                            if let top = row.model.thinkingLevels.last {
+                                Text(top.uppercased())
+                                    .font(.caption2.weight(.medium))
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(.tint.opacity(0.15), in: Capsule())
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Found \(rows.count) custom model(s) in ~/.factory/settings.json. Provider is a best guess — edit any after import.")
+                        .textCase(nil)
+                }
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    private func load() {
+        do {
+            let factory = try FactoryImport.loadFactoryModels()
+            rows = factory.map { Row(model: FactoryImport.toCustomModel($0)) }
+            loaded = true
+        } catch {
+            errorText = error.localizedDescription
+            loaded = true
+        }
     }
 }
