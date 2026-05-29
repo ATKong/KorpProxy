@@ -50,4 +50,21 @@ if [ -n "$BUNDLE_APP" ]; then
   cp "$OUT" "$resources/korpproxy-server"
   chmod +x "$resources/korpproxy-server"
   echo "✓ embedded into $resources/korpproxy-server"
+
+  # The engine is a standalone executable in Resources, which Xcode does NOT
+  # code-sign on its own. For Developer ID + hardened-runtime notarization to
+  # pass, sign it here (before Xcode seals the app). Falls back to ad-hoc ("-")
+  # for local/dev builds. Release builds enable the hardened runtime.
+  # EXPANDED_CODE_SIGN_IDENTITY is the resolved identity (cert SHA for Developer
+  # ID, or "-" for ad-hoc). Prefer it over the human-readable name, which
+  # codesign does not accept as a --sign argument.
+  identity="${EXPANDED_CODE_SIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
+  runtime_flag=""
+  [ "${CONFIGURATION:-}" = "Release" ] && runtime_flag="--options runtime"
+  ts_flag=""
+  [ "$identity" != "-" ] && ts_flag="--timestamp"
+  echo "▸ codesign engine (identity: $identity)"
+  # shellcheck disable=SC2086
+  codesign --force $runtime_flag $ts_flag --sign "$identity" "$resources/korpproxy-server" \
+    && echo "✓ signed engine" || echo "warning: engine codesign failed (continuing)" >&2
 fi

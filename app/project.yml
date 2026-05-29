@@ -10,19 +10,35 @@ settings:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
-    ENABLE_HARDENED_RUNTIME: "NO"
+    # Hardened runtime is required for Developer ID notarization (release builds).
+    ENABLE_HARDENED_RUNTIME: "YES"
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.9.2"
 targets:
   KorpProxy:
     type: application
     platform: macOS
     sources:
       - path: Sources
+    dependencies:
+      - package: Sparkle
     info:
       path: KorpProxy-Info.plist
       properties:
         LSUIElement: true
         CFBundleDisplayName: KorpProxy
-        CFBundleShortVersionString: "0.1.0"
+        # Driven by the build settings so a release tag can bump them in one place.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # Sparkle auto-update. Feed is served from the public releases repo via
+        # GitHub Pages; SUPublicEDKey verifies update signatures (private key is
+        # the SPARKLE_PRIVATE_KEY CI secret).
+        SUFeedURL: "https://atkong.github.io/KorpProxy-releases/appcast.xml"
+        SUPublicEDKey: "Vy+hU7sQEtUWg3I6uIGv6LPhWZ2VpWgrfCXZS7W+z+E="
+        SUEnableAutomaticChecks: true
+        SUScheduledCheckInterval: 86400
     entitlements:
       path: KorpProxy.entitlements
       properties:

@@ -155,6 +155,10 @@ struct MenuContentView: View {
             MenuRow(icon: "folder", title: "Open config folder") {
                 NSWorkspace.shared.open(app.config.baseDir)
             }
+            MenuRow(icon: "arrow.down.circle", title: "Check for Updates…") {
+                app.updater.checkForUpdates()
+            }
+            .disabled(!app.updater.canCheckForUpdates)
             MenuRow(icon: "gearshape", title: "Settings…") { openSettingsWindow() }
             MenuRow(icon: "power", title: "Quit KorpProxy") {
                 NSApplication.shared.terminate(nil)

@@ -39,6 +39,7 @@ final class AppState {
 
     let config = ConfigStore()
     let customModels: CustomModelsStore
+    let updater = UpdaterManager()
 
     @ObservationIgnored
     var proxy: ProxyManager!

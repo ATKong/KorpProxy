@@ -19,6 +19,12 @@ private struct GeneralSettingsView: View {
     @State private var launchAtLogin = LoginItem.isEnabled
     @State private var loginError: String?
 
+    private var appVersion: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return "\(short) (\(build))"
+    }
+
     var body: some View {
         Form {
             Section("Startup") {
@@ -34,6 +40,20 @@ private struct GeneralSettingsView: View {
                     }
                 if let loginError {
                     Text(loginError).font(.caption).foregroundStyle(.red)
+                }
+            }
+
+            Section("Updates") {
+                Toggle("Automatically check for updates", isOn: Binding(
+                    get: { app.updater.automaticallyChecksForUpdates },
+                    set: { app.updater.automaticallyChecksForUpdates = $0 }
+                ))
+                HStack {
+                    Button("Check Now") { app.updater.checkForUpdates() }
+                        .disabled(!app.updater.canCheckForUpdates)
+                    Spacer()
+                    Text("Version \(appVersion)")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
 

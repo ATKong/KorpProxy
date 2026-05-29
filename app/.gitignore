@@ -6,6 +6,15 @@ KorpProxy.entitlements
 # Built engine binary staged for dev runs / bundling
 .engine-bin/
 
+# Sparkle EdDSA private key (export it as the SPARKLE_PRIVATE_KEY CI secret, then
+# keep this local copy out of git). The matching public key lives in project.yml.
+.sparkle_private_key.txt
+
+# Release packaging output + transient appcast (the canonical feed lives in the
+# public KorpProxy-releases repo, not here).
+dist/
+appcast.xml
+
 # Xcode / build artifacts
 build/
 DerivedData/
