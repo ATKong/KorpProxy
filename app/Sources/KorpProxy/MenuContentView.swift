@@ -3,6 +3,7 @@ import SwiftUI
 
 struct MenuContentView: View {
     @Environment(AppState.self) private var app
+    @Environment(\.openSettings) private var openSettings
     @State private var accounts = AccountsModel()
 
     var body: some View {
@@ -143,8 +144,7 @@ struct MenuContentView: View {
                 }
             }
 
-            SettingsLink { MenuRowLabel(icon: "person.2", title: "Manage accounts…") }
-                .buttonStyle(.plain)
+            MenuRow(icon: "person.2", title: "Manage accounts…") { openSettingsWindow() }
         }
     }
 
@@ -155,11 +155,23 @@ struct MenuContentView: View {
             MenuRow(icon: "folder", title: "Open config folder") {
                 NSWorkspace.shared.open(app.config.baseDir)
             }
-            SettingsLink { MenuRowLabel(icon: "gearshape", title: "Settings…") }
-                .buttonStyle(.plain)
+            MenuRow(icon: "gearshape", title: "Settings…") { openSettingsWindow() }
             MenuRow(icon: "power", title: "Quit KorpProxy") {
                 NSApplication.shared.terminate(nil)
             }
+        }
+    }
+
+    /// Opens Settings and brings it to the front. KorpProxy is a menu-bar
+    /// accessory (LSUIElement), so without explicit activation the Settings
+    /// window can open behind whatever app currently has focus.
+    private func openSettingsWindow() {
+        openSettings()
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows
+                .first { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }?
+                .makeKeyAndOrderFront(nil)
         }
     }
 
