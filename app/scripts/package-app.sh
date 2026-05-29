@@ -61,15 +61,40 @@ xcodebuild \
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY="$DEVELOPER_ID_APP" \
   OTHER_CODE_SIGN_FLAGS="--timestamp --options runtime" \
+  CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+  ENABLE_DEBUG_DYLIB=NO \
   clean build
 
 APP="$DERIVED/Build/Products/Release/KorpProxy.app"
 [ -d "$APP" ] || { echo "error: app not found at $APP" >&2; exit 1; }
 
+# ---- re-sign nested code (inside-out) --------------------------------------
+# Xcode/SPM leaves Sparkle's helpers (Updater.app, XPC services) without a
+# secure timestamp, which notarization rejects. Re-sign everything deepest-first
+# with Developer ID + hardened runtime + timestamp, then re-sign the app with
+# our clean entitlements (also drops any injected get-task-allow).
+echo "▸ Re-signing nested code (Developer ID + runtime + timestamp)…"
+FW="$APP/Contents/Frameworks/Sparkle.framework"
+if [ -d "$FW" ]; then
+  V="$FW/Versions/B"; [ -d "$V" ] || V="$FW/Versions/Current"
+  for c in "$V/XPCServices/Downloader.xpc" "$V/XPCServices/Installer.xpc" "$V/Autoupdate" "$V/Updater.app"; do
+    [ -e "$c" ] && codesign --force --options runtime --timestamp \
+      --preserve-metadata=entitlements --sign "$DEVELOPER_ID_APP" "$c"
+  done
+  codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID_APP" "$FW"
+fi
+codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID_APP" \
+  "$APP/Contents/Resources/korpproxy-server"
+codesign --force --options runtime --timestamp \
+  --entitlements "$APP_DIR/KorpProxy.entitlements" --sign "$DEVELOPER_ID_APP" "$APP"
+
 # ---- verify signing --------------------------------------------------------
 echo "▸ Verifying code signature…"
 codesign --verify --deep --strict --verbose=2 "$APP"
 codesign -dvv "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|Runtime" || true
+if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "get-task-allow"; then
+  echo "error: get-task-allow still present on app (would fail notarization)" >&2; exit 1
+fi
 
 # ---- notarize --------------------------------------------------------------
 NOTARIZE_ZIP="$DIST/KorpProxy-notarize.zip"
