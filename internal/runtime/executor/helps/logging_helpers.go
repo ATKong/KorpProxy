@@ -239,6 +239,9 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 // RecordAPIWebsocketHandshake stores the upstream websocket handshake response metadata.
 func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
 	logging.SetResponseHeaders(ctx, headers)
+	// KorpProxy: Codex's x-codex-* usage headers ride on the websocket handshake
+	// response, so capture them here too (independent of RequestLog).
+	recordUsageFromContext(ctx, headers)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}

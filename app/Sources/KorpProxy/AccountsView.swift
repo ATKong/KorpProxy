@@ -18,7 +18,7 @@ struct AccountsView: View {
             model.configure(port: app.config.port, secret: app.config.managementSecret)
             await model.refresh()
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: AccountsModel.usageRefreshInterval)
                 await model.refreshUsage()
             }
         }
@@ -32,14 +32,31 @@ struct AccountsView: View {
             Text("Accounts").font(.headline)
             if model.loading { ProgressView().controlSize(.small) }
             Spacer()
-            Button { Task { await model.refresh() } } label: {
-                Image(systemName: "arrow.clockwise")
+            if let updated = model.lastUsageRefresh {
+                Text("updated \(updatedAgo(updated))")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
-            .help("Refresh")
+            Button { Task { await model.refresh() } } label: {
+                if model.refreshingUsage {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+            .help("Refresh accounts and usage")
+            .disabled(model.refreshingUsage)
             Button { showAdd = true } label: { Label("Add Account", systemImage: "plus") }
                 .disabled(!app.status.isRunning)
         }
         .padding(12)
+    }
+
+    private func updatedAgo(_ date: Date) -> String {
+        let secs = Int(Date().timeIntervalSince(date))
+        if secs < 60 { return "just now" }
+        let m = secs / 60
+        if m < 60 { return "\(m)m ago" }
+        return "\(m / 60)h ago"
     }
 
     @ViewBuilder private var content: some View {

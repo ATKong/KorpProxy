@@ -22,7 +22,7 @@ struct MenuContentView: View {
             guard app.status.isRunning else { return }
             await accounts.refresh()
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: AccountsModel.usageRefreshInterval)
                 await accounts.refreshUsage()
             }
         }

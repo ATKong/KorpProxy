@@ -31,6 +31,13 @@ final class AccountsModel {
 
     /// Usage/limiter info keyed by account name (from GET /usage).
     var usageByName: [String: UsageAccount] = [:]
+    /// True while a usage refresh is in flight (drives the "Refresh now" spinner).
+    var refreshingUsage = false
+    /// When usage was last successfully refreshed, for an "updated Xm ago" hint.
+    var lastUsageRefresh: Date?
+
+    /// How often usage auto-refreshes in the background.
+    static let usageRefreshInterval: Duration = .seconds(300)
 
     // Active OAuth session
     var activeProvider: LoginProvider?
@@ -77,8 +84,11 @@ final class AccountsModel {
     /// Fetch per-account usage/limiter status (best-effort; never surfaces errors).
     func refreshUsage() async {
         guard let client else { return }
+        refreshingUsage = true
+        defer { refreshingUsage = false }
         if let list = try? await client.usageStatus() {
             usageByName = Dictionary(list.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+            lastUsageRefresh = Date()
         }
     }
 
