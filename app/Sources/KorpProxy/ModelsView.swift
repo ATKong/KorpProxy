@@ -57,7 +57,7 @@ struct ModelsView: View {
         for m in app.customModels.models {
             guard byID[m.modelID] == nil else { continue }
             byID[m.modelID] = ExportModel(
-                include: true, modelID: m.modelID, displayName: m.displayName,
+                include: false, modelID: m.modelID, displayName: m.displayName,
                 isAnthropic: m.provider == "claude",
                 maxOutputTokens: m.maxCompletionTokens,
                 levels: m.thinkingLevels, sourceLabel: "Custom")
@@ -68,7 +68,7 @@ struct ModelsView: View {
                 let isAnthropic = (sm.ownedBy?.lowercased().contains("anthropic") ?? false)
                     || sm.id.hasPrefix("claude")
                 byID[sm.id] = ExportModel(
-                    include: true, modelID: sm.id, displayName: "",
+                    include: false, modelID: sm.id, displayName: "",
                     isAnthropic: isAnthropic, maxOutputTokens: 0,
                     levels: available.levels(for: sm.id) ?? ["low", "medium", "high"],
                     sourceLabel: group.provider)
