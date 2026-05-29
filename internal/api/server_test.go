@@ -108,12 +108,20 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
 	}
 
-	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
-	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
-	legacyRR := httptest.NewRecorder()
-	server.engine.ServeHTTP(legacyRR, legacyReq)
-	if legacyRR.Code != http.StatusNotFound {
-		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	// KorpProxy wires /v0/management/usage to the per-account usage-stats handler
+	// (powers the app's usage UI; see commit a27f8779). Upstream leaves /usage
+	// unrouted (404), but the fork serves account stats with 200. It must stay
+	// distinct from the /usage-queue redis queue checked below, which still pops
+	// both records afterward.
+	usageStatsReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	usageStatsReq.Header.Set("Authorization", "Bearer test-management-key")
+	usageStatsRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(usageStatsRR, usageStatsReq)
+	if usageStatsRR.Code != http.StatusOK {
+		t.Fatalf("usage stats status = %d, want %d body=%s", usageStatsRR.Code, http.StatusOK, usageStatsRR.Body.String())
+	}
+	if !strings.Contains(usageStatsRR.Body.String(), `"accounts"`) {
+		t.Fatalf("usage stats body = %s, want accounts payload", usageStatsRR.Body.String())
 	}
 
 	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
