@@ -57,30 +57,27 @@ struct ModelsView: View {
         for m in app.customModels.models {
             guard byID[m.modelID] == nil else { continue }
             let custAnthropic = m.provider == "claude"
-            let fe = FactoryExport.fastEligible(modelID: m.modelID, isAnthropic: custAnthropic)
             byID[m.modelID] = ExportModel(
+                includeStandard: false, includeFast: false,
                 modelID: m.modelID, displayName: m.displayName,
                 isAnthropic: custAnthropic,
                 maxOutputTokens: m.maxCompletionTokens,
-                levels: m.thinkingLevels,
-                fastEligible: fe,
-                sourceLabel: "Custom",
-                variants: ExportModel.makeVariants(levels: m.thinkingLevels, fastEligible: fe))
+                supportsThinking: !m.thinkingLevels.isEmpty,
+                fastEligible: FactoryExport.fastEligible(modelID: m.modelID, isAnthropic: custAnthropic),
+                sourceLabel: "Custom")
             order.append(m.modelID)
         }
         for group in available.groups {
             for sm in group.models where byID[sm.id] == nil {
                 let isAnthropic = (sm.ownedBy?.lowercased().contains("anthropic") ?? false)
                     || sm.id.hasPrefix("claude")
-                let lv = available.levels(for: sm.id) ?? ["low", "medium", "high"]
-                let fe = FactoryExport.fastEligible(modelID: sm.id, isAnthropic: isAnthropic)
                 byID[sm.id] = ExportModel(
+                    includeStandard: false, includeFast: false,
                     modelID: sm.id, displayName: "",
                     isAnthropic: isAnthropic, maxOutputTokens: 0,
-                    levels: lv,
-                    fastEligible: fe,
-                    sourceLabel: group.provider,
-                    variants: ExportModel.makeVariants(levels: lv, fastEligible: fe))
+                    supportsThinking: available.levels(for: sm.id).map { !$0.isEmpty } ?? true,
+                    fastEligible: FactoryExport.fastEligible(modelID: sm.id, isAnthropic: isAnthropic),
+                    sourceLabel: group.provider)
                 order.append(sm.id)
             }
         }
@@ -322,7 +319,6 @@ private struct FactoryExportView: View {
     let apiKey: String
 
     @State private var rows: [ExportModel]
-    @State private var expanded: Set<UUID> = []
     @State private var resultText: String?
     @State private var errorText: String?
 
@@ -332,8 +328,8 @@ private struct FactoryExportView: View {
         _rows = State(initialValue: models)
     }
 
-    private var selectedCount: Int { rows.filter { $0.includedCount > 0 }.count }
-    private var entryCount: Int { rows.reduce(0) { $0 + $1.includedCount } }
+    private var selectedCount: Int { rows.filter(\.isSelected).count }
+    private var entryCount: Int { rows.reduce(0) { $0 + $1.entryCount } }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -343,7 +339,7 @@ private struct FactoryExportView: View {
                     Spacer()
                     Button("Done") { dismiss() }
                 }
-                Text("Expand a model and pick exactly which variants to export. Each reasoning level becomes its own Factory entry (the level is encoded in the model name, e.g. \u{2026}-4-8(high)); Fast adds the priority/speed tier for eligible models (Opus 4.6+ · GPT-5.4/5.5).")
+                Text("One entry per model — pick the reasoning level inside Factory when you use it. Tick Fast to also export a priority/speed-tier copy (Opus 4.6+ · GPT-5.4/5.5).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -399,115 +395,37 @@ private struct FactoryExportView: View {
         }
     }
 
-    /// One model: a header (master toggle + name + summary) that expands to a
-    /// grid of individually selectable variants.
+    /// One model: an include checkbox, name/id, and (for eligible models) a Fast
+    /// checkbox that adds a priority/speed-tier copy. Reasoning is chosen later
+    /// in Factory's own UI, so there is nothing per-level to pick here.
     @ViewBuilder private func modelRow(_ i: Int) -> some View {
-        let isOpen = expanded.contains(rows[i].id)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Button { toggleAll(i) } label: {
-                    Image(systemName: masterSymbol(i))
-                        .foregroundStyle(rows[i].includedCount > 0 ? Color.accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Select or clear every variant for this model")
-
-                VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 10) {
+            Toggle("", isOn: $rows[i].includeStandard).labelsHidden()
+                .help("Export this model")
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
                     Text(rows[i].displayName.isEmpty ? rows[i].modelID : rows[i].displayName)
-                    Text(rows[i].modelID)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                    if rows[i].supportsThinking {
+                        Image(systemName: "brain")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .help("Supports reasoning — choose the level in Factory")
+                    }
                 }
-
-                Spacer()
-                Text(rows[i].isAnthropic ? "anthropic" : "openai")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                if rows[i].includedCount > 0 {
-                    Text("\(rows[i].includedCount)/\(rows[i].variants.count)")
-                        .font(.caption2.weight(.medium))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(.tint.opacity(0.18), in: Capsule())
-                }
-                Button { toggleExpanded(rows[i].id) } label: {
-                    Image(systemName: "chevron.right")
-                        .rotationEffect(.degrees(isOpen ? 90 : 0))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { toggleExpanded(rows[i].id) }
-
-            if isOpen { variantPicker(i) }
-        }
-        .padding(.vertical, 2)
-    }
-
-    /// Selectable chips for every variant, split into Reasoning and Fast rows.
-    @ViewBuilder private func variantPicker(_ i: Int) -> some View {
-        let std = rows[i].variants.indices.filter { !rows[i].variants[$0].fast }
-        let fast = rows[i].variants.indices.filter { rows[i].variants[$0].fast }
-        VStack(alignment: .leading, spacing: 6) {
-            chipRow(i, label: "Reasoning", indices: std, accent: .accentColor)
-            if !fast.isEmpty {
-                chipRow(i, label: "Fast", indices: fast, accent: .orange)
-            }
-        }
-        .padding(.leading, 28)
-        .padding(.bottom, 2)
-    }
-
-    @ViewBuilder private func chipRow(_ i: Int, label: String, indices: [Int], accent: Color) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Button { toggleRow(i, indices) } label: {
-                Text(label)
-                    .font(.caption2.weight(.medium))
-                    .frame(width: 66, alignment: .leading)
+                Text(rows[i].modelID)
+                    .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
-            .help("Toggle all \(label.lowercased()) variants")
-
-            HStack(spacing: 6) {
-                ForEach(indices, id: \.self) { j in
-                    let on = rows[i].variants[j].include
-                    Button { rows[i].variants[j].include.toggle() } label: {
-                        Text(chipLabel(rows[i].variants[j]))
-                            .font(.caption2.weight(.medium))
-                            .padding(.horizontal, 8).padding(.vertical, 3)
-                            .foregroundStyle(on ? Color.white : Color.primary)
-                            .background(on ? accent : Color.secondary.opacity(0.14), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
+            Spacer()
+            Text(rows[i].isAnthropic ? "anthropic" : "openai")
+                .font(.caption2).foregroundStyle(.tertiary)
+            if rows[i].fastEligible {
+                Toggle(isOn: $rows[i].includeFast) { Text("Fast") }
+                    .toggleStyle(.checkbox)
+                    .help("Also export a Fast (priority/speed-tier) copy of this model")
             }
         }
-    }
-
-    private func chipLabel(_ v: ExportVariant) -> String {
-        (v.level ?? "default").uppercased()
-    }
-
-    private func masterSymbol(_ i: Int) -> String {
-        let c = rows[i].includedCount
-        if c == 0 { return "square" }
-        if c == rows[i].variants.count { return "checkmark.square.fill" }
-        return "minus.square.fill"
-    }
-
-    private func toggleAll(_ i: Int) {
-        let turnOn = rows[i].includedCount == 0
-        for j in rows[i].variants.indices { rows[i].variants[j].include = turnOn }
-        if turnOn { expanded.insert(rows[i].id) }
-    }
-
-    private func toggleRow(_ i: Int, _ indices: [Int]) {
-        let turnOn = !indices.allSatisfy { rows[i].variants[$0].include }
-        for j in indices { rows[i].variants[j].include = turnOn }
-    }
-
-    private func toggleExpanded(_ id: UUID) {
-        if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+        .padding(.vertical, 2)
     }
 
     /// Row indices grouped by source label, preserving order.
