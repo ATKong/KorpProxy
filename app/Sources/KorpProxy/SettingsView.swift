@@ -7,6 +7,8 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
             AccountsView()
                 .tabItem { Label("Accounts", systemImage: "person.2") }
+            ModelsView()
+                .tabItem { Label("Models", systemImage: "cube.box") }
         }
         .frame(width: 560, height: 520)
     }

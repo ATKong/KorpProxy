@@ -8,6 +8,9 @@ final class ProxyManager {
     private let config: ConfigStore
     private var process: Process?
 
+    /// Local catalog URL to expose as KORP_MODELS_URL (set before start()).
+    var modelsCatalogURL: String?
+
     init(state: AppState) {
         self.state = state
         self.config = state.config
@@ -48,6 +51,11 @@ final class ProxyManager {
         // config secret-key is bcrypt-compared, which a plaintext value fails.)
         if !config.managementSecret.isEmpty {
             env["MANAGEMENT_PASSWORD"] = config.managementSecret
+        }
+        // Point the engine's model-catalog updater at our local merge server so
+        // user-added models are served on top of the live upstream catalog.
+        if let modelsURL = modelsCatalogURL, !modelsURL.isEmpty {
+            env["KORP_MODELS_URL"] = modelsURL
         }
         proc.environment = env
         // Launch with a writable cwd so any engine relative paths resolve here
