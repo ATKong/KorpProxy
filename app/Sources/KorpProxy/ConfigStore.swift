@@ -13,6 +13,8 @@ final class ConfigStore {
 
     private(set) var port: Int = 8417
     private(set) var managementSecret: String = ""
+    /// First api-key from config.yaml — used to call the engine's /v1/models.
+    private(set) var apiKey: String = ""
 
     init() {
         let support = FileManager.default
@@ -34,6 +36,7 @@ final class ConfigStore {
         managementSecret = Self.loadOrCreateToken(at: mgmtKeyPath)
         ensureDefaultConfig()
         loadPort()
+        loadAPIKey()
     }
 
     private func ensureDefaultConfig() {
@@ -62,6 +65,25 @@ final class ConfigStore {
             if line.hasPrefix("port:") {
                 let value = line.dropFirst("port:".count).trimmingCharacters(in: .whitespaces)
                 if let parsed = Int(value) { port = parsed }
+            }
+        }
+    }
+
+    /// Parse the first entry under `api-keys:` from config.yaml.
+    private func loadAPIKey() {
+        guard let text = try? String(contentsOf: configPath, encoding: .utf8) else { return }
+        var inList = false
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("api-keys:") { inList = true; continue }
+            guard inList else { continue }
+            if line.hasPrefix("- ") {
+                let value = line.dropFirst(2)
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                if !value.isEmpty { apiKey = value; return }
+            } else if !line.isEmpty {
+                return // left the api-keys list
             }
         }
     }

@@ -3,6 +3,7 @@ import SwiftUI
 struct ModelsView: View {
     @Environment(AppState.self) private var app
     @State private var sheet: ModelSheet?
+    @State private var available = AvailableModelsModel()
 
     private enum ModelSheet: Identifiable {
         case add
@@ -17,84 +18,124 @@ struct ModelsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Add cloud models before upstream lists them. KorpProxy serves these on top of the live catalog, then restarts the engine so they're available immediately.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if let url = app.proxy.modelsCatalogURL {
-                    Text("Catalog source: \(url)")
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
-                } else {
-                    Text("Local catalog server unavailable — custom models won’t be served.")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                }
-            }
-            .padding(12)
-
+            explainer
             Divider()
-
-            if app.customModels.models.isEmpty {
-                emptyState
-            } else {
-                List {
-                    ForEach(app.customModels.models) { model in
-                        ModelRow(model: model)
-                            .contentShape(Rectangle())
-                            .onTapGesture { sheet = .edit(model) }
-                            .swipeActions {
-                                Button(role: .destructive) { delete(model) } label: {
-                                    Label("Delete", systemImage: "trash")
-                                }
-                            }
-                    }
-                }
-                .listStyle(.inset)
+            List {
+                availableSection
+                customSection
             }
-
+            .listStyle(.inset)
             Divider()
-            HStack {
-                Button {
-                    sheet = .add
-                } label: {
-                    Label("Add Model", systemImage: "plus")
-                }
-                Spacer()
-                Button {
-                    app.applyCustomModels()
-                } label: {
-                    Label("Restart engine", systemImage: "arrow.clockwise")
-                }
-                .help("Re-apply the catalog and restart the engine now")
-            }
-            .padding(12)
+            footer
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .task {
+            available.configure(port: app.config.port, apiKey: app.config.apiKey)
+            await available.refresh()
         }
         .sheet(item: $sheet) { which in
             switch which {
             case .add:
-                ModelEditor(existing: nil) { saved in app.customModels.add(saved); app.applyCustomModels() }
+                ModelEditor(existing: nil) { saved in app.customModels.add(saved); applyAndRefresh() }
             case .edit(let model):
-                ModelEditor(existing: model) { saved in app.customModels.add(saved); app.applyCustomModels() }
+                ModelEditor(existing: model) { saved in app.customModels.add(saved); applyAndRefresh() }
             }
         }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "cube.box").font(.system(size: 34)).foregroundStyle(.secondary)
-            Text("No custom models").font(.headline)
-            Text("Add a model to serve it before upstream’s catalog includes it.")
-                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+    private var explainer: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Models you can call through KorpProxy. The Available list reflects your logged-in accounts; add Custom models to serve ones upstream hasn’t listed yet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if app.proxy.modelsCatalogURL == nil {
+                Text("Local catalog server unavailable — custom models won’t be served.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(24)
+        .padding(12)
+    }
+
+    @ViewBuilder private var availableSection: some View {
+        Section {
+            if available.loading && available.groups.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading…").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if available.groups.isEmpty {
+                Text(available.errorMessage ?? "No models served yet — add a provider account in the Accounts tab.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(available.groups) { group in
+                    DisclosureGroup {
+                        ForEach(group.models) { model in
+                            Text(model.id)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                    } label: {
+                        HStack {
+                            Text(group.provider).font(.subheadline.weight(.medium))
+                            Spacer()
+                            Text("\(group.models.count)").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        } header: {
+            HStack {
+                Text("Available models\(available.total > 0 ? " (\(available.total))" : "")")
+                Spacer()
+                Button { Task { await available.refresh() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh from the engine")
+            }
+        }
+    }
+
+    @ViewBuilder private var customSection: some View {
+        Section("Custom models") {
+            if app.customModels.models.isEmpty {
+                Text("None yet. Add a model to serve it before upstream’s catalog includes it.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(app.customModels.models) { model in
+                    ModelRow(model: model)
+                        .contentShape(Rectangle())
+                        .onTapGesture { sheet = .edit(model) }
+                        .swipeActions {
+                            Button(role: .destructive) { delete(model) } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                }
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack {
+            Button { sheet = .add } label: { Label("Add Model", systemImage: "plus") }
+            Spacer()
+            Button { applyAndRefresh() } label: { Label("Restart engine", systemImage: "arrow.clockwise") }
+                .help("Re-apply the catalog and restart the engine now")
+        }
+        .padding(12)
+    }
+
+    private func applyAndRefresh() {
+        app.applyCustomModels()
+        // Engine restart takes a few seconds; refresh the live list afterwards.
+        Task { try? await Task.sleep(for: .seconds(4)); await available.refresh() }
     }
 
     private func delete(_ model: CustomModel) {
         app.customModels.remove(model)
-        app.applyCustomModels()
+        applyAndRefresh()
     }
 }
 
