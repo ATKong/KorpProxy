@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagestats"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -25,6 +26,7 @@ const (
 	apiResponseKey          = "API_RESPONSE"
 	apiWebsocketTimelineKey = "API_WEBSOCKET_TIMELINE"
 	creditsUsedKey          = "__antigravity_credits_used__"
+	korpAuthIDKey           = "KORP_UPSTREAM_AUTH_ID"
 )
 
 // UpstreamRequestLog captures the outbound upstream request details for logging.
@@ -55,6 +57,13 @@ type upstreamAttempt struct {
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	// KorpProxy: remember which account served this attempt so the response
+	// handler can attribute captured usage headers (independent of RequestLog).
+	if gc := ginContextFrom(ctx); gc != nil {
+		if id := strings.TrimSpace(info.AuthID); id != "" {
+			gc.Set(korpAuthIDKey, id)
+		}
+	}
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -103,6 +112,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 // RecordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
 	logging.SetResponseHeaders(ctx, headers)
+	recordUsageFromContext(ctx, headers)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -334,6 +344,22 @@ func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage stri
 func ginContextFrom(ctx context.Context) *gin.Context {
 	ginCtx, _ := ctx.Value("gin").(*gin.Context)
 	return ginCtx
+}
+
+// recordUsageFromContext captures provider rate-limit/usage headers for the
+// account that served the latest upstream attempt (KorpProxy-specific).
+func recordUsageFromContext(ctx context.Context, headers http.Header) {
+	gc := ginContextFrom(ctx)
+	if gc == nil {
+		return
+	}
+	value, ok := gc.Get(korpAuthIDKey)
+	if !ok {
+		return
+	}
+	if authID, _ := value.(string); authID != "" {
+		usagestats.RecordFromHeaders(authID, headers)
+	}
 }
 
 func getAttempts(ginCtx *gin.Context) []*upstreamAttempt {

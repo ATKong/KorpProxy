@@ -106,6 +106,21 @@ struct ManagementClient {
         let putBody = try JSONSerialization.data(withJSONObject: list)
         try await request("/" + segment, method: "PUT", body: putBody)
     }
+
+    // MARK: Usage
+
+    /// Per-account usage + limiter status (engine quota plus captured provider
+    /// 5h/weekly windows).
+    func usageStatus() async throws -> [UsageAccount] {
+        let data = try await request("/usage")
+        return try JSONDecoder().decode(UsageStatusResponse.self, from: data).accounts
+    }
+
+    /// Fire a tiny request per Claude account to refresh captured usage now.
+    @discardableResult
+    func probeUsage() async throws -> Data {
+        try await request("/usage-probe", method: "POST")
+    }
 }
 
 // MARK: - Models
@@ -147,4 +162,64 @@ struct OAuthStart: Decodable {
 struct OAuthStatus: Decodable {
     let status: String   // "wait" | "ok" | "error"
     let error: String?
+}
+
+// MARK: - Usage models
+
+/// One rolling rate-limit window (e.g. Anthropic 5-hour or weekly).
+struct UsageWindow: Decodable, Hashable {
+    let utilization: Double      // fraction 0…1 (may exceed 1 on overage)
+    let reset: Int64?            // unix epoch seconds when the window resets
+    let status: String?
+}
+
+/// Captured provider usage snapshot for an account.
+struct AccountUsage: Decodable, Hashable {
+    let fiveHour: UsageWindow?
+    let sevenDay: UsageWindow?
+    let overallStatus: String?
+    let representativeClaim: String?
+    let updatedAt: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case fiveHour = "five_hour"
+        case sevenDay = "seven_day"
+        case overallStatus = "overall_status"
+        case representativeClaim = "representative_claim"
+        case updatedAt = "updated_at"
+    }
+
+    var hasData: Bool { fiveHour != nil || sevenDay != nil }
+}
+
+/// The engine's own limiter state for an account.
+struct QuotaInfo: Decodable, Hashable {
+    let exceeded: Bool?
+    let reason: String?
+    let nextRecoverAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case exceeded, reason
+        case nextRecoverAt = "next_recover_at"
+    }
+}
+
+/// Per-account usage entry from `GET /v0/management/usage`.
+struct UsageAccount: Decodable, Identifiable, Hashable {
+    var id: String { name }
+    let name: String
+    let provider: String?
+    let status: String?
+    let disabled: Bool?
+    let unavailable: Bool?
+    let quota: QuotaInfo?
+    let usage: AccountUsage?
+
+    var isRateLimited: Bool {
+        (unavailable == true) || (quota?.exceeded == true)
+    }
+}
+
+struct UsageStatusResponse: Decodable {
+    let accounts: [UsageAccount]
 }

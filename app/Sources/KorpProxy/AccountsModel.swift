@@ -29,6 +29,10 @@ final class AccountsModel {
     var loading = false
     var errorMessage: String?
 
+    /// Usage/limiter info keyed by account name (from GET /usage).
+    var usageByName: [String: UsageAccount] = [:]
+    var probing = false
+
     // Active OAuth session
     var activeProvider: LoginProvider?
     var authURL: URL?
@@ -68,6 +72,28 @@ final class AccountsModel {
             errorMessage = error.localizedDescription
         }
         loading = false
+        await refreshUsage()
+    }
+
+    /// Fetch per-account usage/limiter status (best-effort; never surfaces errors).
+    func refreshUsage() async {
+        guard let client else { return }
+        if let list = try? await client.usageStatus() {
+            usageByName = Dictionary(list.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+    }
+
+    /// Trigger a live probe of Claude accounts, then refresh usage.
+    func probe() async {
+        guard let client, !probing else { return }
+        probing = true
+        _ = try? await client.probeUsage()
+        await refreshUsage()
+        probing = false
+    }
+
+    func usage(for account: Account) -> UsageAccount? {
+        usageByName[account.name]
     }
 
     func delete(_ account: Account) async {
