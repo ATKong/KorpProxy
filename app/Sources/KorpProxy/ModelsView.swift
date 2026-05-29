@@ -8,12 +8,12 @@ struct ModelsView: View {
     private enum ModelSheet: Identifiable {
         case add
         case edit(CustomModel)
-        case importFactory
+        case exportFactory
         var id: String {
             switch self {
             case .add: return "add"
             case .edit(let m): return m.uuid.uuidString
-            case .importFactory: return "import"
+            case .exportFactory: return "export"
             }
         }
     }
@@ -41,13 +41,40 @@ struct ModelsView: View {
                 ModelEditor(existing: nil) { saved in app.customModels.add(saved); applyAndRefresh() }
             case .edit(let model):
                 ModelEditor(existing: model) { saved in app.customModels.add(saved); applyAndRefresh() }
-            case .importFactory:
-                FactoryImportView { imported in
-                    app.customModels.importModels(imported)
-                    applyAndRefresh()
-                }
+            case .exportFactory:
+                FactoryExportView(models: exportModels(),
+                                  port: app.config.port,
+                                  apiKey: app.config.apiKey)
             }
         }
+    }
+
+    /// Build the export list: custom models (with thinking levels) first, then
+    /// available models, de-duplicated by model id.
+    private func exportModels() -> [ExportModel] {
+        var byID: [String: ExportModel] = [:]
+        var order: [String] = []
+        for m in app.customModels.models {
+            guard byID[m.modelID] == nil else { continue }
+            byID[m.modelID] = ExportModel(
+                include: true, modelID: m.modelID, displayName: m.displayName,
+                isAnthropic: m.provider == "claude",
+                maxOutputTokens: m.maxCompletionTokens,
+                reasoningEffort: m.thinkingLevels.last, sourceLabel: "Custom")
+            order.append(m.modelID)
+        }
+        for group in available.groups {
+            for sm in group.models where byID[sm.id] == nil {
+                let isAnthropic = (sm.ownedBy?.lowercased().contains("anthropic") ?? false)
+                    || sm.id.hasPrefix("claude")
+                byID[sm.id] = ExportModel(
+                    include: true, modelID: sm.id, displayName: "",
+                    isAnthropic: isAnthropic, maxOutputTokens: 0,
+                    reasoningEffort: "high", sourceLabel: group.provider)
+                order.append(sm.id)
+            }
+        }
+        return order.compactMap { byID[$0] }
     }
 
     private var explainer: some View {
@@ -127,10 +154,10 @@ struct ModelsView: View {
     private var footer: some View {
         HStack(spacing: 8) {
             Button { sheet = .add } label: { Label("Add Model", systemImage: "plus") }
-            Button { sheet = .importFactory } label: {
-                Label("Import from Factory", systemImage: "square.and.arrow.down")
+            Button { sheet = .exportFactory } label: {
+                Label("Export to Factory", systemImage: "square.and.arrow.up")
             }
-            .help("Import custom models from ~/.factory/settings.json")
+            .help("Write these models into ~/.factory/settings.json (pointed at KorpProxy)")
             Spacer()
             Button { applyAndRefresh() } label: { Label("Restart engine", systemImage: "arrow.clockwise") }
                 .help("Re-apply the catalog and restart the engine now")
@@ -277,19 +304,21 @@ private struct ModelEditor: View {
     }
 }
 
-/// Lists models found in ~/.factory/settings.json and imports the selected ones.
-private struct FactoryImportView: View {
+/// Lets the user pick KorpProxy models and write them into Factory's
+/// customModels (pointed at the local KorpProxy server).
+private struct FactoryExportView: View {
     @Environment(\.dismiss) private var dismiss
-    let onImport: ([CustomModel]) -> Void
+    let port: Int
+    let apiKey: String
 
-    @State private var rows: [Row] = []
+    @State private var rows: [ExportModel]
+    @State private var resultText: String?
     @State private var errorText: String?
-    @State private var loaded = false
 
-    struct Row: Identifiable {
-        let id = UUID()
-        var include = true
-        let model: CustomModel
+    init(models: [ExportModel], port: Int, apiKey: String) {
+        self.port = port
+        self.apiKey = apiKey
+        _rows = State(initialValue: models)
     }
 
     private var selectedCount: Int { rows.filter(\.include).count }
@@ -297,83 +326,99 @@ private struct FactoryImportView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Import from Factory").font(.headline)
+                Text("Export to Factory").font(.headline)
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Done") { dismiss() }
             }
             .padding(14)
             Divider()
             content
             Divider()
             HStack {
-                Text(rows.isEmpty ? "" : "\(selectedCount) of \(rows.count) selected")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text(statusLine)
+                    .font(.caption)
+                    .foregroundStyle(resultText != nil ? Color.green : .secondary)
                 Spacer()
-                Button("Import \(selectedCount)") {
-                    onImport(rows.filter(\.include).map(\.model))
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(selectedCount == 0)
+                Button("Export \(selectedCount)") { runExport() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedCount == 0)
             }
             .padding(14)
         }
-        .frame(width: 520, height: 560)
-        .task { load() }
+        .frame(width: 540, height: 580)
+    }
+
+    private var statusLine: String {
+        if let resultText { return resultText }
+        if rows.isEmpty { return "Nothing to export." }
+        return "\(selectedCount) of \(rows.count) selected → 127.0.0.1:\(port)"
     }
 
     @ViewBuilder private var content: some View {
         if let errorText {
             ContentUnavailableView {
-                Label("Couldn’t import", systemImage: "exclamationmark.triangle")
+                Label("Couldn’t export", systemImage: "exclamationmark.triangle")
             } description: {
                 Text(errorText)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if !loaded {
-            ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if rows.isEmpty {
+            ContentUnavailableView {
+                Label("Nothing to export", systemImage: "tray")
+            } description: {
+                Text("Add a custom model or log in to an account first.")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List {
-                Section {
-                    ForEach($rows) { $row in
-                        HStack(spacing: 10) {
-                            Toggle("", isOn: $row.include).labelsHidden()
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(row.model.displayName.isEmpty ? row.model.modelID : row.model.displayName)
-                                HStack(spacing: 6) {
-                                    Text(row.model.modelID)
+                ForEach(grouped, id: \.0) { label, indices in
+                    Section(label) {
+                        ForEach(indices, id: \.self) { i in
+                            HStack(spacing: 10) {
+                                Toggle("", isOn: $rows[i].include).labelsHidden()
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(rows[i].displayName.isEmpty ? rows[i].modelID : rows[i].displayName)
+                                    Text(rows[i].modelID)
                                         .font(.system(.caption, design: .monospaced))
                                         .foregroundStyle(.secondary)
-                                    Text("→ \(ModelProvider.label(row.model.provider))")
-                                        .font(.caption2).foregroundStyle(.tertiary)
                                 }
-                            }
-                            Spacer()
-                            if let top = row.model.thinkingLevels.last {
-                                Text(top.uppercased())
-                                    .font(.caption2.weight(.medium))
-                                    .padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(.tint.opacity(0.15), in: Capsule())
+                                Spacer()
+                                Text(rows[i].isAnthropic ? "anthropic" : "openai")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                                if let effort = rows[i].reasoningEffort {
+                                    Text(effort.uppercased())
+                                        .font(.caption2.weight(.medium))
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(.tint.opacity(0.15), in: Capsule())
+                                }
                             }
                         }
                     }
-                } header: {
-                    Text("Found \(rows.count) custom model(s) in ~/.factory/settings.json. Provider is a best guess — edit any after import.")
-                        .textCase(nil)
                 }
             }
             .listStyle(.inset)
         }
     }
 
-    private func load() {
+    /// Row indices grouped by source label, preserving order.
+    private var grouped: [(String, [Int])] {
+        var order: [String] = []
+        var map: [String: [Int]] = [:]
+        for (i, row) in rows.enumerated() {
+            if map[row.sourceLabel] == nil { order.append(row.sourceLabel) }
+            map[row.sourceLabel, default: []].append(i)
+        }
+        return order.map { ($0, map[$0]!) }
+    }
+
+    private func runExport() {
         do {
-            let factory = try FactoryImport.loadFactoryModels()
-            rows = factory.map { Row(model: FactoryImport.toCustomModel($0)) }
-            loaded = true
+            let (count, backup) = try FactoryExport.export(rows, port: port, apiKey: apiKey)
+            resultText = "Exported \(count) model(s). Backup: \(backup.lastPathComponent)"
+            errorText = nil
         } catch {
             errorText = error.localizedDescription
-            loaded = true
+            resultText = nil
         }
     }
 }

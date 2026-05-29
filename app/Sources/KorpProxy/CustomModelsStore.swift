@@ -126,20 +126,6 @@ final class CustomModelsStore {
         save()
     }
 
-    /// Upsert imported models, matching existing entries by (provider, modelID)
-    /// so re-importing updates in place instead of duplicating.
-    func importModels(_ incoming: [CustomModel]) {
-        for var model in incoming {
-            if let idx = models.firstIndex(where: { $0.provider == model.provider && $0.modelID == model.modelID }) {
-                model.uuid = models[idx].uuid
-                models[idx] = model
-            } else {
-                models.append(model)
-            }
-        }
-        save()
-    }
-
     private func load() {
         guard let data = try? Data(contentsOf: fileURL),
               let decoded = try? JSONDecoder().decode([CustomModel].self, from: data) else { return }
