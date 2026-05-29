@@ -60,7 +60,7 @@ struct ModelsView: View {
                 include: true, modelID: m.modelID, displayName: m.displayName,
                 isAnthropic: m.provider == "claude",
                 maxOutputTokens: m.maxCompletionTokens,
-                reasoningEffort: m.thinkingLevels.last, sourceLabel: "Custom")
+                levels: m.thinkingLevels, sourceLabel: "Custom")
             order.append(m.modelID)
         }
         for group in available.groups {
@@ -70,7 +70,7 @@ struct ModelsView: View {
                 byID[sm.id] = ExportModel(
                     include: true, modelID: sm.id, displayName: "",
                     isAnthropic: isAnthropic, maxOutputTokens: 0,
-                    reasoningEffort: "high", sourceLabel: group.provider)
+                    levels: ["low", "medium", "high"], sourceLabel: group.provider)
                 order.append(sm.id)
             }
         }
@@ -322,13 +322,20 @@ private struct FactoryExportView: View {
     }
 
     private var selectedCount: Int { rows.filter(\.include).count }
+    private var entryCount: Int { rows.filter(\.include).reduce(0) { $0 + $1.entryCount } }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("Export to Factory").font(.headline)
-                Spacer()
-                Button("Done") { dismiss() }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Export to Factory").font(.headline)
+                    Spacer()
+                    Button("Done") { dismiss() }
+                }
+                Text("Each model is exported once per reasoning level. Factory can’t pick reasoning for custom models, so the level is encoded in the model name (e.g. \u{2026}-4-8(high)) and KorpProxy applies it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(14)
             Divider()
@@ -339,7 +346,7 @@ private struct FactoryExportView: View {
                     .font(.caption)
                     .foregroundStyle(resultText != nil ? Color.green : .secondary)
                 Spacer()
-                Button("Export \(selectedCount)") { runExport() }
+                Button("Export \(entryCount) entries") { runExport() }
                     .buttonStyle(.borderedProminent)
                     .disabled(selectedCount == 0)
             }
@@ -351,7 +358,7 @@ private struct FactoryExportView: View {
     private var statusLine: String {
         if let resultText { return resultText }
         if rows.isEmpty { return "Nothing to export." }
-        return "\(selectedCount) of \(rows.count) selected → 127.0.0.1:\(port)"
+        return "\(selectedCount) of \(rows.count) models · \(entryCount) entries → 127.0.0.1:\(port)"
     }
 
     @ViewBuilder private var content: some View {
@@ -385,11 +392,19 @@ private struct FactoryExportView: View {
                                 Spacer()
                                 Text(rows[i].isAnthropic ? "anthropic" : "openai")
                                     .font(.caption2).foregroundStyle(.tertiary)
-                                if let effort = rows[i].reasoningEffort {
-                                    Text(effort.uppercased())
+                                if rows[i].levels.isEmpty {
+                                    Text("NO REASONING")
                                         .font(.caption2.weight(.medium))
+                                        .foregroundStyle(.secondary)
                                         .padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background(.tint.opacity(0.15), in: Capsule())
+                                        .background(.secondary.opacity(0.12), in: Capsule())
+                                } else {
+                                    ForEach(rows[i].levels, id: \.self) { level in
+                                        Text(level.uppercased())
+                                            .font(.caption2.weight(.medium))
+                                            .padding(.horizontal, 6).padding(.vertical, 2)
+                                            .background(.tint.opacity(0.15), in: Capsule())
+                                    }
                                 }
                             }
                         }
@@ -413,8 +428,8 @@ private struct FactoryExportView: View {
 
     private func runExport() {
         do {
-            let (count, backup) = try FactoryExport.export(rows, port: port, apiKey: apiKey)
-            resultText = "Exported \(count) model(s). Backup: \(backup.lastPathComponent)"
+            let (models, entries, backup) = try FactoryExport.export(rows, port: port, apiKey: apiKey)
+            resultText = "Exported \(entries) entries from \(models) model(s). Backup: \(backup.lastPathComponent)"
             errorText = nil
         } catch {
             errorText = error.localizedDescription

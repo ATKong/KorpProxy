@@ -1,6 +1,11 @@
 import Foundation
 
 /// A KorpProxy model selected for export into Factory's customModels.
+///
+/// Factory has no reasoning-effort picker for custom (BYOK) models, so we emit
+/// one entry per reasoning level and encode the level as a `model(level)` suffix
+/// (e.g. `claude-opus-4-8(high)`). KorpProxy's engine reads that suffix and
+/// applies the thinking level regardless of what Factory sends.
 struct ExportModel: Identifiable {
     let id = UUID()
     var include: Bool
@@ -8,8 +13,11 @@ struct ExportModel: Identifiable {
     let displayName: String
     let isAnthropic: Bool
     let maxOutputTokens: Int
-    let reasoningEffort: String?   // nil = no thinking
+    let levels: [String]           // reasoning levels to emit; empty = one no-thinking entry
     let sourceLabel: String        // "Custom" or provider group (for the sheet)
+
+    /// Number of Factory entries this model expands into.
+    var entryCount: Int { max(1, levels.count) }
 }
 
 /// Writes selected KorpProxy models into ~/.factory/settings.json → customModels,
@@ -39,26 +47,42 @@ enum FactoryExport {
         return out.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
     }
 
-    static func entry(_ m: ExportModel, port: Int, apiKey: String) -> [String: Any] {
+    /// One Factory customModel entry. `level == nil` emits a plain, no-thinking
+    /// entry; otherwise the level is encoded as a `model(level)` suffix that the
+    /// engine reads to set the reasoning effort.
+    static func entry(_ m: ExportModel, level: String?, port: Int, apiKey: String) -> [String: Any] {
         let baseURL = m.isAnthropic ? "http://localhost:\(port)" : "http://localhost:\(port)/v1"
         let name = m.displayName.isEmpty ? m.modelID : m.displayName
-        return [
-            "model": m.modelID,
-            "id": "custom:korpproxy:\(slug(m.modelID))",
+        let modelField = level.map { "\(m.modelID)(\($0))" } ?? m.modelID
+        let idSuffix = level.map { "-\($0)" } ?? ""
+        let display = level.map { "KorpProxy: \(name) · \($0)" } ?? "KorpProxy: \(name)"
+        var d: [String: Any] = [
+            "model": modelField,
+            "id": "custom:korpproxy:\(slug(m.modelID))\(idSuffix)",
             "baseUrl": baseURL,
             "apiKey": apiKey.isEmpty ? "dummy-not-used" : apiKey,
-            "displayName": "KorpProxy: \(name)",
-            "enableThinking": m.reasoningEffort != nil,
+            "displayName": display,
+            "enableThinking": level != nil,
             "maxOutputTokens": m.maxOutputTokens > 0 ? m.maxOutputTokens : 64000,
-            "reasoningEffort": m.reasoningEffort ?? "high",
             "noImageSupport": false,
             "provider": m.isAnthropic ? "anthropic" : "openai",
         ]
+        // Kept for when Factory adds native reasoning support for custom models;
+        // today the engine derives the level from the model-name suffix instead.
+        if let level { d["reasoningEffort"] = level }
+        return d
     }
 
-    /// Returns (exportedCount, backupURL).
+    /// All Factory entries for one model: one per reasoning level, or a single
+    /// plain entry when the model has no levels.
+    static func factoryEntries(_ m: ExportModel, port: Int, apiKey: String) -> [[String: Any]] {
+        guard !m.levels.isEmpty else { return [entry(m, level: nil, port: port, apiKey: apiKey)] }
+        return m.levels.map { entry(m, level: $0, port: port, apiKey: apiKey) }
+    }
+
+    /// Returns (modelCount, entryCount, backupURL).
     @discardableResult
-    static func export(_ models: [ExportModel], port: Int, apiKey: String) throws -> (Int, URL) {
+    static func export(_ models: [ExportModel], port: Int, apiKey: String) throws -> (Int, Int, URL) {
         let url = settingsURL()
         guard let data = try? Data(contentsOf: url) else { throw ExportError.notFound(url.path) }
         guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
@@ -75,7 +99,8 @@ enum FactoryExport {
         entries.removeAll { ($0["id"] as? String)?.hasPrefix("custom:korpproxy:") == true }
 
         let selected = models.filter(\.include)
-        entries.append(contentsOf: selected.map { entry($0, port: port, apiKey: apiKey) })
+        let added = selected.flatMap { factoryEntries($0, port: port, apiKey: apiKey) }
+        entries.append(contentsOf: added)
 
         // Reindex for stable ordering.
         for i in entries.indices { entries[i]["index"] = i }
@@ -83,7 +108,7 @@ enum FactoryExport {
 
         let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
         try out.write(to: url, options: .atomic)
-        return (selected.count, backupURL)
+        return (selected.count, added.count, backupURL)
     }
 
     private static func backupStamp() -> String {
