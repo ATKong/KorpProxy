@@ -31,8 +31,21 @@ final class AvailableModelsModel {
     private(set) var loading = false
     var errorMessage: String?
 
+    /// Reasoning levels per model id, read from the engine's model catalog
+    /// (models.json `thinking.levels`). Lets the export surface each model's
+    /// real ladder (e.g. Opus → low/medium/high/xhigh/max). Empty until fetched.
+    private(set) var levelsByID: [String: [String]] = [:]
+
     @ObservationIgnored private var port = 8417
     @ObservationIgnored private var apiKey = ""
+    @ObservationIgnored private var catalogFetchedAt: Date?
+
+    /// The same catalog the LocalModelsServer serves; source of truth for the
+    /// reasoning levels each model actually supports.
+    private static let catalogURLs = [
+        URL(string: "https://raw.githubusercontent.com/router-for-me/models/refs/heads/main/models.json")!,
+        URL(string: "https://models.router-for.me/models.json")!,
+    ]
 
     func configure(port: Int, apiKey: String) {
         self.port = port
@@ -46,6 +59,8 @@ final class AvailableModelsModel {
         }
         loading = true
         defer { loading = false }
+
+        await loadCatalogLevels()
 
         var req = URLRequest(url: url)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -65,6 +80,46 @@ final class AvailableModelsModel {
         } catch {
             errorMessage = error.localizedDescription
             groups = []; total = 0
+        }
+    }
+
+    /// Catalog reasoning levels for a model id, if the catalog lists any.
+    func levels(for id: String) -> [String]? {
+        guard let levels = levelsByID[id], !levels.isEmpty else { return nil }
+        return levels
+    }
+
+    /// Fetch the model catalog (models.json) and index `thinking.levels` by id.
+    /// Best-effort and lightly cached: a failure leaves any prior map intact.
+    private func loadCatalogLevels() async {
+        let fresh = catalogFetchedAt.map { Date().timeIntervalSince($0) < 1800 } ?? false
+        if fresh && !levelsByID.isEmpty { return }
+
+        let allowed: Set<String> = ["minimal", "low", "medium", "high", "xhigh", "max"]
+        for url in Self.catalogURLs {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 12
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            else { continue }
+
+            var map: [String: [String]] = [:]
+            for (_, value) in root {
+                guard let arr = value as? [[String: Any]] else { continue }
+                for model in arr {
+                    guard let id = model["id"] as? String,
+                          let thinking = model["thinking"] as? [String: Any],
+                          let levels = thinking["levels"] as? [String] else { continue }
+                    let filtered = levels.filter { allowed.contains($0.lowercased()) }
+                    if !filtered.isEmpty { map[id] = filtered }
+                }
+            }
+            if !map.isEmpty {
+                levelsByID = map
+                catalogFetchedAt = Date()
+                return
+            }
         }
     }
 

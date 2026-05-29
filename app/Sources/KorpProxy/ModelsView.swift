@@ -70,7 +70,8 @@ struct ModelsView: View {
                 byID[sm.id] = ExportModel(
                     include: true, modelID: sm.id, displayName: "",
                     isAnthropic: isAnthropic, maxOutputTokens: 0,
-                    levels: ["low", "medium", "high"], sourceLabel: group.provider)
+                    levels: available.levels(for: sm.id) ?? ["low", "medium", "high"],
+                    sourceLabel: group.provider)
                 order.append(sm.id)
             }
         }
