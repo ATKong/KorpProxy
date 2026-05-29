@@ -138,7 +138,12 @@ if [ -z "$SPARKLE_BIN" ] || [ ! -x "$SPARKLE_BIN/sign_update" ]; then
 fi
 
 if [ -n "${SPARKLE_PRIVATE_KEY:-}" ]; then
-  SIGOUT="$("$SPARKLE_BIN/sign_update" -s "$SPARKLE_PRIVATE_KEY" "$ZIP")"
+  # Sparkle 2.9+ removed `-s <key>`; write the key to a temp file and pass
+  # --ed-key-file. Locally (no env key) sign_update reads the login keychain.
+  KEYFILE="$(mktemp)"
+  printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEYFILE"
+  SIGOUT="$("$SPARKLE_BIN/sign_update" --ed-key-file "$KEYFILE" "$ZIP")"
+  rm -f "$KEYFILE"
 else
   SIGOUT="$("$SPARKLE_BIN/sign_update" "$ZIP")"   # uses login keychain
 fi
