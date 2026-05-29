@@ -115,12 +115,6 @@ struct ManagementClient {
         let data = try await request("/usage")
         return try JSONDecoder().decode(UsageStatusResponse.self, from: data).accounts
     }
-
-    /// Fire a tiny request per Claude account to refresh captured usage now.
-    @discardableResult
-    func probeUsage() async throws -> Data {
-        try await request("/usage-probe", method: "POST")
-    }
 }
 
 // MARK: - Models

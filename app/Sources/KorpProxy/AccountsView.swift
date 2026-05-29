@@ -17,6 +17,10 @@ struct AccountsView: View {
         .task {
             model.configure(port: app.config.port, secret: app.config.managementSecret)
             await model.refresh()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                await model.refreshUsage()
+            }
         }
         .sheet(isPresented: $showAdd) {
             AddAccountSheet(model: model)
@@ -45,7 +49,9 @@ struct AccountsView: View {
         } else {
             List {
                 ForEach(model.accounts) { account in
-                    AccountRow(account: account) { Task { await model.delete(account) } }
+                    AccountRow(account: account, usage: model.usage(for: account)) {
+                        Task { await model.delete(account) }
+                    }
                 }
             }
             .listStyle(.inset)
@@ -77,35 +83,44 @@ struct AccountsView: View {
 
 private struct AccountRow: View {
     let account: Account
+    let usage: UsageAccount?
     let onDelete: () -> Void
     @State private var confirmDelete = false
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: providerSymbol(account.provider))
-                .foregroundStyle(.tint)
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(account.email ?? account.name).font(.body)
-                HStack(spacing: 6) {
-                    Text(account.provider ?? "unknown")
-                        .font(.caption).foregroundStyle(.secondary)
-                    if let s = account.status, !s.isEmpty {
-                        Text(s)
-                            .font(.caption2)
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(.quaternary, in: Capsule())
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: providerSymbol(account.provider))
+                    .foregroundStyle(.tint)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(account.email ?? account.name).font(.body)
+                    HStack(spacing: 6) {
+                        Text(account.provider ?? "unknown")
+                            .font(.caption).foregroundStyle(.secondary)
+                        if let s = account.status, !s.isEmpty {
+                            Text(s)
+                                .font(.caption2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(.quaternary, in: Capsule())
+                        }
                     }
                 }
+                Spacer()
+                if usage?.isRateLimited == true { RateLimitedPill() }
+                Button(role: .destructive) { confirmDelete = true } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .confirmationDialog("Remove “\(account.name)”?", isPresented: $confirmDelete) {
+                    Button("Remove", role: .destructive, action: onDelete)
+                    Button("Cancel", role: .cancel) {}
+                }
             }
-            Spacer()
-            Button(role: .destructive) { confirmDelete = true } label: {
-                Image(systemName: "trash")
-            }
-            .buttonStyle(.borderless)
-            .confirmationDialog("Remove “\(account.name)”?", isPresented: $confirmDelete) {
-                Button("Remove", role: .destructive, action: onDelete)
-                Button("Cancel", role: .cancel) {}
+            if let u = usage?.usage, u.hasData {
+                DetailedUsageView(usage: u)
+                    .padding(.leading, 34)
+                    .padding(.trailing, 4)
             }
         }
         .padding(.vertical, 4)

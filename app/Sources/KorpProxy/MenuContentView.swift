@@ -18,7 +18,12 @@ struct MenuContentView: View {
         .frame(width: 300)
         .task(id: app.status) {
             accounts.configure(port: app.config.port, secret: app.config.managementSecret)
-            if app.status.isRunning { await accounts.refresh() }
+            guard app.status.isRunning else { return }
+            await accounts.refresh()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                await accounts.refreshUsage()
+            }
         }
     }
 
@@ -115,14 +120,21 @@ struct MenuContentView: View {
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 ForEach(accounts.accounts.prefix(4)) { acct in
-                    HStack(spacing: 8) {
-                        Image(systemName: providerSymbol(acct.provider))
-                            .foregroundStyle(.tint).frame(width: 16)
-                        Text(acct.email ?? acct.name).font(.caption).lineLimit(1)
-                        Spacer()
-                        Circle()
-                            .fill(acct.disabled == true ? Color.orange : Color.green)
-                            .frame(width: 6, height: 6)
+                    let info = accounts.usage(for: acct)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            Image(systemName: providerSymbol(acct.provider))
+                                .foregroundStyle(.tint).frame(width: 16)
+                            Text(acct.email ?? acct.name).font(.caption).lineLimit(1)
+                            Spacer()
+                            if info?.isRateLimited == true { RateLimitedPill() }
+                            Circle()
+                                .fill(acct.disabled == true ? Color.orange : Color.green)
+                                .frame(width: 6, height: 6)
+                        }
+                        if let u = info?.usage, u.hasData {
+                            CompactUsageView(usage: u).padding(.leading, 24)
+                        }
                     }
                 }
                 if accounts.accounts.count > 4 {

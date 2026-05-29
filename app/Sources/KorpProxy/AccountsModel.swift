@@ -31,7 +31,6 @@ final class AccountsModel {
 
     /// Usage/limiter info keyed by account name (from GET /usage).
     var usageByName: [String: UsageAccount] = [:]
-    var probing = false
 
     // Active OAuth session
     var activeProvider: LoginProvider?
@@ -81,15 +80,6 @@ final class AccountsModel {
         if let list = try? await client.usageStatus() {
             usageByName = Dictionary(list.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
         }
-    }
-
-    /// Trigger a live probe of Claude accounts, then refresh usage.
-    func probe() async {
-        guard let client, !probing else { return }
-        probing = true
-        _ = try? await client.probeUsage()
-        await refreshUsage()
-        probing = false
     }
 
     func usage(for account: Account) -> UsageAccount? {
