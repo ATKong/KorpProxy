@@ -32,3 +32,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.korp.KorpProxy
+    postBuildScripts:
+      - name: Embed KorpProxy engine
+        basedOnDependencyAnalysis: false
+        script: |
+          "${SRCROOT}/scripts/build-engine.sh" --bundle "${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}"
