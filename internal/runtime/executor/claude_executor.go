@@ -1703,6 +1703,70 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		}
 	}
 
+	// Cloaking replaced the client system prompt with the Claude Code prompt.
+	// Anthropic validates replayed thinking/redacted_thinking blocks against the
+	// request system context, so blocks signed under the original client system are
+	// rejected with a 400: "thinking or redacted_thinking blocks in the latest
+	// assistant message cannot be modified". Drop those blocks; the cloaked request
+	// can never carry thinking signed under a different system, and Anthropic accepts
+	// assistant turns that omit them.
+	payload = stripReplayedThinkingBlocks(payload)
+
+	return payload
+}
+
+// stripReplayedThinkingBlocks removes thinking and redacted_thinking blocks from
+// every message content array. It runs after the client system prompt has been
+// swapped for the cloaked Claude Code prompt: Anthropic checks replayed thinking
+// blocks against the request system context, so blocks signed under the original
+// client system are rejected as modified. Dropping them keeps the cloaked request
+// valid; Anthropic accepts assistant turns that omit thinking blocks.
+//
+// Non-thinking blocks and string content are left untouched. If removing thinking
+// blocks would empty a message, a single empty text block is inserted so the
+// message stays valid.
+func stripReplayedThinkingBlocks(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	type rebuild struct {
+		idx int
+		arr string
+	}
+	var jobs []rebuild
+	messages.ForEach(func(mi, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		kept := make([]string, 0, int(content.Get("#").Int()))
+		removed := false
+		content.ForEach(func(_, blk gjson.Result) bool {
+			switch blk.Get("type").String() {
+			case "thinking", "redacted_thinking":
+				removed = true
+			default:
+				kept = append(kept, blk.Raw)
+			}
+			return true
+		})
+		if !removed {
+			return true
+		}
+		if len(kept) == 0 {
+			kept = append(kept, `{"type":"text","text":""}`)
+		}
+		jobs = append(jobs, rebuild{int(mi.Int()), "[" + strings.Join(kept, ",") + "]"})
+		return true
+	})
+
+	for _, j := range jobs {
+		if updated, err := sjson.SetRawBytes(payload, fmt.Sprintf("messages.%d.content", j.idx), []byte(j.arr)); err == nil {
+			payload = updated
+		}
+	}
 	return payload
 }
 
