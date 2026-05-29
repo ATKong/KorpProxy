@@ -72,11 +72,13 @@ jobs:
         run: |
           V="${GITHUB_REF_NAME#app-v}"
           ZIP="app/dist/KorpProxy-${V}.zip"
-          gh release create "app-v${V}" "$ZIP" \
+          DMG="app/dist/KorpProxy-${V}.dmg"
+          NOTES="Download **KorpProxy-${V}.dmg**, open it, and drag KorpProxy to Applications. Existing installs update automatically via Sparkle (or \"Check for Updates…\"). The .zip is the Sparkle update artifact."
+          gh release create "app-v${V}" "$DMG" "$ZIP" \
             --repo ATKong/KorpProxy-releases \
             --title "KorpProxy ${V}" \
-            --notes "Automated KorpProxy ${V} release. Installs/updates via Sparkle." \
-            || gh release upload "app-v${V}" "$ZIP" --repo ATKong/KorpProxy-releases --clobber
+            --notes "$NOTES" \
+            || gh release upload "app-v${V}" "$DMG" "$ZIP" --repo ATKong/KorpProxy-releases --clobber
           git clone "https://x-access-token:${GH_TOKEN}@github.com/ATKong/KorpProxy-releases.git" pubrepo
           cp app/dist/appcast.xml pubrepo/appcast.xml
           cd pubrepo

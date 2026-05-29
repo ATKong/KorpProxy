@@ -5,7 +5,7 @@ Two independent pipelines, triggered by different git tags on the private
 
 | What | Tag | Workflow | Output |
 | --- | --- | --- | --- |
-| **macOS app** (Sparkle auto-update) | `app-vX.Y.Z` | `.github/workflows/app-release.yml` | signed+notarized `KorpProxy-X.Y.Z.zip` + `appcast.xml` → public `ATKong/KorpProxy-releases` |
+| **macOS app** (Sparkle auto-update) | `app-vX.Y.Z` | `.github/workflows/app-release.yml` | signed+notarized `KorpProxy-X.Y.Z.dmg` (drag-to-Applications) + `KorpProxy-X.Y.Z.zip` (Sparkle) + `appcast.xml` → public `ATKong/KorpProxy-releases` |
 | **Go engine** binaries | `vX.Y.Z` | `.github/workflows/release.yaml` (goreleaser) | per-platform tarballs → private repo Releases |
 
 The app **bundles** the engine, so a normal user only ever needs app updates;
@@ -16,9 +16,10 @@ the engine tarballs are for headless/CLI use.
 - Sparkle is added via SPM in `app/project.yml`; `UpdaterManager.swift` drives it.
 - `Info.plist` carries `SUFeedURL` → `https://atkong.github.io/KorpProxy-releases/appcast.xml`
   and `SUPublicEDKey` (the EdDSA **public** key).
-- Each release uploads the zip as a GitHub Release asset on the **public**
-  `KorpProxy-releases` repo and prepends an `<item>` to `appcast.xml`, which is
-  served from that repo via GitHub Pages.
+- Each release uploads a `.dmg` (drag KorpProxy to Applications — what humans
+  download) and a `.zip` (the Sparkle update artifact) as GitHub Release assets
+  on the **public** `KorpProxy-releases` repo, and prepends an `<item>` to
+  `appcast.xml`, which is served from that repo via GitHub Pages.
 - The app checks the feed daily (and via the menu "Check for Updates…").
 
 ## One-time setup
@@ -58,12 +59,12 @@ gh secret set NOTARY_ISSUER_ID             # the Issuer ID
 ```
 
 ### 4. Cross-repo publish token
-The release job pushes the zip + appcast to the **public** repo. The default
-`GITHUB_TOKEN` can't write cross-repo, so create a fine-grained PAT with
-**Contents: read/write** on `ATKong/KorpProxy-releases` and add it:
+The release job pushes the dmg + zip + appcast to the **public** repo. The
+default `GITHUB_TOKEN` can't write cross-repo, so create a **classic** PAT with
+the `repo` scope (fine-grained tokens returned 403 on the releases API) and add it:
 
 ```bash
-gh secret set RELEASES_REPO_TOKEN          # fine-grained PAT for KorpProxy-releases
+gh secret set RELEASES_REPO_TOKEN          # classic repo-scope PAT for KorpProxy-releases
 ```
 
 ## Cutting an app release
@@ -74,9 +75,9 @@ git tag app-v0.2.0
 git push origin app-v0.2.0
 ```
 
-The `app-release` workflow builds, signs, notarizes, staples, zips, Sparkle-signs,
-updates the appcast, creates the GitHub Release on the public repo, and pushes
-the updated feed. Existing installs pick it up within a day (or immediately via
+The `app-release` workflow builds, signs, notarizes, staples, zips (for Sparkle),
+builds a notarized drag-to-Applications DMG, Sparkle-signs, updates the appcast,
+creates the GitHub Release on the public repo, and pushes the updated feed. Existing installs pick it up within a day (or immediately via
 "Check for Updates…").
 
 ## Cutting an engine release
@@ -93,7 +94,7 @@ With your Developer ID + Sparkle key in the login keychain:
 ```bash
 DEVELOPER_ID_APP="Developer ID Application: Your Name (TEAMID)" \
 NOTARY_PROFILE="my-notary-profile" \
-  ./app/scripts/package-app.sh        # → app/dist/KorpProxy-<version>.zip + appcast.xml
+  ./app/scripts/package-app.sh        # → app/dist/KorpProxy-<version>.{dmg,zip} + appcast.xml
 ```
 
 Omit the notary vars to skip notarization (Gatekeeper will warn on other Macs,

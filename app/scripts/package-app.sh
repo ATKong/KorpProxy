@@ -97,23 +97,25 @@ if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "get-task-allow"; t
 fi
 
 # ---- notarize --------------------------------------------------------------
-NOTARIZE_ZIP="$DIST/KorpProxy-notarize.zip"
-ditto -c -k --keepParent "$APP" "$NOTARIZE_ZIP"
-
+# notarize <file> — submit the given archive/dmg to Apple and wait for the verdict.
 notarize() {
   if [ -n "${NOTARY_PROFILE:-}" ]; then
-    xcrun notarytool submit "$NOTARIZE_ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun notarytool submit "$1" --keychain-profile "$NOTARY_PROFILE" --wait
   elif [ -n "${NOTARY_KEY:-}" ] && [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER:-}" ]; then
-    xcrun notarytool submit "$NOTARIZE_ZIP" --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
+    xcrun notarytool submit "$1" --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
   elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
-    xcrun notarytool submit "$NOTARIZE_ZIP" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+    xcrun notarytool submit "$1" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
   else
     return 2
   fi
 }
 
-if notarize; then
-  echo "▸ Stapling notarization ticket…"
+NOTARIZE_OK=0
+NOTARIZE_ZIP="$DIST/KorpProxy-notarize.zip"
+ditto -c -k --keepParent "$APP" "$NOTARIZE_ZIP"
+if notarize "$NOTARIZE_ZIP"; then
+  NOTARIZE_OK=1
+  echo "▸ Stapling notarization ticket to app…"
   xcrun stapler staple "$APP"
   xcrun stapler validate "$APP"
 else
@@ -122,10 +124,29 @@ fi
 rm -f "$NOTARIZE_ZIP"
 
 # ---- package for distribution ----------------------------------------------
+# Sparkle update archive (this is what the appcast enclosure points to):
 ZIP="$DIST/KorpProxy-${VERSION}.zip"
 ditto -c -k --keepParent "$APP" "$ZIP"
 LENGTH="$(stat -f%z "$ZIP")"
 echo "▸ Archive: $ZIP ($LENGTH bytes)"
+
+# Drag-to-Applications disk image for first-time human installs:
+DMG="$DIST/KorpProxy-${VERSION}.dmg"
+echo "▸ Building DMG…"
+DMG_STAGE="$(mktemp -d)"
+cp -R "$APP" "$DMG_STAGE/KorpProxy.app"
+ln -s /Applications "$DMG_STAGE/Applications"
+hdiutil create -volname "KorpProxy" -srcfolder "$DMG_STAGE" -fs HFS+ \
+  -format UDZO -ov -quiet "$DMG"
+rm -rf "$DMG_STAGE"
+codesign --force --timestamp --sign "$DEVELOPER_ID_APP" "$DMG"
+if [ "$NOTARIZE_OK" = "1" ] && notarize "$DMG"; then
+  xcrun stapler staple "$DMG"
+  xcrun stapler validate "$DMG"
+else
+  echo "warning: DMG not notarized (no creds or notarization skipped)" >&2
+fi
+echo "▸ DMG: $DMG ($(stat -f%z "$DMG") bytes)"
 
 # ---- Sparkle EdDSA signature -----------------------------------------------
 SPARKLE_BIN="${SPARKLE_BIN:-}"
@@ -166,5 +187,6 @@ python3 "$APP_DIR/scripts/update_appcast.py" \
   --min-system "14.0"
 
 echo "✓ Done."
-echo "  Artifact: $ZIP"
-echo "  Appcast:  $APPCAST"
+echo "  Update zip: $ZIP"
+echo "  Installer:  $DMG"
+echo "  Appcast:    $APPCAST"
