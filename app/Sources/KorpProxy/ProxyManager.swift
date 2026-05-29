@@ -42,7 +42,14 @@ final class ProxyManager {
         let proc = Process()
         proc.executableURL = binary
         proc.arguments = ["--config", config.configPath.path]
-        proc.environment = ProcessInfo.processInfo.environment
+        var env = ProcessInfo.processInfo.environment
+        // Expose the management secret as MANAGEMENT_PASSWORD so the app can call
+        // the engine's /v0/management API with a plaintext bearer token. (The
+        // config secret-key is bcrypt-compared, which a plaintext value fails.)
+        if !config.managementSecret.isEmpty {
+            env["MANAGEMENT_PASSWORD"] = config.managementSecret
+        }
+        proc.environment = env
         // Launch with a writable cwd so any engine relative paths resolve here
         // (a GUI app launched via `open` otherwise inherits cwd = "/").
         proc.currentDirectoryURL = config.baseDir

@@ -1,6 +1,18 @@
 import SwiftUI
 
 struct SettingsView: View {
+    var body: some View {
+        TabView {
+            GeneralSettingsView()
+                .tabItem { Label("General", systemImage: "gearshape") }
+            AccountsView()
+                .tabItem { Label("Accounts", systemImage: "person.2") }
+        }
+        .frame(width: 560, height: 520)
+    }
+}
+
+private struct GeneralSettingsView: View {
     @Environment(AppState.self) private var app
 
     var body: some View {
@@ -23,6 +35,5 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 460)
     }
 }

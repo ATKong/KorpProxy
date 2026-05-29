@@ -36,7 +36,7 @@ struct MenuContentView: View {
             Button("Open config folder") {
                 NSWorkspace.shared.open(app.config.baseDir)
             }
-            SettingsLink { Text("Settings…") }
+            SettingsLink { Text("Accounts & Settings…") }
 
             Divider()
 
