@@ -54,6 +54,36 @@ automatically on future syncs.
 3. **Consider opening the same fix as a PR upstream.** If it lands there, drop
    our patch on the next sync — less to maintain.
 
+## Self-controlled model catalog (`KORP_MODELS_URL`)
+
+Models are defined in `internal/registry/models/models.json` (embedded at build)
+but refreshed at runtime from a **remote catalog** on startup and every 3h —
+upstream's by default, so new models otherwise appear only when *upstream*
+updates their list.
+
+KorpProxy adds an override (`internal/registry/korp_models_source.go`, a file
+upstream never touches): set `KORP_MODELS_URL` to one or more comma-separated
+`models.json` URL(s) and they're tried first, with upstream kept as fallback.
+
+```bash
+export KORP_MODELS_URL=https://example.com/your/models.json
+```
+
+Add a model to that catalog and every running instance picks it up within 3h
+(or instantly on restart) — no rebuild, no upstream PR. The macOS app will own
+this list (serving it locally and/or syncing to a hosted URL). `--local-model`
+disables remote refresh and pins to the embedded list.
+
+Per-model schema (from the real Claude Opus 4.8 entry):
+
+```json
+{ "id": "claude-opus-4-8", "type": "claude", "owned_by": "anthropic",
+  "display_name": "Claude Opus 4.8", "context_length": 1000000,
+  "max_completion_tokens": 128000,
+  "thinking": { "min": 1024, "max": 128000, "zero_allowed": true,
+                "levels": ["low", "medium", "high", "xhigh", "max"] } }
+```
+
 ## Build
 
 ```bash
