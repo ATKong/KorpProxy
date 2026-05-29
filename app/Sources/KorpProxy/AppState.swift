@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -43,6 +44,18 @@ final class AppState {
 
     init() {
         proxy = ProxyManager(state: self)
+
+        // Stop the engine cleanly when the app quits — don't leak the child process.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.proxy.stop()
+        }
+
+        // Auto-start the engine shortly after launch.
+        DispatchQueue.main.async { [weak self] in
+            self?.proxy.start()
+        }
     }
 
     func appendLog(_ line: String) {

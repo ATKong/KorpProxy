@@ -43,6 +43,9 @@ final class ProxyManager {
         proc.executableURL = binary
         proc.arguments = ["--config", config.configPath.path]
         proc.environment = ProcessInfo.processInfo.environment
+        // Launch with a writable cwd so any engine relative paths resolve here
+        // (a GUI app launched via `open` otherwise inherits cwd = "/").
+        proc.currentDirectoryURL = config.baseDir
 
         let pipe = Pipe()
         proc.standardOutput = pipe
