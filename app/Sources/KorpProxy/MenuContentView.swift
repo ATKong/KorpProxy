@@ -3,48 +3,152 @@ import SwiftUI
 
 struct MenuContentView: View {
     @Environment(AppState.self) private var app
+    @State private var accounts = AccountsModel()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Circle().fill(statusColor).frame(width: 9, height: 9)
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            controls
+            Divider()
+            accountsSection
+            Divider()
+            footer
+        }
+        .padding(14)
+        .frame(width: 300)
+        .task(id: app.status) {
+            accounts.configure(port: app.config.port, secret: app.config.managementSecret)
+            if app.status.isRunning { await accounts.refresh() }
+        }
+    }
+
+    // MARK: Header
+
+    private var header: some View {
+        HStack(spacing: 11) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(statusColor.opacity(0.16))
+                .frame(width: 38, height: 38)
+                .overlay(
+                    Image(systemName: app.status.symbolName)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(statusColor)
+                )
+            VStack(alignment: .leading, spacing: 1) {
                 Text("KorpProxy").font(.headline)
-                Spacer()
-                Text(app.status.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
             }
+            Spacer()
+            statusPill
+        }
+    }
 
-            Divider()
+    private var subtitle: String {
+        switch app.status {
+        case .running(let port): return "Serving on 127.0.0.1:\(port)"
+        case .starting: return "Starting engine…"
+        case .stopped: return "Engine stopped"
+        case .failed: return "Engine error"
+        }
+    }
 
-            HStack(spacing: 8) {
-                if app.status.isRunning {
-                    Button("Stop") { app.proxy.stop() }
-                    Button("Restart") { app.proxy.restart() }
-                } else {
-                    Button("Start") { app.proxy.start() }
-                }
-                Spacer()
+    private var statusPill: some View {
+        HStack(spacing: 5) {
+            Circle().fill(statusColor).frame(width: 7, height: 7)
+            Text(pillText).font(.caption2.weight(.medium))
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(statusColor.opacity(0.12), in: Capsule())
+        .foregroundStyle(statusColor)
+    }
+
+    private var pillText: String {
+        switch app.status {
+        case .running: return "On"
+        case .starting: return "Starting"
+        case .failed: return "Error"
+        case .stopped: return "Off"
+        }
+    }
+
+    // MARK: Controls
+
+    private var controls: some View {
+        HStack(spacing: 8) {
+            if app.status.isRunning {
+                Button { app.proxy.stop() } label: { Label("Stop", systemImage: "stop.fill") }
+                Button { app.proxy.restart() } label: { Label("Restart", systemImage: "arrow.clockwise") }
+            } else {
+                Button { app.proxy.start() } label: { Label("Start", systemImage: "play.fill") }
             }
-
-            if app.status.isRunning, let url = URL(string: "http://127.0.0.1:\(app.config.port)/") {
-                Link("Open dashboard", destination: url).font(.caption)
+            Spacer()
+            if app.status.isRunning, let url = dashboardURL {
+                Link(destination: url) { Image(systemName: "safari") }
+                    .help("Open dashboard")
             }
-
-            Divider()
-
-            Button("Open config folder") {
-                NSWorkspace.shared.open(app.config.baseDir)
-            }
-            SettingsLink { Text("Accounts & Settings…") }
-
-            Divider()
-
-            Button("Quit KorpProxy") { NSApplication.shared.terminate(nil) }
         }
         .buttonStyle(.bordered)
-        .padding(12)
-        .frame(width: 260)
+        .controlSize(.small)
+    }
+
+    private var dashboardURL: URL? { URL(string: "http://127.0.0.1:\(app.config.port)/") }
+
+    // MARK: Accounts
+
+    private var accountsSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("ACCOUNTS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                if accounts.loading {
+                    ProgressView().controlSize(.mini)
+                } else if app.status.isRunning {
+                    Text("\(accounts.accounts.count)").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+
+            if !app.status.isRunning {
+                Text("Start the engine to manage accounts.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if accounts.accounts.isEmpty {
+                Text("No accounts yet — models won’t serve until you add one.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(accounts.accounts.prefix(4)) { acct in
+                    HStack(spacing: 8) {
+                        Image(systemName: providerSymbol(acct.provider))
+                            .foregroundStyle(.tint).frame(width: 16)
+                        Text(acct.email ?? acct.name).font(.caption).lineLimit(1)
+                        Spacer()
+                        Circle()
+                            .fill(acct.disabled == true ? Color.orange : Color.green)
+                            .frame(width: 6, height: 6)
+                    }
+                }
+                if accounts.accounts.count > 4 {
+                    Text("+\(accounts.accounts.count - 4) more")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+
+            SettingsLink { MenuRowLabel(icon: "person.2", title: "Manage accounts…") }
+                .buttonStyle(.plain)
+        }
+    }
+
+    // MARK: Footer
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            MenuRow(icon: "folder", title: "Open config folder") {
+                NSWorkspace.shared.open(app.config.baseDir)
+            }
+            SettingsLink { MenuRowLabel(icon: "gearshape", title: "Settings…") }
+                .buttonStyle(.plain)
+            MenuRow(icon: "power", title: "Quit KorpProxy") {
+                NSApplication.shared.terminate(nil)
+            }
+        }
     }
 
     private var statusColor: Color {
@@ -54,5 +158,36 @@ struct MenuContentView: View {
         case .failed: return .red
         case .stopped: return .gray
         }
+    }
+}
+
+/// A menu-style row button with hover highlight.
+private struct MenuRow: View {
+    let icon: String
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) { MenuRowLabel(icon: icon, title: title) }
+            .buttonStyle(.plain)
+    }
+}
+
+private struct MenuRowLabel: View {
+    let icon: String
+    let title: String
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon).frame(width: 16).foregroundStyle(.secondary)
+            Text(title)
+            Spacer()
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .background(hovering ? Color.primary.opacity(0.08) : .clear,
+                    in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
     }
 }
