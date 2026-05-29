@@ -13,6 +13,7 @@ struct AccountsView: View {
             Divider()
             content
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .task {
             model.configure(port: app.config.port, secret: app.config.managementSecret)
             await model.refresh()
@@ -39,23 +40,8 @@ struct AccountsView: View {
 
     @ViewBuilder private var content: some View {
         if model.accounts.isEmpty {
-            if model.loading {
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let err = model.errorMessage {
-                ContentUnavailableView {
-                    Label("Couldn’t reach engine", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(err)
-                }
-            } else {
-                ContentUnavailableView {
-                    Label("No accounts yet", systemImage: "person.crop.circle.badge.plus")
-                } description: {
-                    Text("Add a provider account to start serving models.")
-                } actions: {
-                    Button("Add Account") { showAdd = true }.disabled(!app.status.isRunning)
-                }
-            }
+            emptyOrError
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List {
                 ForEach(model.accounts) { account in
@@ -63,6 +49,28 @@ struct AccountsView: View {
                 }
             }
             .listStyle(.inset)
+        }
+    }
+
+    @ViewBuilder private var emptyOrError: some View {
+        if model.loading {
+            ProgressView()
+        } else if let err = model.errorMessage {
+            ContentUnavailableView {
+                Label("Couldn’t reach engine", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(err)
+            } actions: {
+                Button("Retry") { Task { await model.refresh() } }
+            }
+        } else {
+            ContentUnavailableView {
+                Label("No accounts yet", systemImage: "person.crop.circle.badge.plus")
+            } description: {
+                Text("Add a provider account to start serving models.")
+            } actions: {
+                Button("Add Account") { showAdd = true }.disabled(!app.status.isRunning)
+            }
         }
     }
 }
