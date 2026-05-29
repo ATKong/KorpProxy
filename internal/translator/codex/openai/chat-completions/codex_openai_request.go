@@ -66,6 +66,14 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
+	// Preserve Codex Fast mode. The Chat Completions → Codex conversion rebuilds
+	// the request from scratch, so carry over service_tier when it requests the
+	// priority (Fast) tier. Only "priority" is valid upstream; anything else is
+	// dropped (matches the Responses path behaviour).
+	if v := gjson.GetBytes(rawJSON, "service_tier"); v.Exists() && v.String() == "priority" {
+		out, _ = sjson.SetBytes(out, "service_tier", "priority")
+	}
+
 	// Build tool name shortening map from original tools (if any)
 	originalToolNameMap := map[string]string{}
 	{

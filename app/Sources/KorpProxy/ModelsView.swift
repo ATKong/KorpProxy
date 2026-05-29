@@ -56,11 +56,14 @@ struct ModelsView: View {
         var order: [String] = []
         for m in app.customModels.models {
             guard byID[m.modelID] == nil else { continue }
+            let custAnthropic = m.provider == "claude"
             byID[m.modelID] = ExportModel(
                 include: false, modelID: m.modelID, displayName: m.displayName,
-                isAnthropic: m.provider == "claude",
+                isAnthropic: custAnthropic,
                 maxOutputTokens: m.maxCompletionTokens,
-                levels: m.thinkingLevels, sourceLabel: "Custom")
+                levels: m.thinkingLevels,
+                fastEligible: FactoryExport.fastEligible(modelID: m.modelID, isAnthropic: custAnthropic),
+                sourceLabel: "Custom")
             order.append(m.modelID)
         }
         for group in available.groups {
@@ -71,6 +74,7 @@ struct ModelsView: View {
                     include: false, modelID: sm.id, displayName: "",
                     isAnthropic: isAnthropic, maxOutputTokens: 0,
                     levels: available.levels(for: sm.id) ?? ["low", "medium", "high"],
+                    fastEligible: FactoryExport.fastEligible(modelID: sm.id, isAnthropic: isAnthropic),
                     sourceLabel: group.provider)
                 order.append(sm.id)
             }
@@ -313,6 +317,7 @@ private struct FactoryExportView: View {
     let apiKey: String
 
     @State private var rows: [ExportModel]
+    @State private var includeFast = true
     @State private var resultText: String?
     @State private var errorText: String?
 
@@ -323,7 +328,12 @@ private struct FactoryExportView: View {
     }
 
     private var selectedCount: Int { rows.filter(\.include).count }
-    private var entryCount: Int { rows.filter(\.include).reduce(0) { $0 + $1.entryCount } }
+    private var entryCount: Int {
+        rows.filter(\.include).reduce(0) { sum, row in
+            let mult = (includeFast && row.fastEligible) ? 2 : 1
+            return sum + row.baseEntryCount * mult
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -337,6 +347,12 @@ private struct FactoryExportView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $includeFast) {
+                    Text("Add Fast variants (Opus 4.6+ · GPT-5.4/5.5) — doubles those models’ entries with the priority/speed tier")
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .toggleStyle(.checkbox)
             }
             .padding(14)
             Divider()
@@ -407,6 +423,13 @@ private struct FactoryExportView: View {
                                             .background(.tint.opacity(0.15), in: Capsule())
                                     }
                                 }
+                                if rows[i].fastEligible {
+                                    Text("FAST")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(includeFast ? Color.orange : .secondary)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background((includeFast ? Color.orange : Color.secondary).opacity(0.15), in: Capsule())
+                                }
                             }
                         }
                     }
@@ -429,7 +452,7 @@ private struct FactoryExportView: View {
 
     private func runExport() {
         do {
-            let (models, entries, backup) = try FactoryExport.export(rows, port: port, apiKey: apiKey)
+            let (models, entries, backup) = try FactoryExport.export(rows, includeFast: includeFast, port: port, apiKey: apiKey)
             resultText = "Exported \(entries) entries from \(models) model(s). Backup: \(backup.lastPathComponent)"
             errorText = nil
         } catch {

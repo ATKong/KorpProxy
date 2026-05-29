@@ -14,10 +14,11 @@ struct ExportModel: Identifiable {
     let isAnthropic: Bool
     let maxOutputTokens: Int
     let levels: [String]           // reasoning levels to emit; empty = one no-thinking entry
+    let fastEligible: Bool         // model supports a Fast/priority tier
     let sourceLabel: String        // "Custom" or provider group (for the sheet)
 
-    /// Number of Factory entries this model expands into.
-    var entryCount: Int { max(1, levels.count) }
+    /// Entries per reasoning level (Fast doubling is applied at export time).
+    var baseEntryCount: Int { max(1, levels.count) }
 }
 
 /// Writes selected KorpProxy models into ~/.factory/settings.json → customModels,
@@ -47,18 +48,35 @@ enum FactoryExport {
         return out.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
     }
 
+    /// Whether a model supports a Fast / priority tier:
+    /// - Claude: Opus 4.6 / 4.7 / 4.8 (`speed: "fast"`, per Anthropic Fast mode docs)
+    /// - OpenAI/Codex: GPT-5.4 / 5.5 (`service_tier: "priority"`, per OpenAI Codex Speed docs)
+    /// Sending fast to an unsupported model can error upstream, so we gate it.
+    static func fastEligible(modelID: String, isAnthropic: Bool) -> Bool {
+        let id = modelID.lowercased()
+        if isAnthropic {
+            return id.contains("opus-4-6") || id.contains("opus-4-7") || id.contains("opus-4-8")
+        }
+        return id.contains("gpt-5.4") || id.contains("gpt-5.5")
+    }
+
     /// One Factory customModel entry. `level == nil` emits a plain, no-thinking
     /// entry; otherwise the level is encoded as a `model(level)` suffix that the
-    /// engine reads to set the reasoning effort.
-    static func entry(_ m: ExportModel, level: String?, port: Int, apiKey: String) -> [String: Any] {
+    /// engine reads to set the reasoning effort. `fast == true` adds the
+    /// provider's Fast/priority tier via extraArgs.
+    static func entry(_ m: ExportModel, level: String?, fast: Bool, port: Int, apiKey: String) -> [String: Any] {
         let baseURL = m.isAnthropic ? "http://localhost:\(port)" : "http://localhost:\(port)/v1"
         let name = m.displayName.isEmpty ? m.modelID : m.displayName
         let modelField = level.map { "\(m.modelID)(\($0))" } ?? m.modelID
-        let idSuffix = level.map { "-\($0)" } ?? ""
-        let display = level.map { "KorpProxy: \(name) · \($0)" } ?? "KorpProxy: \(name)"
+        var idValue = "custom:korpproxy:\(slug(m.modelID))"
+        if let level { idValue += "-\(level)" }
+        if fast { idValue += "-fast" }
+        var display = "KorpProxy: \(name)"
+        if let level { display += " · \(level)" }
+        if fast { display += " · fast" }
         var d: [String: Any] = [
             "model": modelField,
-            "id": "custom:korpproxy:\(slug(m.modelID))\(idSuffix)",
+            "id": idValue,
             "baseUrl": baseURL,
             "apiKey": apiKey.isEmpty ? "dummy-not-used" : apiKey,
             "displayName": display,
@@ -70,19 +88,32 @@ enum FactoryExport {
         // Kept for when Factory adds native reasoning support for custom models;
         // today the engine derives the level from the model-name suffix instead.
         if let level { d["reasoningEffort"] = level }
+        // Fast/priority tier. Claude uses the beta `speed` field (the engine already
+        // sends the fast-mode beta header); OpenAI/Codex uses service_tier=priority.
+        // Factory merges extraArgs into the request body.
+        if fast {
+            d["extraArgs"] = m.isAnthropic ? ["speed": "fast"] : ["service_tier": "priority"]
+        }
         return d
     }
 
-    /// All Factory entries for one model: one per reasoning level, or a single
-    /// plain entry when the model has no levels.
-    static func factoryEntries(_ m: ExportModel, port: Int, apiKey: String) -> [[String: Any]] {
-        guard !m.levels.isEmpty else { return [entry(m, level: nil, port: port, apiKey: apiKey)] }
-        return m.levels.map { entry(m, level: $0, port: port, apiKey: apiKey) }
+    /// All Factory entries for one model: one per reasoning level (plus a Fast
+    /// twin for each when the model is fast-eligible and Fast is enabled).
+    static func factoryEntries(_ m: ExportModel, includeFast: Bool, port: Int, apiKey: String) -> [[String: Any]] {
+        let levels: [String?] = m.levels.isEmpty ? [nil] : m.levels.map { Optional($0) }
+        var out: [[String: Any]] = []
+        for level in levels {
+            out.append(entry(m, level: level, fast: false, port: port, apiKey: apiKey))
+            if includeFast && m.fastEligible {
+                out.append(entry(m, level: level, fast: true, port: port, apiKey: apiKey))
+            }
+        }
+        return out
     }
 
     /// Returns (modelCount, entryCount, backupURL).
     @discardableResult
-    static func export(_ models: [ExportModel], port: Int, apiKey: String) throws -> (Int, Int, URL) {
+    static func export(_ models: [ExportModel], includeFast: Bool, port: Int, apiKey: String) throws -> (Int, Int, URL) {
         let url = settingsURL()
         guard let data = try? Data(contentsOf: url) else { throw ExportError.notFound(url.path) }
         guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
@@ -99,7 +130,7 @@ enum FactoryExport {
         entries.removeAll { ($0["id"] as? String)?.hasPrefix("custom:korpproxy:") == true }
 
         let selected = models.filter(\.include)
-        let added = selected.flatMap { factoryEntries($0, port: port, apiKey: apiKey) }
+        let added = selected.flatMap { factoryEntries($0, includeFast: includeFast, port: port, apiKey: apiKey) }
         entries.append(contentsOf: added)
 
         // Reindex for stable ordering.
