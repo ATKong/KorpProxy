@@ -35,24 +35,25 @@ enum SoulforgeExport {
         "soulforge --set-key \(providerID) \(apiKey.isEmpty ? "<your-korpproxy-api-key>" : apiKey)"
     }
 
-    /// One entry for the provider's `models` array: `{ id, name, thinking? }`.
-    /// Unlike Factory, SoulForge has no per-model reasoning picker, so we emit
-    /// the model's discrete reasoning levels as `thinking.levels` here — that's
-    /// the effort ladder SoulForge offers when the model is used.
+    /// One entry for the provider's `models` array.
     ///
-    /// `fast == true` emits the priority/speed-tier twin: SoulForge has no Fast
-    /// picker for custom providers, so we expose a separate `<model>-fast` id.
-    /// The engine maps that suffix to `service_tier: "priority"` upstream.
-    static func modelEntry(_ m: ExportModel, fast: Bool = false) -> [String: Any] {
+    /// When `level` is set, the id carries a thinking suffix — e.g.
+    /// `claude-sonnet-4(high)` — so the engine applies that effort level.
+    /// When `fast` is set, the id carries a `-fast` suffix so the engine
+    /// injects `service_tier: "priority"` for the Codex path.
+    static func modelEntry(_ m: ExportModel, level: String? = nil, fast: Bool = false) -> [String: Any] {
         let baseName = m.displayName.isEmpty ? m.modelID : m.displayName
-        var entry: [String: Any] = [
-            "id": "\(m.modelID)\(fast ? "-fast" : "")",
-            "name": "\(baseName)\(fast ? " · fast" : "")",
-        ]
-        if !m.thinkingLevels.isEmpty {
-            entry["thinking"] = ["levels": m.thinkingLevels]
+        var id = m.modelID
+        var name = baseName
+        if let level {
+            id = "\(id)(\(level))"
+            name = "\(name) · \(level)"
         }
-        return entry
+        if fast {
+            id = "\(id)-fast"
+            name = "\(name) · fast"
+        }
+        return ["id": id, "name": name]
     }
 
     /// Whether a model gets a Fast twin in the SoulForge export. Scoped to
@@ -62,10 +63,23 @@ enum SoulforgeExport {
         !m.isAnthropic && m.fastEligible
     }
 
-    /// SoulForge model entries for one model: the standard entry, plus a Fast
-    /// twin when the model is eligible and the user selected Fast.
+    /// SoulForge model entries for one model.
+    ///
+    /// If the user selected specific reasoning levels, one entry per level is
+    /// emitted (using the `model(level)` suffix the engine already handles).
+    /// Otherwise a single plain entry is emitted. Fast twins are appended for
+    /// each variant when eligible and selected.
     static func modelEntries(_ m: ExportModel) -> [[String: Any]] {
-        var out: [[String: Any]] = [modelEntry(m)]
+        var out: [[String: Any]] = []
+        let levels = m.thinkingLevels.filter { m.selectedThinkingLevels.contains($0) }
+        if levels.isEmpty {
+            // No specific levels chosen — export a single plain entry.
+            out.append(modelEntry(m))
+        } else {
+            for level in levels {
+                out.append(modelEntry(m, level: level))
+            }
+        }
         if m.includeFast && fastEligible(m) {
             out.append(modelEntry(m, fast: true))
         }

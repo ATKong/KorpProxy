@@ -495,7 +495,7 @@ private struct SoulforgeExportView: View {
                     Spacer()
                     Button("Done") { dismiss() }
                 }
-                Text("Adds a “korpproxy” custom provider to ~/.soulforge/config.json with the models you pick. Use them in SoulForge as korpproxy/<model>. Tick Fast on GPT-5.4/5.5 to also export a priority/speed-tier copy.")
+                Text("Adds a “korpproxy” custom provider to ~/.soulforge/config.json Pick reasoning levels to export separate model(level) entries — or leave them unselected for a single plain entry. Tick Fast on GPT-5.4/5.5 for a priority/speed-tier copy.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -582,32 +582,51 @@ private struct SoulforgeExportView: View {
         }
     }
 
-    /// One model: an include checkbox, brand icon, name, and the SoulForge model
-    /// string. The model's reasoning levels are exported as thinking.levels.
+    /// One model row: include checkbox, icon, name, reasoning-level chips, and
+    /// an optional Fast checkbox. Each selected level becomes a separate
+    /// `model(level)` entry so the user picks effort by picking the model in
+    /// SoulForge. When no levels are selected, a single plain entry is exported.
     @ViewBuilder private func modelRow(_ i: Int) -> some View {
-        HStack(spacing: 10) {
-            Toggle("", isOn: $rows[i].includeStandard).labelsHidden()
-                .help("Export this model")
-            ProviderIcon(provider: rows[i].modelID, size: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Toggle("", isOn: $rows[i].includeStandard).labelsHidden()
+                    .help("Export this model")
+                ProviderIcon(provider: rows[i].modelID, size: 18)
+                VStack(alignment: .leading, spacing: 2) {
                     Text(rows[i].displayName.isEmpty ? rows[i].modelID : rows[i].displayName)
-                    if rows[i].supportsThinking {
-                        Image(systemName: "brain")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .help("Supports reasoning — its levels are exported to SoulForge")
+                    Text("korpproxy/\(rows[i].modelID)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if SoulforgeExport.fastEligible(rows[i]) {
+                    Toggle(isOn: $rows[i].includeFast) { Text("Fast") }
+                        .toggleStyle(.checkbox)
+                        .help("Also export a Fast (priority/speed-tier) copy as korpproxy/\(rows[i].modelID)-fast")
+                }
+            }
+            if !rows[i].thinkingLevels.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "brain")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    ForEach(rows[i].thinkingLevels, id: \.self) { level in
+                        let on = rows[i].selectedThinkingLevels.contains(level)
+                        Button {
+                            if on { rows[i].selectedThinkingLevels.remove(level) }
+                            else { rows[i].selectedThinkingLevels.insert(level) }
+                        } label: {
+                            Text(level)
+                                .font(.system(.caption2, design: .monospaced))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(on ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.1))
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
-                Text("korpproxy/\(rows[i].modelID)")
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-              if SoulforgeExport.fastEligible(rows[i]) {
-                  Toggle(isOn: $rows[i].includeFast) { Text("Fast") }
-                      .toggleStyle(.checkbox)
-                    .help("Also export a Fast (priority/speed-tier) copy as korpproxy/\(rows[i].modelID)-fast")
+                .padding(.leading, 36) // align under the model name
             }
         }
         .padding(.vertical, 2)
