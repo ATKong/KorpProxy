@@ -124,8 +124,7 @@ struct MenuContentView: View {
                     let info = accounts.usage(for: acct)
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 8) {
-                            Image(systemName: providerSymbol(acct.provider))
-                                .foregroundStyle(.tint).frame(width: 16)
+                            ProviderIcon(provider: acct.provider, size: 16)
                             Text(acct.email ?? acct.name).font(.caption).lineLimit(1)
                             Spacer()
                             if info?.isRateLimited == true { RateLimitedPill() }

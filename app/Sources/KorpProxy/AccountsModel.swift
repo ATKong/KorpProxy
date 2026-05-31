@@ -196,15 +196,3 @@ final class AccountsModel {
         }
     }
 }
-
-/// SF Symbol for a provider string returned by the engine.
-func providerSymbol(_ provider: String?) -> String {
-    let p = (provider ?? "").lowercased()
-    if p.contains("gemini") { return "sparkle" }
-    if p.contains("claude") || p.contains("anthropic") { return "a.circle" }
-    if p.contains("codex") || p.contains("openai") { return "o.circle" }
-    if p.contains("antigravity") { return "arrow.up.circle" }
-    if p.contains("kimi") { return "k.circle" }
-    if p.contains("xai") || p.contains("grok") { return "x.circle" }
-    return "person.crop.circle"
-}

@@ -107,9 +107,7 @@ private struct AccountRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Image(systemName: providerSymbol(account.provider))
-                    .foregroundStyle(.tint)
-                    .frame(width: 22)
+                ProviderIcon(provider: account.provider, size: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(account.email ?? account.name).font(.body)
                     HStack(spacing: 6) {
@@ -197,7 +195,7 @@ private struct AddAccountSheet: View {
                     if p.kind == .oauth { model.beginOAuth(p) }
                 } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: p.symbol)
+                        ProviderIcon(provider: p.id, size: 18)
                         Text(p.display).lineLimit(1)
                         Spacer()
                     }
@@ -217,8 +215,11 @@ private struct OAuthFlowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Signing in to \(provider.display)", systemImage: provider.symbol)
-                .font(.headline)
+            HStack(spacing: 8) {
+                ProviderIcon(provider: provider.id, size: 20)
+                Text("Signing in to \(provider.display)")
+            }
+            .font(.headline)
 
             switch model.phase {
             case .waiting:
@@ -269,7 +270,11 @@ private struct APIKeyFormView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Add \(provider.display)", systemImage: provider.symbol).font(.headline)
+            HStack(spacing: 8) {
+                ProviderIcon(provider: provider.id, size: 20)
+                Text("Add \(provider.display)")
+            }
+            .font(.headline)
             TextField("API key", text: $apiKey).textFieldStyle(.roundedBorder)
             TextField("Base URL (optional)", text: $baseURL).textFieldStyle(.roundedBorder)
             if let err = model.errorMessage {

@@ -9,11 +9,13 @@ struct ModelsView: View {
         case add
         case edit(CustomModel)
         case exportFactory
+        case exportSoulforge
         var id: String {
             switch self {
             case .add: return "add"
             case .edit(let m): return m.uuid.uuidString
-            case .exportFactory: return "export"
+            case .exportFactory: return "export-factory"
+            case .exportSoulforge: return "export-soulforge"
             }
         }
     }
@@ -45,6 +47,10 @@ struct ModelsView: View {
                 FactoryExportView(models: exportModels(),
                                   port: app.config.port,
                                   apiKey: app.config.apiKey)
+            case .exportSoulforge:
+                SoulforgeExportView(models: exportModels(),
+                                    port: app.config.port,
+                                    apiKey: app.config.apiKey)
             }
         }
     }
@@ -117,7 +123,8 @@ struct ModelsView: View {
                                 .textSelection(.enabled)
                         }
                     } label: {
-                        HStack {
+                        HStack(spacing: 8) {
+                            ProviderIcon(provider: group.provider, size: 18)
                             Text(group.provider).font(.subheadline.weight(.medium))
                             Spacer()
                             Text("\(group.models.count)").font(.caption).foregroundStyle(.secondary)
@@ -161,10 +168,15 @@ struct ModelsView: View {
     private var footer: some View {
         HStack(spacing: 8) {
             Button { sheet = .add } label: { Label("Add Model", systemImage: "plus") }
-            Button { sheet = .exportFactory } label: {
-                Label("Export to Factory", systemImage: "square.and.arrow.up")
+            Menu {
+                Button("To Factory…") { sheet = .exportFactory }
+                Button("To Soulforge…") { sheet = .exportSoulforge }
+            } label: {
+                Label("Export", systemImage: "square.and.arrow.up")
             }
-            .help("Write these models into ~/.factory/settings.json (pointed at KorpProxy)")
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Export these models into another AI client (pointed at KorpProxy)")
             Spacer()
             Button { applyAndRefresh() } label: { Label("Restart engine", systemImage: "arrow.clockwise") }
                 .help("Re-apply the catalog and restart the engine now")
@@ -189,10 +201,11 @@ private struct ModelRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
+            ProviderIcon(provider: model.provider, size: 20)
             Text(ModelProvider.label(model.provider))
                 .font(.caption2.weight(.medium))
                 .padding(.horizontal, 7).padding(.vertical, 3)
-                .background(.tint.opacity(0.15), in: Capsule())
+                .background(ProviderBrand.forProvider(model.provider).tint.opacity(0.15), in: Capsule())
             VStack(alignment: .leading, spacing: 1) {
                 Text(model.modelID).font(.system(.body, design: .monospaced))
                 if !model.displayName.isEmpty {
@@ -402,6 +415,7 @@ private struct FactoryExportView: View {
         HStack(spacing: 10) {
             Toggle("", isOn: $rows[i].includeStandard).labelsHidden()
                 .help("Export this model")
+            ProviderIcon(provider: rows[i].modelID, size: 18)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(rows[i].displayName.isEmpty ? rows[i].modelID : rows[i].displayName)
@@ -444,6 +458,175 @@ private struct FactoryExportView: View {
             let (models, entries, backup) = try FactoryExport.export(rows, port: port, apiKey: apiKey)
             resultText = "Exported \(entries) entries from \(models) model(s). Backup: \(backup.lastPathComponent)"
             errorText = nil
+        } catch {
+            errorText = error.localizedDescription
+            resultText = nil
+        }
+    }
+}
+
+/// Lets the user pick KorpProxy models and write them into SoulForge's custom
+/// providers (~/.soulforge/config.json), pointed at the local KorpProxy server.
+private struct SoulforgeExportView: View {
+    @Environment(\.dismiss) private var dismiss
+    let port: Int
+    let apiKey: String
+
+    @State private var rows: [ExportModel]
+    @State private var resultText: String?
+    @State private var errorText: String?
+    @State private var didExport = false
+
+    init(models: [ExportModel], port: Int, apiKey: String) {
+        self.port = port
+        self.apiKey = apiKey
+        _rows = State(initialValue: models)
+    }
+
+    private var selectedCount: Int { rows.filter(\.isSelected).count }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Export to Soulforge").font(.headline)
+                    Spacer()
+                    Button("Done") { dismiss() }
+                }
+                Text("Adds a “korpproxy” custom provider to ~/.soulforge/config.json with the models you pick. Use them in SoulForge as korpproxy/<model>.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            Divider()
+            content
+            Divider()
+            footer
+        }
+        .frame(width: 540, height: 580)
+    }
+
+    @ViewBuilder private var footer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if didExport { setKeyHint }
+            HStack {
+                Text(statusLine)
+                    .font(.caption)
+                    .foregroundStyle(resultText != nil ? Color.green : .secondary)
+                Spacer()
+                Button("Export \(selectedCount) model\(selectedCount == 1 ? "" : "s")") { runExport() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedCount == 0)
+            }
+        }
+        .padding(14)
+    }
+
+    /// After export, surface the one command that registers KorpProxy's key with
+    /// SoulForge (custom providers read their key from the keystore or env var).
+    private var setKeyHint: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Register KorpProxy’s API key with SoulForge:")
+                .font(.caption2).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text(SoulforgeExport.setKeyCommand(apiKey: apiKey))
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(SoulforgeExport.setKeyCommand(apiKey: apiKey), forType: .string)
+                } label: { Image(systemName: "doc.on.doc") }
+                    .buttonStyle(.borderless)
+                    .help("Copy command")
+            }
+            .padding(8)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    private var statusLine: String {
+        if let resultText { return resultText }
+        if rows.isEmpty { return "Nothing to export." }
+        return "\(selectedCount) of \(rows.count) models → 127.0.0.1:\(port)/v1"
+    }
+
+    @ViewBuilder private var content: some View {
+        if let errorText {
+            ContentUnavailableView {
+                Label("Couldn’t export", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(errorText)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if rows.isEmpty {
+            ContentUnavailableView {
+                Label("Nothing to export", systemImage: "tray")
+            } description: {
+                Text("Add a custom model or log in to an account first.")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            List {
+                ForEach(grouped, id: \.0) { label, indices in
+                    Section(label) {
+                        ForEach(indices, id: \.self) { i in modelRow(i) }
+                    }
+                }
+            }
+            .listStyle(.inset)
+        }
+    }
+
+    /// One model: an include checkbox, brand icon, name, and the SoulForge model
+    /// string. Reasoning effort is chosen later in SoulForge's own UI.
+    @ViewBuilder private func modelRow(_ i: Int) -> some View {
+        HStack(spacing: 10) {
+            Toggle("", isOn: $rows[i].includeStandard).labelsHidden()
+                .help("Export this model")
+            ProviderIcon(provider: rows[i].modelID, size: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(rows[i].displayName.isEmpty ? rows[i].modelID : rows[i].displayName)
+                    if rows[i].supportsThinking {
+                        Image(systemName: "brain")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .help("Supports reasoning — pick the effort in SoulForge")
+                    }
+                }
+                Text("korpproxy/\(rows[i].modelID)")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// Row indices grouped by source label, preserving order.
+    private var grouped: [(String, [Int])] {
+        var order: [String] = []
+        var map: [String: [Int]] = [:]
+        for (i, row) in rows.enumerated() {
+            if map[row.sourceLabel] == nil { order.append(row.sourceLabel) }
+            map[row.sourceLabel, default: []].append(i)
+        }
+        return order.map { ($0, map[$0]!) }
+    }
+
+    private func runExport() {
+        do {
+            let (count, backup) = try SoulforgeExport.export(rows, port: port)
+            if let backup {
+                resultText = "Exported \(count) model(s). Backup: \(backup.lastPathComponent)"
+            } else {
+                resultText = "Created ~/.soulforge/config.json with \(count) model(s)."
+            }
+            errorText = nil
+            didExport = true
         } catch {
             errorText = error.localizedDescription
             resultText = nil
