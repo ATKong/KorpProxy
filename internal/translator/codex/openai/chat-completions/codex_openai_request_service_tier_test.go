@@ -32,3 +32,15 @@ func TestConvertOpenAIRequestToCodexServiceTier(t *testing.T) {
 		})
 	}
 }
+
+func TestConvertOpenAIRequestToCodexFastSuffix(t *testing.T) {
+	input := []byte(`{"model":"gpt-5.5-fast","messages":[]}`)
+	out := ConvertOpenAIRequestToCodex("gpt-5.5-fast", input, true)
+
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want %q; output=%s", got, "priority", out)
+	}
+	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("model = %q, want %q (suffix should be stripped); output=%s", got, "gpt-5.5", out)
+	}
+}

@@ -35,11 +35,41 @@ enum SoulforgeExport {
         "soulforge --set-key \(providerID) \(apiKey.isEmpty ? "<your-korpproxy-api-key>" : apiKey)"
     }
 
-    /// One entry for the provider's `models` array: `{ id, name }`. SoulForge
-    /// also accepts plain id strings, but names give a friendlier picker.
-    static func modelEntry(_ m: ExportModel) -> [String: Any] {
-        let name = m.displayName.isEmpty ? m.modelID : m.displayName
-        return ["id": m.modelID, "name": name]
+    /// One entry for the provider's `models` array: `{ id, name, thinking? }`.
+    /// Unlike Factory, SoulForge has no per-model reasoning picker, so we emit
+    /// the model's discrete reasoning levels as `thinking.levels` here — that's
+    /// the effort ladder SoulForge offers when the model is used.
+    ///
+    /// `fast == true` emits the priority/speed-tier twin: SoulForge has no Fast
+    /// picker for custom providers, so we expose a separate `<model>-fast` id.
+    /// The engine maps that suffix to `service_tier: "priority"` upstream.
+    static func modelEntry(_ m: ExportModel, fast: Bool = false) -> [String: Any] {
+        let baseName = m.displayName.isEmpty ? m.modelID : m.displayName
+        var entry: [String: Any] = [
+            "id": "\(m.modelID)\(fast ? "-fast" : "")",
+            "name": "\(baseName)\(fast ? " · fast" : "")",
+        ]
+        if !m.thinkingLevels.isEmpty {
+            entry["thinking"] = ["levels": m.thinkingLevels]
+        }
+        return entry
+    }
+
+    /// Whether a model gets a Fast twin in the SoulForge export. Scoped to
+    /// OpenAI/Codex GPT models — only the Codex path honours the `-fast`
+    /// suffix (`service_tier: "priority"`); Claude Fast is not wired here.
+    static func fastEligible(_ m: ExportModel) -> Bool {
+        !m.isAnthropic && m.fastEligible
+    }
+
+    /// SoulForge model entries for one model: the standard entry, plus a Fast
+    /// twin when the model is eligible and the user selected Fast.
+    static func modelEntries(_ m: ExportModel) -> [[String: Any]] {
+        var out: [[String: Any]] = [modelEntry(m)]
+        if m.includeFast && fastEligible(m) {
+            out.append(modelEntry(m, fast: true))
+        }
+        return out
     }
 
     /// The `korpproxy` provider block for SoulForge's `providers` array.
@@ -49,7 +79,7 @@ enum SoulforgeExport {
             "name": "KorpProxy",
             "baseURL": "http://127.0.0.1:\(port)/v1",
             "envVar": envVar,
-            "models": selected.map { modelEntry($0) },
+            "models": selected.flatMap { modelEntries($0) },
         ]
     }
 

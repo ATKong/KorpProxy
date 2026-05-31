@@ -63,14 +63,24 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	out, _ = sjson.SetBytes(out, "reasoning.summary", "auto")
 	out, _ = sjson.SetBytes(out, "include", []string{"reasoning.encrypted_content"})
 
-	// Model
+	// Model. A "-fast" alias suffix selects the priority (Fast) speed tier:
+	// callers that can't set a request body field (e.g. SoulForge custom
+	// providers) request Fast by appending "-fast" to the model id. Strip the
+	// suffix here so the upstream model name stays valid.
+	fastSuffix := strings.HasSuffix(modelName, "-fast")
+	if fastSuffix {
+		modelName = strings.TrimSuffix(modelName, "-fast")
+	}
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
 	// Preserve Codex Fast mode. The Chat Completions → Codex conversion rebuilds
 	// the request from scratch, so carry over service_tier when it requests the
-	// priority (Fast) tier. Only "priority" is valid upstream; anything else is
-	// dropped (matches the Responses path behaviour).
-	if v := gjson.GetBytes(rawJSON, "service_tier"); v.Exists() && v.String() == "priority" {
+	// priority (Fast) tier — either via the "-fast" model suffix or an explicit
+	// service_tier in the body. Only "priority" is valid upstream; anything else
+	// is dropped (matches the Responses path behaviour).
+	if fastSuffix {
+		out, _ = sjson.SetBytes(out, "service_tier", "priority")
+	} else if v := gjson.GetBytes(rawJSON, "service_tier"); v.Exists() && v.String() == "priority" {
 		out, _ = sjson.SetBytes(out, "service_tier", "priority")
 	}
 

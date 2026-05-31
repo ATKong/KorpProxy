@@ -69,6 +69,7 @@ struct ModelsView: View {
                 isAnthropic: custAnthropic,
                 maxOutputTokens: m.maxCompletionTokens,
                 supportsThinking: !m.thinkingLevels.isEmpty,
+                thinkingLevels: m.thinkingLevels,
                 fastEligible: FactoryExport.fastEligible(modelID: m.modelID, isAnthropic: custAnthropic),
                 sourceLabel: "Custom")
             order.append(m.modelID)
@@ -82,6 +83,7 @@ struct ModelsView: View {
                     modelID: sm.id, displayName: "",
                     isAnthropic: isAnthropic, maxOutputTokens: 0,
                     supportsThinking: available.levels(for: sm.id).map { !$0.isEmpty } ?? true,
+                    thinkingLevels: available.levels(for: sm.id) ?? [],
                     fastEligible: FactoryExport.fastEligible(modelID: sm.id, isAnthropic: isAnthropic),
                     sourceLabel: group.provider)
                 order.append(sm.id)
@@ -493,7 +495,7 @@ private struct SoulforgeExportView: View {
                     Spacer()
                     Button("Done") { dismiss() }
                 }
-                Text("Adds a “korpproxy” custom provider to ~/.soulforge/config.json with the models you pick. Use them in SoulForge as korpproxy/<model>.")
+                Text("Adds a “korpproxy” custom provider to ~/.soulforge/config.json with the models you pick. Use them in SoulForge as korpproxy/<model>. Tick Fast on GPT-5.4/5.5 to also export a priority/speed-tier copy.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -581,7 +583,7 @@ private struct SoulforgeExportView: View {
     }
 
     /// One model: an include checkbox, brand icon, name, and the SoulForge model
-    /// string. Reasoning effort is chosen later in SoulForge's own UI.
+    /// string. The model's reasoning levels are exported as thinking.levels.
     @ViewBuilder private func modelRow(_ i: Int) -> some View {
         HStack(spacing: 10) {
             Toggle("", isOn: $rows[i].includeStandard).labelsHidden()
@@ -594,7 +596,7 @@ private struct SoulforgeExportView: View {
                         Image(systemName: "brain")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
-                            .help("Supports reasoning — pick the effort in SoulForge")
+                            .help("Supports reasoning — its levels are exported to SoulForge")
                     }
                 }
                 Text("korpproxy/\(rows[i].modelID)")
@@ -602,6 +604,11 @@ private struct SoulforgeExportView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+              if SoulforgeExport.fastEligible(rows[i]) {
+                  Toggle(isOn: $rows[i].includeFast) { Text("Fast") }
+                      .toggleStyle(.checkbox)
+                    .help("Also export a Fast (priority/speed-tier) copy as korpproxy/\(rows[i].modelID)-fast")
+            }
         }
         .padding(.vertical, 2)
     }

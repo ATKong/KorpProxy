@@ -16,6 +16,7 @@ struct ExportModel: Identifiable {
     let isAnthropic: Bool
     let maxOutputTokens: Int
     let supportsThinking: Bool     // model has reasoning levels -> Factory shows its picker
+    let thinkingLevels: [String]   // discrete reasoning levels; SoulForge emits these (it has no picker of its own)
     let fastEligible: Bool         // model supports a Fast/priority tier
     let sourceLabel: String        // "Custom" or provider group (for the sheet)
 
