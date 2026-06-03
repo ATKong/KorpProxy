@@ -13,7 +13,7 @@ upstream's (near-daily) updates.
 | repo root (`cmd/`, `internal/`, `sdk/`, `go.mod`, …) | The Go engine — an **exact mirror of upstream's tree** | yes — keep it mergeable |
 | `app/` | The SwiftUI macOS menu-bar app | no — ours only |
 | `scripts/sync-upstream.sh` | Local upstream-sync helper | no |
-| `.github/workflows/fork-*.yml` | Our CI (build/test) + weekly upstream sync | no |
+| `.github/workflows/fork-*.yml` | Our CI (build/test) + 3-hourly upstream-release sync | no |
 | `FORK.md` | This file | no |
 
 **Golden rule:** the engine stays at the repo root so merges from upstream are
@@ -30,20 +30,45 @@ upstream  https://github.com/router-for-me/CLIProxyAPI.git   # the source
 
 ## Pulling upstream updates
 
-**Automatic:** the `fork-sync` Action runs weekly (and on manual dispatch from
-the Actions tab). If upstream merges cleanly it opens a `sync/upstream-*` PR
-with build/test status; if it conflicts it files an issue.
+**Automatic:** the `fork-sync` Action runs **every 3 hours** (and on manual
+dispatch from the Actions tab). It tracks upstream's
+[releases](https://github.com/router-for-me/CLIProxyAPI/releases) — it resolves
+the **latest published release tag** (not raw `main`) and merges it into ours.
+Upstream ships several releases a day, so the cadence is deliberately tight.
+What happens next depends on the merge:
+
+| Outcome | Action takes |
+|---------|--------------|
+| Clean merge **and** `go build` + `go test` pass | **auto-merges straight to `main`** — no PR, no human step |
+| Clean merge but build/test **fails** | opens a normal `sync/upstream-*` PR titled `build/test FAILED` for you to fix |
+| Merge **conflict** | commits the conflicted tree and opens a **draft** PR titled `MANUAL: … CONFLICTS` listing the files |
+
+Because clean+green updates land on `main` on their own, the steady state is
+**zero manual work**; you only get a PR when something actually needs a human.
 
 **Manual (recommended when there are conflicts):**
 
 ```bash
-./scripts/sync-upstream.sh        # branch + merge upstream/main + build + test
+./scripts/sync-upstream.sh        # branch + merge latest release tag + build + test
 # resolve any conflicts, then:  git add -A && git commit --no-edit
 git push -u origin sync/upstream-<ts>   # open the PR
 ```
 
+By default the script merges the **latest release tag** (matching the Action).
+Override the target with `UPSTREAM_REF`:
+
+```bash
+UPSTREAM_REF=upstream/main ./scripts/sync-upstream.sh   # bleeding edge
+UPSTREAM_REF=v7.1.40       ./scripts/sync-upstream.sh   # pin a specific release
+```
+
 `git rerere` is enabled, so once you resolve a recurring conflict it's replayed
 automatically on future syncs.
+
+> **Note:** auto-merge needs the repo setting *Settings → Actions → General →
+> "Allow GitHub Actions to create and approve pull requests"* **enabled**, and
+> the workflow's default token permission set to **read and write**. Without it
+> the PR/auto-merge steps fail with `Resource not accessible by integration`.
 
 ## Making core fixes
 

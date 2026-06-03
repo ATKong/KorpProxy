@@ -1,14 +1,23 @@
+# Tracks upstream RELEASES (https://github.com/router-for-me/CLIProxyAPI/releases),
+# not raw main. Every 3h it resolves upstream's latest published release tag and:
+#   - clean merge + green build/test  -> auto-merges straight to `main`
+#   - clean merge + red build/test    -> opens a PR for review
+#   - merge conflict                  -> opens a draft PR with the conflict for manual resolution
+# Upstream ships several releases/day, so the cadence is deliberately tight.
 name: fork-sync
 
 on:
   schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+    - cron: "0 */3 * * *" # every 3 hours
   workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
-  issues: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -17,68 +26,110 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: main
 
       - name: Configure git + upstream
         run: |
+          set -euo pipefail
           git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git 2>/dev/null \
             || git remote set-url upstream https://github.com/router-for-me/CLIProxyAPI.git
-          git fetch upstream main
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Attempt merge
-        id: merge
+      - name: Resolve latest upstream release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if git merge-base --is-ancestor upstream/main origin/main; then
-            echo "status=uptodate" >> "$GITHUB_OUTPUT"
-            echo "Nothing to sync."
-            exit 0
+          set -euo pipefail
+          tag="$(gh api repos/router-for-me/CLIProxyAPI/releases/latest -q .tag_name)"
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "Could not resolve upstream latest release tag." >&2
+            exit 1
           fi
-          branch="sync/upstream-$(date -u +%Y%m%d-%H%M%S)"
+          echo "Latest upstream release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
+          if git merge-base --is-ancestor "$tag" origin/main; then
+            echo "status=uptodate" >> "$GITHUB_OUTPUT"
+            echo "Already in sync with $tag — nothing to do."
+          else
+            echo "status=behind" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge release tag
+        id: merge
+        if: steps.rel.outputs.status == 'behind'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.rel.outputs.tag }}"
+          branch="sync/upstream-$(date -u +%Y%m%d-%H%M%S)-${tag}"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
           git checkout -B "$branch" origin/main
-          if git merge --no-edit upstream/main; then
-            echo "status=clean" >> "$GITHUB_OUTPUT"
+          if git merge --no-edit "$tag"; then
+            echo "merge=clean" >> "$GITHUB_OUTPUT"
+            echo "Clean merge of $tag."
           else
-            git merge --abort
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "merge=conflict" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            echo "Conflicts in:"; cat /tmp/conflicts.txt
+            # Commit the conflicted tree (markers included) so the state is reviewable in a PR.
+            git add -A
+            git commit --no-edit -m "WIP: merge ${tag} — CONFLICTS, manual resolution required"
           fi
 
       - name: Set up Go
-        if: steps.merge.outputs.status == 'clean'
+        if: steps.merge.outputs.merge == 'clean'
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           check-latest: true
 
       - name: Build + test
-        if: steps.merge.outputs.status == 'clean'
         id: verify
+        if: steps.merge.outputs.merge == 'clean'
         continue-on-error: true
         run: |
+          set -euo pipefail
           go build ./cmd/server
           go test ./...
 
-      - name: Push branch + open PR
-        if: steps.merge.outputs.status == 'clean'
+      # Path 1: clean merge + green build/test -> auto-merge straight to main.
+      - name: Auto-merge to main
+        if: steps.merge.outputs.merge == 'clean' && steps.verify.outcome == 'success'
+        run: |
+          set -euo pipefail
+          echo "Build/test green — fast-forwarding main to ${{ steps.rel.outputs.tag }}."
+          # Fails loudly (non-ff) if main moved mid-run; the next scheduled run retries.
+          git push origin HEAD:main
+
+      # Path 2: clean merge but build/test failed -> open a PR for a human to fix.
+      - name: Open PR (build/test failed)
+        if: steps.merge.outputs.merge == 'clean' && steps.verify.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           git push -u origin "${{ steps.merge.outputs.branch }}"
           gh pr create \
             --base main \
             --head "${{ steps.merge.outputs.branch }}" \
-            --title "sync: merge upstream/main ($(date -u +%Y-%m-%d))" \
-            --body "Automated upstream sync. build/test outcome: ${{ steps.verify.outcome }}. Review before merging; fix any breakage on this branch." \
-            || echo "PR may already exist"
+            --title "sync: ${{ steps.rel.outputs.tag }} — build/test FAILED (review)" \
+            --body "Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge."
 
-      - name: Flag conflict
-        if: steps.merge.outputs.status == 'conflict'
+      # Path 3: merge conflict -> draft PR with the conflicted state for manual resolution.
+      - name: Open PR (merge conflict)
+        if: steps.merge.outputs.merge == 'conflict'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh issue create \
-            --title "Upstream sync needs manual merge ($(date -u +%Y-%m-%d))" \
-            --body "Auto-merge of upstream/main hit conflicts. Run \`./scripts/sync-upstream.sh\` locally to resolve (rerere remembers resolutions), then push the branch to open a PR." \
-            || echo "issue may already exist"
-          exit 1
+          set -euo pipefail
+          git push -u origin "${{ steps.merge.outputs.branch }}"
+          files="$(sed 's/^/- /' /tmp/conflicts.txt)"
+          body="$(printf 'Auto-sync of \`%s\` hit merge conflicts. Conflict markers are committed on this branch, so **do not merge as-is**.\n\nConflicted files:\n%s\n\nResolve locally (rerere remembers the resolution for next time):\n\n```bash\n./scripts/sync-upstream.sh\n```\n' "${{ steps.rel.outputs.tag }}" "$files")"
+          gh pr create \
+            --base main \
+            --head "${{ steps.merge.outputs.branch }}" \
+            --title "MANUAL: sync ${{ steps.rel.outputs.tag }} — CONFLICTS" \
+            --body "$body" \
+            --draft

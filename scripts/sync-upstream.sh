@@ -13,8 +13,11 @@
 set -euo pipefail
 
 UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
-UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 BASE_BRANCH="${BASE_BRANCH:-main}"
+# What to merge. By default we track the latest upstream *release* tag (matching
+# the fork-sync Action). Override with UPSTREAM_REF=upstream/main for bleeding edge,
+# or UPSTREAM_REF=v7.1.40 to pin a specific tag.
+UPSTREAM_REF="${UPSTREAM_REF:-}"
 
 cd "$(git rev-parse --show-toplevel)"
 
@@ -27,11 +30,21 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-echo "▸ Fetching ${UPSTREAM_REMOTE}…"
-git fetch "${UPSTREAM_REMOTE}"
+echo "▸ Fetching ${UPSTREAM_REMOTE} (with tags)…"
+git fetch --tags "${UPSTREAM_REMOTE}"
 
-if git merge-base --is-ancestor "${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}" "${BASE_BRANCH}"; then
-  echo "✓ Already up to date with ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}."
+# Resolve the ref to merge: latest release tag unless the caller pinned one.
+if [ -z "${UPSTREAM_REF}" ]; then
+  UPSTREAM_REF="$(git -c 'versionsort.suffix=-' tag -l 'v*' --sort=-v:refname | head -1)"
+  if [ -z "${UPSTREAM_REF}" ]; then
+    echo "✖ Could not find any upstream release tag (v*)." >&2
+    exit 1
+  fi
+fi
+echo "▸ Target upstream ref: ${UPSTREAM_REF}"
+
+if git merge-base --is-ancestor "${UPSTREAM_REF}" "${BASE_BRANCH}"; then
+  echo "✓ Already up to date with ${UPSTREAM_REF}."
   exit 0
 fi
 
@@ -39,8 +52,8 @@ SYNC_BRANCH="sync/upstream-$(date -u +%Y%m%d-%H%M%S)"
 echo "▸ Creating ${SYNC_BRANCH} from ${BASE_BRANCH}…"
 git checkout -B "${SYNC_BRANCH}" "${BASE_BRANCH}"
 
-echo "▸ Merging ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}…"
-if ! git merge --no-edit "${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}"; then
+echo "▸ Merging ${UPSTREAM_REF}…"
+if ! git merge --no-edit "${UPSTREAM_REF}"; then
   echo
   echo "✖ Merge conflicts in:"
   git diff --name-only --diff-filter=U | sed 's/^/    - /'
