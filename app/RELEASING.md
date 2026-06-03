@@ -11,6 +11,20 @@ Two independent pipelines, triggered by different git tags on the private
 The app **bundles** the engine, so a normal user only ever needs app updates;
 the engine tarballs are for headless/CLI use.
 
+### Why app releases live on a separate public repo
+
+`ATKong/KorpProxy` is **private** (free plan). Sparkle auto-update needs two
+things that a private free repo can't provide: **auth-free download URLs** for
+the release assets, and a **GitHub Pages**-served `appcast.xml` feed. So the
+canonical app release — assets + appcast — is published to the public
+`ATKong/KorpProxy-releases` repo. That repo is the **source of truth** for
+downloads and updates.
+
+For visibility, `app-release.yml` also **mirrors** each release onto this
+private repo (same `app-vX.Y.Z` tag, same signed `.dmg`/`.zip`), with notes that
+link back to the public canonical release. The mirror is convenience only —
+Sparkle and the website never read from it.
+
 ## Auto-update architecture (app)
 
 - Sparkle is added via SPM in `app/project.yml`; `UpdaterManager.swift` drives it.

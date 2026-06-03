@@ -10,7 +10,7 @@ on:
       - 'app-v*'
 
 permissions:
-  contents: read
+  contents: write # needed to mirror the Release onto this (private) repo
 
 jobs:
   release:
@@ -87,6 +87,23 @@ jobs:
           git add appcast.xml
           git commit -m "release: KorpProxy ${V}" || echo "appcast unchanged"
           git push origin main
+
+      - name: Mirror release onto this repo (visibility)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#app-v}"
+          ZIP="app/dist/KorpProxy-${V}.zip"
+          DMG="app/dist/KorpProxy-${V}.dmg"
+          PUBLIC="https://github.com/ATKong/KorpProxy-releases/releases/tag/app-v${V}"
+          NOTES="Mirror for visibility. **Canonical download + Sparkle auto-update live on the public releases repo:** ${PUBLIC} (the public repo is required because Sparkle needs auth-free asset URLs and a GitHub Pages appcast). The same signed .dmg/.zip are attached here."
+          # Create (or refresh) the mirror release on this private repo.
+          gh release create "app-v${V}" "$DMG" "$ZIP" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "KorpProxy ${V}" \
+            --notes "$NOTES" \
+            || gh release upload "app-v${V}" "$DMG" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Clean up keychain
         if: always()
