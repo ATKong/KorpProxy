@@ -7,7 +7,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.2.2"
+    MARKETING_VERSION: "0.2.3"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
     # Hardened runtime is required for Developer ID notarization (release builds).
@@ -32,10 +32,13 @@ targets:
         # Driven by the build settings so a release tag can bump them in one place.
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        # Sparkle auto-update. Feed is served from the public releases repo via
-        # GitHub Pages; SUPublicEDKey verifies update signatures (private key is
-        # the SPARKLE_PRIVATE_KEY CI secret).
-        SUFeedURL: "https://atkong.github.io/KorpProxy-releases/appcast.xml"
+        # Sparkle auto-update. Feed is served from THIS repo via GitHub Pages
+        # (gh-pages branch); SUPublicEDKey verifies update signatures (private
+        # key is the SPARKLE_PRIVATE_KEY CI secret). The legacy public
+        # KorpProxy-releases feed is still written at release time as a bridge so
+        # already-installed 0.2.0-0.2.2 builds (which only poll the old URL) can
+        # discover 0.2.3 and migrate. See RELEASING.md.
+        SUFeedURL: "https://atkong.github.io/KorpProxy/appcast.xml"
         SUPublicEDKey: "Vy+hU7sQEtUWg3I6uIGv6LPhWZ2VpWgrfCXZS7W+z+E="
         SUEnableAutomaticChecks: true
         SUScheduledCheckInterval: 86400
