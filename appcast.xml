@@ -1,0 +1,31 @@
+<?xml version='1.0' encoding='utf-8'?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <title>KorpProxy</title>
+    <description>KorpProxy app updates</description>
+    <item>
+      <title>Version 0.2.2</title>
+      <pubDate>Fri, 29 May 2026 18:58:03 GMT</pubDate>
+      <sparkle:version>2607</sparkle:version>
+      <sparkle:shortVersionString>0.2.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/ATKong/KorpProxy-releases/releases/download/app-v0.2.2/KorpProxy-0.2.2.zip" length="25349250" type="application/octet-stream" sparkle:edSignature="SkkoBl1dkHZnd2b27xxW7beWW2XWUkXYPM0JMRWnOV4mmBgfkNNRWSZdcVzn1QWScy6z7Ugpe0Td3uok74IFAg==" />
+    </item>
+    <item>
+      <title>Version 0.2.1</title>
+      <pubDate>Fri, 29 May 2026 18:19:06 GMT</pubDate>
+      <sparkle:version>2605</sparkle:version>
+      <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/ATKong/KorpProxy-releases/releases/download/app-v0.2.1/KorpProxy-0.2.1.zip" length="25342280" type="application/octet-stream" sparkle:edSignature="j/yALos9CQXa5fp/ZY1pusVWwK/pQ+GBkjx2Lqf5gFUdeJ1Pa4klNbytHFOBKhlfAB4Tb41xA+GGHQOpSz3WCw==" />
+    </item>
+    <item>
+      <title>Version 0.2.0</title>
+      <pubDate>Fri, 29 May 2026 17:30:38 GMT</pubDate>
+      <sparkle:version>2604</sparkle:version>
+      <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/ATKong/KorpProxy-releases/releases/download/app-v0.2.0/KorpProxy-0.2.0.zip" length="25342280" type="application/octet-stream" sparkle:edSignature="N2dw3txs+8jqeYwr379h8j7IWCsGbYi2CU7Tmu3UTS9uLKXunNXjgvybFUJ3a0pr2+1Tl80eaVF3CUIsjWgfCw==" />
+    </item>
+  </channel>
+</rss>
