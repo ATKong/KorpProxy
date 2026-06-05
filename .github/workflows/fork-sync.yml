@@ -110,12 +110,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git push -u origin "${{ steps.merge.outputs.branch }}"
-          gh pr create \
+          branch="${{ steps.merge.outputs.branch }}"
+          git push -u origin "$branch"
+          if gh pr create \
             --base main \
-            --head "${{ steps.merge.outputs.branch }}" \
+            --head "$branch" \
             --title "sync: ${{ steps.rel.outputs.tag }} — build/test FAILED (review)" \
-            --body "Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge."
+            --body "Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge."; then
+            echo "Opened review PR for $branch."
+          else
+            echo "::warning::Could not open PR for $branch — GITHUB_TOKEN PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure a PAT."
+            git push origin --delete "$branch" || true
+            exit 0
+          fi
 
       # Path 3: merge conflict -> draft PR with the conflicted state for manual resolution.
       - name: Open PR (merge conflict)
@@ -124,12 +131,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git push -u origin "${{ steps.merge.outputs.branch }}"
+          branch="${{ steps.merge.outputs.branch }}"
+          git push -u origin "$branch"
           files="$(sed 's/^/- /' /tmp/conflicts.txt)"
           body="$(printf 'Auto-sync of \`%s\` hit merge conflicts. Conflict markers are committed on this branch, so **do not merge as-is**.\n\nConflicted files:\n%s\n\nResolve locally (rerere remembers the resolution for next time):\n\n```bash\n./scripts/sync-upstream.sh\n```\n' "${{ steps.rel.outputs.tag }}" "$files")"
-          gh pr create \
+          if gh pr create \
             --base main \
-            --head "${{ steps.merge.outputs.branch }}" \
+            --head "$branch" \
             --title "MANUAL: sync ${{ steps.rel.outputs.tag }} — CONFLICTS" \
             --body "$body" \
-            --draft
+            --draft; then
+            echo "Opened draft conflict PR for $branch."
+          else
+            echo "::warning::Could not open PR for $branch — GITHUB_TOKEN PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure a PAT. Conflict tag: ${{ steps.rel.outputs.tag }} needs manual sync via ./scripts/sync-upstream.sh."
+            git push origin --delete "$branch" || true
+            exit 0
+          fi
