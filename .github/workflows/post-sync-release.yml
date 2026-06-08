@@ -1,0 +1,88 @@
+name: post-sync-release
+
+on:
+  workflow_run:
+    workflows: ["fork-ci"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: post-sync-release
+  cancel-in-progress: false
+
+jobs:
+  release-tags:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'main' }}
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+
+      - name: Create release tags for synced upstream
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/router-for-me/CLIProxyAPI.git
+
+          upstream_tag="$(gh api repos/router-for-me/CLIProxyAPI/releases/latest -q .tag_name)"
+          if [ -z "$upstream_tag" ] || [ "$upstream_tag" = "null" ]; then
+            echo "Could not resolve upstream latest release tag." >&2
+            exit 1
+          fi
+
+          git fetch upstream "refs/tags/${upstream_tag}:refs/tags/upstream/${upstream_tag}" --force
+          if ! git merge-base --is-ancestor "refs/tags/upstream/${upstream_tag}" HEAD; then
+            echo "main does not contain upstream ${upstream_tag}; skipping release tags."
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${upstream_tag}" >/dev/null 2>&1; then
+            echo "Engine release tag ${upstream_tag} already exists; skipping release tag creation."
+            exit 0
+          fi
+
+          release_sha="$(git rev-parse HEAD)"
+          git tag "$upstream_tag" "$release_sha"
+          git push origin "refs/tags/${upstream_tag}"
+          echo "Pushed engine release tag ${upstream_tag} at ${release_sha}."
+
+          git fetch --force origin "refs/tags/app-v*:refs/tags/app-v*" || true
+          latest_app_tag="$(git tag -l 'app-v[0-9]*' --sort=-v:refname | head -1)"
+          if [ -z "$latest_app_tag" ]; then
+            app_tag="app-v0.1.0"
+          else
+            version="${latest_app_tag#app-v}"
+            IFS=. read -r major minor patch <<EOF
+          $version
+          EOF
+            if [ -z "${major:-}" ] || [ -z "${minor:-}" ] || [ -z "${patch:-}" ]; then
+              echo "Could not parse latest app tag ${latest_app_tag}." >&2
+              exit 1
+            fi
+            patch=$((patch + 1))
+            app_tag="app-v${major}.${minor}.${patch}"
+          fi
+
+          while git ls-remote --exit-code --tags origin "refs/tags/${app_tag}" >/dev/null 2>&1; do
+            version="${app_tag#app-v}"
+            IFS=. read -r major minor patch <<EOF
+          $version
+          EOF
+            patch=$((patch + 1))
+            app_tag="app-v${major}.${minor}.${patch}"
+          done
+
+          git tag "$app_tag" "$release_sha"
+          git push origin "refs/tags/${app_tag}"
+          echo "Pushed app release tag ${app_tag} at ${release_sha}."
