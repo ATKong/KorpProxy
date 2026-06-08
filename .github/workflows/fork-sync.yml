@@ -118,17 +118,23 @@ jobs:
             echo "::warning::Could not push $branch. If the sync includes workflow-file changes, configure FORK_SYNC_TOKEN with Contents, Pull requests, and Workflows write permissions."
             exit 0
           fi
-          if gh pr create \
-            --base main \
-            --head "$branch" \
-            --title "sync: ${{ steps.rel.outputs.tag }} — build/test FAILED (review)" \
-            --body "Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge."; then
-            echo "Opened review PR for $branch."
-          else
-            echo "::warning::Could not open PR for $branch — sync token PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure FORK_SYNC_TOKEN."
-            git push origin --delete "$branch" || true
-            exit 0
-          fi
+          for attempt in 1 2 3 4 5; do
+            if gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "sync: ${{ steps.rel.outputs.tag }} — build/test FAILED (review)" \
+              --body "Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge."; then
+              echo "Opened review PR for $branch."
+              exit 0
+            fi
+            if [ "$attempt" != "5" ]; then
+              echo "::warning::PR creation attempt $attempt failed for $branch; retrying after GitHub indexes the branch."
+              sleep 5
+            fi
+          done
+          echo "::warning::Could not open PR for $branch. Deleting orphan branch to avoid pile-up. Check PR permissions for FORK_SYNC_TOKEN and whether the branch has commits ahead of main."
+          git push origin --delete "$branch" || true
+          exit 0
 
       # Path 3: merge conflict -> draft PR with the conflicted state for manual resolution.
       - name: Open PR (merge conflict)
@@ -145,15 +151,21 @@ jobs:
           fi
           files="$(sed 's/^/- /' /tmp/conflicts.txt)"
           body="$(printf "Auto-sync of \`%s\` hit merge conflicts. Conflict markers are committed on this branch, so **do not merge as-is**.\n\nConflicted files:\n%s\n\nResolve locally (rerere remembers the resolution for next time):\n\n\`\`\`bash\n./scripts/sync-upstream.sh\n\`\`\`\n" "$tag" "$files")"
-          if gh pr create \
-            --base main \
-            --head "$branch" \
-            --title "MANUAL: sync $tag — CONFLICTS" \
-            --body "$body" \
-            --draft; then
-            echo "Opened draft conflict PR for $branch."
-          else
-            echo "::warning::Could not open PR for $branch — sync token PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure FORK_SYNC_TOKEN. Conflict tag: $tag needs manual sync via ./scripts/sync-upstream.sh."
-            git push origin --delete "$branch" || true
-            exit 0
-          fi
+          for attempt in 1 2 3 4 5; do
+            if gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "MANUAL: sync $tag — CONFLICTS" \
+              --body "$body" \
+              --draft; then
+              echo "Opened draft conflict PR for $branch."
+              exit 0
+            fi
+            if [ "$attempt" != "5" ]; then
+              echo "::warning::PR creation attempt $attempt failed for $branch; retrying after GitHub indexes the branch."
+              sleep 5
+            fi
+          done
+          echo "::warning::Could not open PR for $branch. Deleting orphan branch to avoid pile-up. Check PR permissions for FORK_SYNC_TOKEN and whether the branch has commits ahead of main. Conflict tag: $tag needs manual sync via ./scripts/sync-upstream.sh."
+          git push origin --delete "$branch" || true
+          exit 0
