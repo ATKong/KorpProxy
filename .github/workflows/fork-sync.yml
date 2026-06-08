@@ -119,12 +119,13 @@ jobs:
             exit 0
           fi
           for attempt in 1 2 3 4 5; do
-            if gh pr create \
-              --base main \
-              --head "$branch" \
-              --title "sync: ${{ steps.rel.outputs.tag }} — build/test FAILED (review)" \
-              --body "Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge."; then
-              echo "Opened review PR for $branch."
+            if pr_url="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f base=main \
+              -f head="$branch" \
+              -f title="sync: ${{ steps.rel.outputs.tag }} — build/test FAILED (review)" \
+              -f body="Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge." \
+              --jq .html_url)"; then
+              echo "Opened review PR for $branch: $pr_url"
               exit 0
             fi
             if [ "$attempt" != "5" ]; then
@@ -152,13 +153,14 @@ jobs:
           files="$(sed 's/^/- /' /tmp/conflicts.txt)"
           body="$(printf "Auto-sync of \`%s\` hit merge conflicts. Conflict markers are committed on this branch, so **do not merge as-is**.\n\nConflicted files:\n%s\n\nResolve locally (rerere remembers the resolution for next time):\n\n\`\`\`bash\n./scripts/sync-upstream.sh\n\`\`\`\n" "$tag" "$files")"
           for attempt in 1 2 3 4 5; do
-            if gh pr create \
-              --base main \
-              --head "$branch" \
-              --title "MANUAL: sync $tag — CONFLICTS" \
-              --body "$body" \
-              --draft; then
-              echo "Opened draft conflict PR for $branch."
+            if pr_url="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f base=main \
+              -f head="$branch" \
+              -f title="MANUAL: sync $tag — CONFLICTS" \
+              -f body="$body" \
+              -F draft=true \
+              --jq .html_url)"; then
+              echo "Opened draft conflict PR for $branch: $pr_url"
               exit 0
             fi
             if [ "$attempt" != "5" ]; then
