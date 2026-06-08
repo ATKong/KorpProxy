@@ -27,6 +27,9 @@ jobs:
         with:
           fetch-depth: 0
           ref: main
+          # Set FORK_SYNC_TOKEN to a PAT/GitHub App token with Contents, Pull requests,
+          # and Workflows write permissions so upstream workflow-file changes can sync.
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
 
       - name: Configure git + upstream
         run: |
@@ -39,7 +42,7 @@ jobs:
       - name: Resolve latest upstream release
         id: rel
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
         run: |
           set -euo pipefail
           tag="$(gh api repos/router-for-me/CLIProxyAPI/releases/latest -q .tag_name)"
@@ -107,11 +110,14 @@ jobs:
       - name: Open PR (build/test failed)
         if: steps.merge.outputs.merge == 'clean' && steps.verify.outcome == 'failure'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
         run: |
           set -euo pipefail
           branch="${{ steps.merge.outputs.branch }}"
-          git push -u origin "$branch"
+          if ! git push -u origin "$branch"; then
+            echo "::warning::Could not push $branch. If the sync includes workflow-file changes, configure FORK_SYNC_TOKEN with Contents, Pull requests, and Workflows write permissions."
+            exit 0
+          fi
           if gh pr create \
             --base main \
             --head "$branch" \
@@ -119,7 +125,7 @@ jobs:
             --body "Auto-sync merged \`${{ steps.rel.outputs.tag }}\` cleanly, but \`go build ./cmd/server\` / \`go test ./...\` failed. Fix on this branch, then merge."; then
             echo "Opened review PR for $branch."
           else
-            echo "::warning::Could not open PR for $branch — GITHUB_TOKEN PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure a PAT."
+            echo "::warning::Could not open PR for $branch — sync token PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure FORK_SYNC_TOKEN."
             git push origin --delete "$branch" || true
             exit 0
           fi
@@ -128,22 +134,26 @@ jobs:
       - name: Open PR (merge conflict)
         if: steps.merge.outputs.merge == 'conflict'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
         run: |
           set -euo pipefail
+          tag="${{ steps.rel.outputs.tag }}"
           branch="${{ steps.merge.outputs.branch }}"
-          git push -u origin "$branch"
+          if ! git push -u origin "$branch"; then
+            echo "::warning::Could not push $branch. If the sync includes workflow-file changes, configure FORK_SYNC_TOKEN with Contents, Pull requests, and Workflows write permissions. Conflict tag: $tag needs manual sync via ./scripts/sync-upstream.sh."
+            exit 0
+          fi
           files="$(sed 's/^/- /' /tmp/conflicts.txt)"
-          body="$(printf 'Auto-sync of \`%s\` hit merge conflicts. Conflict markers are committed on this branch, so **do not merge as-is**.\n\nConflicted files:\n%s\n\nResolve locally (rerere remembers the resolution for next time):\n\n```bash\n./scripts/sync-upstream.sh\n```\n' "${{ steps.rel.outputs.tag }}" "$files")"
+          body="$(printf "Auto-sync of \`%s\` hit merge conflicts. Conflict markers are committed on this branch, so **do not merge as-is**.\n\nConflicted files:\n%s\n\nResolve locally (rerere remembers the resolution for next time):\n\n\`\`\`bash\n./scripts/sync-upstream.sh\n\`\`\`\n" "$tag" "$files")"
           if gh pr create \
             --base main \
             --head "$branch" \
-            --title "MANUAL: sync ${{ steps.rel.outputs.tag }} — CONFLICTS" \
+            --title "MANUAL: sync $tag — CONFLICTS" \
             --body "$body" \
             --draft; then
             echo "Opened draft conflict PR for $branch."
           else
-            echo "::warning::Could not open PR for $branch — GITHUB_TOKEN PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure a PAT. Conflict tag: ${{ steps.rel.outputs.tag }} needs manual sync via ./scripts/sync-upstream.sh."
+            echo "::warning::Could not open PR for $branch — sync token PR creation is blocked. Deleting orphan branch to avoid pile-up. Enable 'Settings → Actions → General → Allow GitHub Actions to create and approve pull requests', or configure FORK_SYNC_TOKEN. Conflict tag: $tag needs manual sync via ./scripts/sync-upstream.sh."
             git push origin --delete "$branch" || true
             exit 0
           fi
