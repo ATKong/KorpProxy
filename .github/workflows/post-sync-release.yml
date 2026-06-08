@@ -41,7 +41,7 @@ jobs:
             exit 1
           fi
 
-          git fetch upstream "refs/tags/${upstream_tag}:refs/tags/upstream/${upstream_tag}" --force
+          git fetch --no-tags upstream "refs/tags/${upstream_tag}:refs/tags/upstream/${upstream_tag}" --force
           if ! git merge-base --is-ancestor "refs/tags/upstream/${upstream_tag}" HEAD; then
             echo "main does not contain upstream ${upstream_tag}; skipping release tags."
             exit 0
@@ -53,6 +53,7 @@ jobs:
           fi
 
           release_sha="$(git rev-parse HEAD)"
+          git tag -d "$upstream_tag" 2>/dev/null || true
           git tag "$upstream_tag" "$release_sha"
           git push origin "refs/tags/${upstream_tag}"
           echo "Pushed engine release tag ${upstream_tag} at ${release_sha}."
