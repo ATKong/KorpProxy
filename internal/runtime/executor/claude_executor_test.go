@@ -959,6 +959,50 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsClaudeErrorEvent(t *testing
 	}
 }
 
+func TestClaudeExecutor_ExecuteStreamConvertsRateLimitErrorEventTo429(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: error\n"))
+		_, _ = w.Write([]byte(`data: {"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}` + "\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before error chunk")
+	}
+	if len(chunk.Payload) != 0 {
+		t.Fatalf("first chunk payload = %q, want empty payload", chunk.Payload)
+	}
+	if chunk.Err == nil {
+		t.Fatal("first chunk err = nil, want rate-limit error")
+	}
+	assertStatusErr(t, chunk.Err, http.StatusTooManyRequests)
+	if !strings.Contains(chunk.Err.Error(), "rate limit exceeded") {
+		t.Fatalf("first chunk err = %q, want rate limit message", chunk.Err.Error())
+	}
+	if next, ok := <-result.Chunks; ok {
+		t.Fatalf("unexpected extra chunk: %#v", next)
+	}
+}
+
 func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsIncompleteClaudeStream(t *testing.T) {
 	body := strings.Join([]string{
 		`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-3-5-sonnet-20241022"}}`,

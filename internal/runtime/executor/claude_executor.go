@@ -492,11 +492,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if from == to {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
+			var pendingEvent string
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
+				}
+				if streamErr, consumed := claudeStreamErrorFromLine(line, &pendingEvent); streamErr != nil {
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case <-ctx.Done():
+					}
+					return
+				} else if consumed {
+					continue
 				}
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				// Forward the line as-is to preserve SSE format
@@ -524,11 +536,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		var pendingEvent string
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
+			}
+			if streamErr, consumed := claudeStreamErrorFromLine(line, &pendingEvent); streamErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
+				}
+				return
+			} else if consumed {
+				continue
 			}
 			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			chunks := sdktranslator.TranslateStream(
@@ -561,6 +585,69 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
 
+func claudeStreamErrorFromLine(line []byte, pendingEvent *string) (error, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return nil, false
+	}
+	if bytes.HasPrefix(trimmed, []byte("event:")) {
+		event := strings.TrimSpace(string(trimmed[len("event:"):]))
+		if pendingEvent != nil {
+			*pendingEvent = event
+		}
+		return nil, strings.EqualFold(event, "error")
+	}
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return nil, false
+	}
+
+	payload := bytes.TrimSpace(trimmed[len("data:"):])
+	event := ""
+	if pendingEvent != nil {
+		event = *pendingEvent
+		*pendingEvent = ""
+	}
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return nil, false
+	}
+	if !strings.EqualFold(event, "error") && gjson.GetBytes(payload, "type").String() != "error" {
+		return nil, false
+	}
+	if !gjson.ValidBytes(payload) {
+		return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned malformed stream error event"}, true
+	}
+	return claudeStreamStatusError(gjson.ParseBytes(payload)), true
+}
+
+func claudeStreamStatusError(root gjson.Result) error {
+	errType := strings.TrimSpace(root.Get("error.type").String())
+	message := strings.TrimSpace(root.Get("error.message").String())
+	if message == "" {
+		message = errType
+	}
+	if message == "" {
+		message = "unknown upstream error"
+	}
+	return statusErr{code: claudeStreamErrorStatus(errType), msg: "claude executor: upstream returned error event: " + message}
+}
+
+func claudeStreamErrorStatus(errType string) int {
+	switch strings.ToLower(strings.TrimSpace(errType)) {
+	case "rate_limit_error":
+		return http.StatusTooManyRequests
+	case "authentication_error":
+		return http.StatusUnauthorized
+	case "permission_error":
+		return http.StatusForbidden
+	case "invalid_request_error":
+		return http.StatusBadRequest
+	case "not_found_error":
+		return http.StatusNotFound
+	default:
+		return http.StatusBadGateway
+	}
+}
+
 func validateClaudeStreamingResponse(data []byte) error {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(nil, 52_428_800)
@@ -586,14 +673,7 @@ func validateClaudeStreamingResponse(data []byte) error {
 		root := gjson.ParseBytes(payload)
 		switch root.Get("type").String() {
 		case "error":
-			message := strings.TrimSpace(root.Get("error.message").String())
-			if message == "" {
-				message = strings.TrimSpace(root.Get("error.type").String())
-			}
-			if message == "" {
-				message = "unknown upstream error"
-			}
-			return statusErr{code: http.StatusBadGateway, msg: "claude executor: upstream returned error event: " + message}
+			return claudeStreamStatusError(root)
 		case "message_start":
 			message := root.Get("message")
 			if strings.TrimSpace(message.Get("id").String()) == "" || strings.TrimSpace(message.Get("model").String()) == "" {

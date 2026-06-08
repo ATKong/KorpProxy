@@ -482,6 +482,147 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	}
 }
 
+func TestManager_ExecuteRateLimitFallsBackAndCoolsDownAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-rate-limited-auth": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    "rate limit exceeded",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-sonnet-rate-limit"
+	badAuth := &Auth{ID: "aa-rate-limited-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute error = %v, want rollover success", errExecute)
+	}
+	if string(resp.Payload) != goodAuth.ID {
+		t.Fatalf("Execute payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	state := updatedBad.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state for %q", model)
+	}
+	if !state.Unavailable || !state.Quota.Exceeded {
+		t.Fatalf("expected bad auth model to be cooling down with quota exceeded, got %#v", state)
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected bad auth model state cooldown to be set")
+	}
+}
+
+func TestManager_ExecuteStreamRateLimitBootstrapFallsBackAndCoolsDownAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		streamFirstErrors: map[string]error{
+			"aa-rate-limited-auth": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    "rate limit exceeded",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-sonnet-stream-rate-limit"
+	badAuth := &Auth{ID: "aa-rate-limited-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream error = %v, want rollover success", errExecute)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v, want success", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != goodAuth.ID {
+		t.Fatalf("stream payload = %q, want %q", string(payload), goodAuth.ID)
+	}
+
+	got := executor.StreamCalls()
+	want := []string{badAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	state := updatedBad.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state for %q", model)
+	}
+	if !state.Unavailable || !state.Quota.Exceeded {
+		t.Fatalf("expected bad auth model to be cooling down with quota exceeded, got %#v", state)
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected bad auth model state cooldown to be set")
+	}
+}
+
 func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
