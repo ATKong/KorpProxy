@@ -1677,10 +1677,12 @@ func TestExecutorAdapterMethods(t *testing.T) {
 		},
 	}
 	adapter := &executorAdapter{
-		host:     host,
-		pluginID: "executor-plugin",
-		provider: "plugin-provider",
-		executor: exec,
+		host:          host,
+		pluginID:      "executor-plugin",
+		provider:      "plugin-provider",
+		executor:      exec,
+		inputFormats:  []sdktranslator.Format{sdktranslator.FormatClaude},
+		outputFormats: []sdktranslator.Format{sdktranslator.FormatClaude},
 	}
 	auth := &coreauth.Auth{
 		ID:       "auth-1",
@@ -1849,9 +1851,11 @@ func TestExecutorAdapterPanicFusesAndReturnsError(t *testing.T) {
 	host := New()
 	calls := 0
 	adapter := &executorAdapter{
-		host:     host,
-		pluginID: "executor-panic",
-		provider: "plugin-provider",
+		host:          host,
+		pluginID:      "executor-panic",
+		provider:      "plugin-provider",
+		inputFormats:  []sdktranslator.Format{sdktranslator.FormatOpenAI},
+		outputFormats: []sdktranslator.Format{sdktranslator.FormatOpenAI},
 		executor: &fakeExecutor{
 			execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 				calls++
@@ -2214,7 +2218,7 @@ func (e *fakeExecutor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHT
 
 func assertExecutorRequest(t *testing.T, req pluginapi.ExecutorRequest) {
 	t.Helper()
-	if req.AuthID != "auth-1" || req.AuthProvider != "plugin-provider" || req.Model != "model-1" || req.Format != sdktranslator.FormatOpenAI.String() ||
+	if req.AuthID != "auth-1" || req.AuthProvider != "plugin-provider" || req.Model != "model-1" || req.Format != sdktranslator.FormatClaude.String() ||
 		!req.Stream || req.Alt != "alt" || req.Headers.Get("X-Request") != "yes" || string(req.OriginalRequest) != "original" ||
 		req.SourceFormat != sdktranslator.FormatClaude.String() || string(req.Payload) != "payload" ||
 		req.Metadata["req"] != "metadata" || req.Metadata["opt"] != "metadata" {
