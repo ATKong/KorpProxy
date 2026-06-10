@@ -35,7 +35,35 @@ type Usage struct {
 var (
 	mu    sync.RWMutex
 	store = make(map[string]Usage)
+
+	// exhaustionHook, when set, is invoked after each snapshot whose account is
+	// fully maxed on a rolling window. It lets a higher layer (the auth manager)
+	// proactively rotate away from the account without usagestats importing it,
+	// which would create an import cycle. resetUnix is the epoch (seconds) at
+	// which the blocking window recovers.
+	exhaustionHook   func(authID string, resetUnix int64)
+	exhaustionHookMu sync.RWMutex
 )
+
+// SetExhaustionHook registers the callback invoked when an account becomes fully
+// maxed. Passing nil clears it. Safe for concurrent use.
+func SetExhaustionHook(hook func(authID string, resetUnix int64)) {
+	exhaustionHookMu.Lock()
+	exhaustionHook = hook
+	exhaustionHookMu.Unlock()
+}
+
+func notifyExhaustion(authID string, snapshot Usage) {
+	exhaustionHookMu.RLock()
+	hook := exhaustionHook
+	exhaustionHookMu.RUnlock()
+	if hook == nil {
+		return
+	}
+	if resetUnix, ok := snapshot.ExhaustedUntil(); ok {
+		hook(authID, resetUnix)
+	}
+}
 
 // RecordFromHeaders parses a provider's rate-limit response headers and stores a
 // snapshot for authID. It understands Anthropic's anthropic-ratelimit-unified-*
@@ -57,6 +85,8 @@ func RecordFromHeaders(authID string, h http.Header) {
 	mu.Lock()
 	store[authID] = *snapshot
 	mu.Unlock()
+
+	notifyExhaustion(authID, *snapshot)
 }
 
 // parseAnthropic reads anthropic-ratelimit-unified-* headers (Claude). Returns
@@ -128,6 +158,43 @@ func Get(authID string) (Usage, bool) {
 	snapshot, ok := store[authID]
 	mu.RUnlock()
 	return snapshot, ok
+}
+
+// ExhaustedUntil reports whether the account is fully maxed out on any of its
+// rolling windows, returning the unix epoch (seconds) at which the blocking
+// window resets. ok is false when the account still has headroom.
+//
+// "Fully maxed" means a window's status is "rejected"/"exceeded" or its
+// utilization has reached 1.0 (100%). When several windows are exhausted, the
+// latest reset wins so the account is skipped until every blocked window has
+// recovered. This drives proactive rotation: an account is taken out of the
+// rotation BEFORE it returns a 429, using the rate-limit headers the provider
+// already reports on every response.
+func (u Usage) ExhaustedUntil() (resetUnix int64, ok bool) {
+	for _, w := range []*Window{u.FiveHour, u.SevenDay} {
+		if !windowExhausted(w) {
+			continue
+		}
+		ok = true
+		if w.Reset > resetUnix {
+			resetUnix = w.Reset
+		}
+	}
+	return resetUnix, ok
+}
+
+// windowExhausted reports whether a single window is fully consumed.
+func windowExhausted(w *Window) bool {
+	if w == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(w.Status)) {
+	case "rejected", "exceeded", "blocked":
+		return true
+	}
+	// Utilization is a fraction in [0,1] (may exceed 1 in overage); treat >= 1
+	// as fully maxed.
+	return w.Utilization >= 1.0
 }
 
 // parseWindow reads the utilization/reset/status headers for a window, trying

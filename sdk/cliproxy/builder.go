@@ -12,6 +12,7 @@ import (
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagestats"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -264,6 +265,13 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
+	// Wire proactive usage-based rotation (KorpProxy-specific): when an account's
+	// rolling rate-limit window is fully consumed (reported via provider usage
+	// headers), take it out of the rotation until the window resets so requests
+	// fail over to another account before hitting a 429.
+	usagestats.SetExhaustionHook(func(authID string, resetUnix int64) {
+		coreManager.MarkUsageExhausted(authID, time.Unix(resetUnix, 0))
+	})
 	coreManager.SetConfig(b.cfg)
 	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
 	if pluginHost != nil {
