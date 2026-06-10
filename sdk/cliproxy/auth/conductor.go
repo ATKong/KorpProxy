@@ -84,6 +84,12 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+	// quotaSyntheticBackoffMax caps the cooldown used for a 429 when the provider
+	// did NOT supply a retry hint (no Retry-After / rate-limit reset header). The
+	// real reset, when present, is always honored verbatim and may legitimately be
+	// minutes long; this cap only bounds the guessed fallback so a provider that
+	// omits the header can never trigger a multi-minute blackout across accounts.
+	quotaSyntheticBackoffMax = time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -2743,16 +2749,25 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
-				resetModelState(state, now)
-				updateAggregatedAvailability(auth, now)
-				if !hasModelError(auth, now) {
-					auth.LastError = nil
-					auth.StatusMessage = ""
-					auth.Status = StatusActive
+				// KorpProxy: a proactive usage-limit block (set from rolling-window
+				// rate-limit headers) is authoritative until its window resets; a
+				// request that streams through must not clear it, otherwise the
+				// account would be re-selected while still maxed.
+				if hasActiveUsageLimitBlock(state, now) {
+					updateAggregatedAvailability(auth, now)
+					auth.UpdatedAt = now
+				} else {
+					resetModelState(state, now)
+					updateAggregatedAvailability(auth, now)
+					if !hasModelError(auth, now) {
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+					}
+					auth.UpdatedAt = now
+					shouldResumeModel = true
+					clearModelQuota = true
 				}
-				auth.UpdatedAt = now
-				shouldResumeModel = true
-				clearModelQuota = true
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
@@ -2824,9 +2839,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
 								if result.RetryAfter != nil {
+									// Provider told us exactly when capacity returns; honor it verbatim.
 									next = now.Add(*result.RetryAfter)
 								} else {
 									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+									if cooldown > quotaSyntheticBackoffMax {
+										cooldown = quotaSyntheticBackoffMax
+									}
 									if cooldown > 0 {
 										next = now.Add(cooldown)
 									}
@@ -3338,9 +3357,13 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		var next time.Time
 		if !disableCooling {
 			if retryAfter != nil {
+				// Provider told us exactly when capacity returns; honor it verbatim.
 				next = now.Add(*retryAfter)
 			} else {
 				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+				if cooldown > quotaSyntheticBackoffMax {
+					cooldown = quotaSyntheticBackoffMax
+				}
 				if cooldown > 0 {
 					next = now.Add(cooldown)
 				}
