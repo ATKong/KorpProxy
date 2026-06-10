@@ -1003,6 +1003,42 @@ func TestClaudeExecutor_ExecuteStreamConvertsRateLimitErrorEventTo429(t *testing
 	}
 }
 
+func TestClaudeExecutor_ExecuteStream429AttachesRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "37")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err == nil {
+		t.Fatal("ExecuteStream error = nil, want 429")
+	}
+	assertStatusErr(t, err, http.StatusTooManyRequests)
+
+	ra, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok {
+		t.Fatalf("error %T does not expose RetryAfter", err)
+	}
+	got := ra.RetryAfter()
+	if got == nil || *got != 37*time.Second {
+		t.Fatalf("RetryAfter() = %v, want 37s", got)
+	}
+}
+
 func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsIncompleteClaudeStream(t *testing.T) {
 	body := strings.Join([]string{
 		`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-3-5-sonnet-20241022"}}`,

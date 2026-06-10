@@ -136,8 +136,13 @@ quota-exceeded:
   antigravity-credits: true # Whether to use credits as last-resort fallback when all free-tier auths are exhausted for Claude models
 
 # Routing strategy for selecting credentials when multiple match.
+# With multiple accounts of the same provider (e.g. two Claude logins), requests
+# rotate across them automatically. An account that hits a rate limit (429) is
+# put on cooldown and skipped until it recovers; for Claude/Codex the proxy also
+# reads each response's rolling rate-limit headers and proactively rotates away
+# from an account whose usage window is fully maxed BEFORE it would 429.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first
+  strategy: "round-robin" # round-robin (default, spreads load), fill-first (burn one account, then switch)
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Amp-Thread-Id (Amp CLI),

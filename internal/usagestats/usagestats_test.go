@@ -116,3 +116,103 @@ func TestRecordFromHeadersAnthropicWinsOverCodex(t *testing.T) {
 		t.Fatalf("expected anthropic 0.3 to win, got %+v ok=%v", u, ok)
 	}
 }
+
+func TestExhaustedUntil(t *testing.T) {
+	reset5h := int64(2_000_000_000)
+	reset7d := int64(2_000_500_000)
+
+	cases := []struct {
+		name      string
+		usage     Usage
+		wantOK    bool
+		wantReset int64
+	}{
+		{
+			name:   "headroom",
+			usage:  Usage{FiveHour: &Window{Utilization: 0.4, Status: "active"}},
+			wantOK: false,
+		},
+		{
+			name:      "five_hour full by utilization",
+			usage:     Usage{FiveHour: &Window{Utilization: 1.0, Reset: reset5h}},
+			wantOK:    true,
+			wantReset: reset5h,
+		},
+		{
+			name:      "status rejected",
+			usage:     Usage{FiveHour: &Window{Utilization: 0.8, Status: "rejected", Reset: reset5h}},
+			wantOK:    true,
+			wantReset: reset5h,
+		},
+		{
+			name: "both exhausted uses latest reset",
+			usage: Usage{
+				FiveHour: &Window{Utilization: 1.0, Reset: reset5h},
+				SevenDay: &Window{Utilization: 1.2, Reset: reset7d},
+			},
+			wantOK:    true,
+			wantReset: reset7d,
+		},
+		{
+			name:   "near max is not exhausted",
+			usage:  Usage{FiveHour: &Window{Utilization: 0.99, Status: "warning"}},
+			wantOK: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotReset, gotOK := tc.usage.ExhaustedUntil()
+			if gotOK != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", gotOK, tc.wantOK)
+			}
+			if tc.wantOK && gotReset != tc.wantReset {
+				t.Fatalf("reset = %d, want %d", gotReset, tc.wantReset)
+			}
+		})
+	}
+}
+
+func TestRecordFromHeadersFiresExhaustionHook(t *testing.T) {
+	t.Cleanup(func() { SetExhaustionHook(nil) })
+
+	type call struct {
+		authID    string
+		resetUnix int64
+	}
+	got := make(chan call, 1)
+	SetExhaustionHook(func(authID string, resetUnix int64) {
+		got <- call{authID, resetUnix}
+	})
+
+	reset := int64(2_000_000_000)
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "1.0")
+	h.Set("anthropic-ratelimit-unified-5h-reset", "2000000000")
+	h.Set("anthropic-ratelimit-unified-5h-status", "rejected")
+	RecordFromHeaders("hook-1", h)
+
+	select {
+	case c := <-got:
+		if c.authID != "hook-1" || c.resetUnix != reset {
+			t.Fatalf("hook call = %+v, want {hook-1 %d}", c, reset)
+		}
+	default:
+		t.Fatal("expected exhaustion hook to fire")
+	}
+}
+
+func TestRecordFromHeadersSkipsHookWhenHealthy(t *testing.T) {
+	t.Cleanup(func() { SetExhaustionHook(nil) })
+
+	fired := false
+	SetExhaustionHook(func(string, int64) { fired = true })
+
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "0.5")
+	h.Set("anthropic-ratelimit-unified-5h-status", "active")
+	RecordFromHeaders("hook-2", h)
+
+	if fired {
+		t.Fatal("hook must not fire when the account still has headroom")
+	}
+}
