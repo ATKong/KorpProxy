@@ -4,6 +4,14 @@
     <title>KorpProxy</title>
     <description>KorpProxy app updates</description>
     <item>
+      <title>Version 0.2.21</title>
+      <pubDate>Sun, 14 Jun 2026 15:41:14 GMT</pubDate>
+      <sparkle:version>2789</sparkle:version>
+      <sparkle:shortVersionString>0.2.21</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/ATKong/KorpProxy/releases/download/app-v0.2.21/KorpProxy-0.2.21.zip" length="26025254" type="application/octet-stream" sparkle:edSignature="e2tMH2i1ddT/CBtRXsUkP4aC3Xg1wr50mAAdTwg5teNJNnSMyQNR5qNZeQjnEfyoQktIyL5VWkZGsknvWvniDg==" />
+    </item>
+    <item>
       <title>Version 0.2.20</title>
       <pubDate>Sun, 14 Jun 2026 10:17:16 GMT</pubDate>
       <sparkle:version>2783</sparkle:version>
