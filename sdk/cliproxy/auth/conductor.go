@@ -1584,7 +1584,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 	if lastErr != nil {
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if resp, ok := m.tryAntigravityCreditsExecute(ctx, req, opts); ok {
+			if resp, ok, errCredits := m.tryAntigravityCreditsExecute(ctx, req, opts); errCredits != nil {
+				return cliproxyexecutor.Response{}, errCredits
+			} else if ok {
 				return resp, nil
 			}
 		}
@@ -1650,7 +1652,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 	if lastErr != nil {
 		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
-			if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
+			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
+				return nil, errCredits
+			} else if ok {
 				return result, nil
 			}
 		}
@@ -4241,15 +4245,13 @@ func requestedModelFromMetadata(metadata map[string]any, fallback string) string
 	return fallback
 }
 
-func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opts cliproxyexecutor.Options) []creditsCandidateEntry {
+func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, routeModel string, opts cliproxyexecutor.Options) ([]creditsCandidateEntry, error) {
 	if m == nil {
-		return nil
+		return nil, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	var candidates []creditsCandidateEntry
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var known []creditsCandidateEntry
-	var unknown []creditsCandidateEntry
 	for _, auth := range m.auths {
 		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
 			continue
@@ -4268,24 +4270,29 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 		if !ok {
 			continue
 		}
-
-		hint, okHint := GetAntigravityCreditsHint(auth.ID)
-		if okHint && hint.Known {
-			if !hint.Available {
-				continue
-			}
-			known = append(known, creditsCandidateEntry{
-				auth:     auth.Clone(),
-				executor: executor,
-				provider: providerKey,
-			})
-			continue
-		}
-		unknown = append(unknown, creditsCandidateEntry{
+		candidates = append(candidates, creditsCandidateEntry{
 			auth:     auth.Clone(),
 			executor: executor,
 			provider: providerKey,
 		})
+	}
+	m.mu.RUnlock()
+
+	var known []creditsCandidateEntry
+	var unknown []creditsCandidateEntry
+	for _, candidate := range candidates {
+		hint, okHint, errHint := GetAntigravityCreditsHintRequired(ctx, candidate.auth.ID)
+		if errHint != nil {
+			return nil, antigravityCreditsKVUnavailableError(errHint)
+		}
+		if okHint && hint.Known {
+			if !hint.Available {
+				continue
+			}
+			known = append(known, candidate)
+			continue
+		}
+		unknown = append(unknown, candidate)
 	}
 	sort.Slice(known, func(i, j int) bool {
 		return known[i].auth.ID < known[j].auth.ID
@@ -4293,7 +4300,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 	sort.Slice(unknown, func(i, j int) bool {
 		return unknown[i].auth.ID < unknown[j].auth.ID
 	})
-	return append(known, unknown...)
+	return append(known, unknown...), nil
 }
 
 type creditsCandidateEntry struct {
@@ -4343,12 +4350,15 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 	}
 }
 
-func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool) {
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool, error) {
 	routeModel := req.Model
-	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
+	if errCandidates != nil {
+		return cliproxyexecutor.Response{}, false, errCandidates
+	}
 	for _, c := range candidates {
 		if ctx.Err() != nil {
-			return cliproxyexecutor.Response{}, false
+			return cliproxyexecutor.Response{}, false, nil
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
@@ -4385,18 +4395,21 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 				continue
 			}
 			m.MarkResult(creditsCtx, result)
-			return resp, true
+			return resp, true, nil
 		}
 	}
-	return cliproxyexecutor.Response{}, false
+	return cliproxyexecutor.Response{}, false, nil
 }
 
-func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool) {
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool, error) {
 	routeModel := req.Model
-	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
+	if errCandidates != nil {
+		return nil, false, errCandidates
+	}
 	for _, c := range candidates {
 		if ctx.Err() != nil {
-			return nil, false
+			return nil, false, nil
 		}
 		creditsCtx := WithAntigravityCredits(ctx)
 		if rt := m.roundTripperFor(c.auth); rt != nil {
@@ -4418,9 +4431,16 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if errStream != nil {
 			continue
 		}
-		return result, true
+		return result, true, nil
 	}
-	return nil, false
+	return nil, false, nil
+}
+
+func antigravityCreditsKVUnavailableError(cause error) error {
+	if cause == nil {
+		return &Error{Code: "home_kv_unavailable", Message: "home kv store unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	return &Error{Code: "home_kv_unavailable", Message: "home kv store unavailable: " + cause.Error(), HTTPStatus: http.StatusServiceUnavailable}
 }
 
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
