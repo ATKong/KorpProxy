@@ -28,10 +28,12 @@ import (
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -57,11 +59,18 @@ type callbackForwarder struct {
 	done     chan struct{}
 }
 
+type codexOAuthService interface {
+	GenerateAuthURL(state string, pkceCodes *codex.PKCECodes) (string, error)
+	ExchangeCodeForTokens(ctx context.Context, code string, pkceCodes *codex.PKCECodes) (*codex.CodexAuthBundle, error)
+	CreateTokenStorage(bundle *codex.CodexAuthBundle) *codex.CodexTokenStorage
+}
+
 var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
+	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -1161,21 +1170,35 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if authID == "" {
 		authID = path
 	}
-	attr := map[string]string{
-		"path":   path,
-		"source": path,
+	auth := (*coreauth.Auth)(nil)
+	if h != nil && h.cfg != nil {
+		sctx := &synthesizer.SynthesisContext{
+			Config:      h.cfg,
+			AuthDir:     h.cfg.AuthDir,
+			Now:         time.Now(),
+			IDGenerator: synthesizer.NewStableIDGenerator(),
+		}
+		if generated := synthesizer.SynthesizeAuthFile(sctx, path, data); len(generated) > 0 && generated[0] != nil {
+			auth = generated[0].Clone()
+		}
 	}
-	auth := &coreauth.Auth{
-		ID:         authID,
-		Provider:   provider,
-		FileName:   filepath.Base(path),
-		Label:      label,
-		Status:     coreauth.StatusActive,
-		Attributes: attr,
-		Metadata:   metadata,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+	if auth == nil {
+		auth = &coreauth.Auth{
+			ID:       authID,
+			Provider: provider,
+			Label:    label,
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"path":   path,
+				"source": path,
+			},
+			Metadata:  metadata,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
 	}
+	auth.ID = authID
+	auth.FileName = filepath.Base(path)
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
@@ -1876,7 +1899,6 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Claude services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("anthropic")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2134,7 +2156,6 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		}
 
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("gemini")
 		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
@@ -2164,7 +2185,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	openaiAuth := newCodexOAuthService(h.cfg)
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -2281,7 +2302,6 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Codex services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2441,7 +2461,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("antigravity")
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", util.HideAPIKey(projectID))
@@ -2623,7 +2642,6 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		}
 
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("xai")
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use xAI services through this CLI")
 	}()
@@ -2702,7 +2720,6 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("kimi")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
