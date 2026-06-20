@@ -371,12 +371,28 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	}
 
 	// Gemini/Vertex accepts assistant/model turns in history, but some model
-	// surfaces reject requests whose final turn is model-authored prefill.
+	// surfaces reject requests whose final turn is plain model-authored text
+	// prefill. Reasoning thoughts and pending function calls must be preserved
+	// here: they carry replayable thoughtSignatures, so only strip a trailing
+	// model turn that is pure text prefill.
 	contents := gjson.GetBytes(out, "contents")
 	if contents.Exists() && contents.IsArray() {
 		arr := contents.Array()
-		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
-			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+		if n := len(arr); n > 0 {
+			last := arr[n-1]
+			if last.Get("role").String() == "model" {
+				strip := true
+				last.Get("parts").ForEach(func(_, part gjson.Result) bool {
+					if part.Get("thought").Bool() || part.Get("functionCall").Exists() {
+						strip = false
+						return false
+					}
+					return true
+				})
+				if strip {
+					out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", n-1))
+				}
+			}
 		}
 	}
 
