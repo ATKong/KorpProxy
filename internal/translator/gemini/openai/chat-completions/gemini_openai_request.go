@@ -210,6 +210,14 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							} else {
 								log.Warnf("Unknown file name extension '%s' in user message, skip", ext)
 							}
+						case "input_audio":
+							audioData := item.Get("input_audio.data").String()
+							if audioData != "" {
+								mimeType := openAIInputAudioMimeType(item.Get("input_audio.format").String())
+								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mimeType)
+								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", audioData)
+								p++
+							}
 						}
 					}
 				}
@@ -291,6 +299,16 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					out, _ = sjson.SetRawBytes(out, "contents.-1", node)
 				}
 			}
+		}
+	}
+
+	// Gemini/Vertex accepts assistant/model turns in history, but some model
+	// surfaces reject requests whose final turn is model-authored prefill.
+	contents := gjson.GetBytes(out, "contents")
+	if contents.Exists() && contents.IsArray() {
+		arr := contents.Array()
+		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
+			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
 		}
 	}
 
@@ -428,3 +446,26 @@ func openAIToolCallGeminiThoughtSignature(toolCall gjson.Result) string {
 
 // itoa converts int to string without strconv import for few usages.
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
+
+func openAIInputAudioMimeType(audioFormat string) string {
+	switch audioFormat {
+	case "", "wav":
+		return "audio/wav"
+	case "mp3":
+		return "audio/mpeg"
+	case "ogg":
+		return "audio/ogg"
+	case "flac":
+		return "audio/flac"
+	case "aac":
+		return "audio/aac"
+	case "webm":
+		return "audio/webm"
+	case "pcm16":
+		return "audio/pcm"
+	case "g711_ulaw", "g711_alaw":
+		return "audio/basic"
+	default:
+		return "audio/" + audioFormat
+	}
+}
