@@ -170,8 +170,8 @@ func TestCodexExecutorDirectOpenAIImageEditUsesImagesEditEndpointForJSON(t *test
 		t.Fatalf("Execute() error = %v", errExecute)
 	}
 
-	if gotPath != "/images/edit" {
-		t.Fatalf("path = %q, want /images/edit", gotPath)
+	if gotPath != "/images/edits" {
+		t.Fatalf("path = %q, want /images/edits", gotPath)
 	}
 	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-image-2" {
 		t.Fatalf("model = %q, want gpt-image-2; body=%s", got, string(gotBody))
@@ -250,8 +250,8 @@ func TestCodexExecutorDirectOpenAIImageEditUsesImagesEditEndpointForMultipart(t 
 		t.Fatalf("Execute() error = %v", errExecute)
 	}
 
-	if gotPath != "/images/edit" {
-		t.Fatalf("path = %q, want /images/edit", gotPath)
+	if gotPath != "/images/edits" {
+		t.Fatalf("path = %q, want /images/edits", gotPath)
 	}
 	if !strings.HasPrefix(gotContentType, "application/json") {
 		t.Fatalf("Content-Type = %q, want application/json", gotContentType)

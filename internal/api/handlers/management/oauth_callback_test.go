@@ -51,7 +51,7 @@ func TestPostOAuthCallbackCreatesMissingAuthDir(t *testing.T) {
 }
 
 func TestWriteOAuthCallbackFileForPendingSessionCreatesMissingAuthDirForCallbackProviders(t *testing.T) {
-	providers := []string{"anthropic", "codex", "gemini", "antigravity", "xai"}
+	providers := []string{"anthropic", "codex", "antigravity", "xai"}
 	for _, provider := range providers {
 		t.Run(provider, func(t *testing.T) {
 			authDir := filepath.Join(t.TempDir(), "missing-auth")

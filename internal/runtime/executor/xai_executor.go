@@ -983,6 +983,10 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	body = removeXAIEncryptedReasoningInclude(body)
 	if !xaiSupportsReasoningEffort(model) {
 		body, _ = sjson.DeleteBytes(body, "reasoning.effort")
+		// Drop a now-empty reasoning object so unsupported models never see it.
+		if r := gjson.GetBytes(body, "reasoning"); r.IsObject() && len(r.Map()) == 0 {
+			body, _ = sjson.DeleteBytes(body, "reasoning")
+		}
 	}
 	return body
 }
