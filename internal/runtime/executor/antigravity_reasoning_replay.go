@@ -368,8 +368,48 @@ func insertAntigravityModelFunctionCallBeforeContent(payload []byte, beforeIndex
 func antigravityRequestHasThoughtSignatureAt(payload []byte, itemResult gjson.Result) bool {
 	ci := int(itemResult.Get("contentIndex").Int())
 	pi := int(itemResult.Get("partIndex").Int())
-	path := fmt.Sprintf("request.contents.%d.parts.%d.thoughtSignature", ci, pi)
+	partPath, ok := antigravityExistingReplayPartPath(payload, ci, pi)
+	if !ok {
+		return false
+	}
+	path := partPath + ".thoughtSignature"
 	return strings.TrimSpace(gjson.GetBytes(payload, path).String()) != ""
+}
+
+func antigravityExistingReplayPartPath(payload []byte, contentIndex int, partIndex int) (string, bool) {
+	if contentIndex < 0 || partIndex < 0 {
+		return "", false
+	}
+	partsPath := fmt.Sprintf("request.contents.%d.parts", contentIndex)
+	parts := gjson.GetBytes(payload, partsPath)
+	if !parts.IsArray() {
+		return "", false
+	}
+	arr := parts.Array()
+	if partIndex >= len(arr) || arr[partIndex].Type == gjson.Null {
+		return "", false
+	}
+	return fmt.Sprintf("%s.%d", partsPath, partIndex), true
+}
+
+func appendAntigravityReplayPart(payload []byte, contentIndex int, part map[string]any) ([]byte, bool) {
+	partsPath := fmt.Sprintf("request.contents.%d.parts", contentIndex)
+	parts := gjson.GetBytes(payload, partsPath)
+	if !parts.IsArray() {
+		updated, err := sjson.SetBytes(payload, partsPath+".0", part)
+		return updated, err == nil
+	}
+	arr := parts.Array()
+	values := make([]any, 0, len(arr)+1)
+	for _, existing := range arr {
+		if existing.Type == gjson.Null {
+			continue
+		}
+		values = append(values, existing.Value())
+	}
+	values = append(values, part)
+	updated, err := sjson.SetBytes(payload, partsPath, values)
+	return updated, err == nil
 }
 
 func insertAntigravityReasoningReplayItems(payload []byte, items [][]byte) ([]byte, bool) {
@@ -385,12 +425,22 @@ func insertAntigravityReasoningReplayItems(payload []byte, items [][]byte) ([]by
 			if sig == "" {
 				continue
 			}
-			path := fmt.Sprintf("request.contents.%d.parts.%d.thoughtSignature", ci, pi)
-			if strings.TrimSpace(gjson.GetBytes(out, path).String()) != "" {
+			partPath, exists := antigravityExistingReplayPartPath(out, ci, pi)
+			if exists {
+				path := partPath + ".thoughtSignature"
+				if strings.TrimSpace(gjson.GetBytes(out, path).String()) != "" {
+					continue
+				}
+				updated, err := sjson.SetBytes(out, path, sig)
+				if err != nil {
+					continue
+				}
+				out = updated
+				changed = true
 				continue
 			}
-			updated, err := sjson.SetBytes(out, path, sig)
-			if err != nil {
+			updated, ok := appendAntigravityReplayPart(out, ci, map[string]any{"thoughtSignature": sig})
+			if !ok {
 				continue
 			}
 			out = updated
@@ -433,16 +483,41 @@ func mergeAntigravityFunctionCallPartReplay(payload []byte, itemResult gjson.Res
 
 	ci := antigravityReasoningReplayResolveContentIndex(payload, int(itemResult.Get("contentIndex").Int()))
 	pi := int(itemResult.Get("partIndex").Int())
-	pathSig := fmt.Sprintf("request.contents.%d.parts.%d.thoughtSignature", ci, pi)
 	out := payload
 	changed := false
+
+	partPath, exists := antigravityExistingReplayPartPath(out, ci, pi)
+	if !exists {
+		fc := map[string]any{"name": name}
+		if callID != "" {
+			fc["id"] = callID
+		}
+		if args.Type == gjson.String {
+			fc["args"] = args.String()
+		} else {
+			var parsed any
+			if json.Unmarshal([]byte(args.Raw), &parsed) == nil {
+				fc["args"] = parsed
+			}
+		}
+		part := map[string]any{"functionCall": fc}
+		if sig != "" {
+			part["thoughtSignature"] = sig
+		}
+		if updated, ok := appendAntigravityReplayPart(out, ci, part); ok {
+			return updated, true
+		}
+		return payload, false
+	}
+
+	pathSig := partPath + ".thoughtSignature"
 	if sig != "" && strings.TrimSpace(gjson.GetBytes(out, pathSig).String()) == "" {
 		if updated, err := sjson.SetBytes(out, pathSig, sig); err == nil {
 			out = updated
 			changed = true
 		}
 	}
-	pathFC := fmt.Sprintf("request.contents.%d.parts.%d.functionCall", ci, pi)
+	pathFC := partPath + ".functionCall"
 	if !gjson.GetBytes(out, pathFC).Exists() {
 		fc := map[string]any{"name": name}
 		if callID != "" {

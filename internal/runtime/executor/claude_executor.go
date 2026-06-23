@@ -45,11 +45,18 @@ type ClaudeExecutor struct {
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
 
+func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
+	return sigcompat.SignatureProviderFromModelName(baseModel) == sigcompat.SignatureProviderClaude
+}
+
 func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string) []byte {
-	sanitized, report := sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel)
-	logClaudeSignatureSanitizeReport(ctx, baseModel, report)
-	sanitized = sanitizeClaudeWebSearchDomains(sanitized)
-	return sanitized
+	sanitized := body
+	if shouldSanitizeClaudeMessagesForUpstream(baseModel) {
+		var report sigcompat.SignatureSanitizeReport
+		sanitized, report = sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel)
+		logClaudeSignatureSanitizeReport(ctx, baseModel, report)
+	}
+	return sanitizeClaudeWebSearchDomains(sanitized)
 }
 
 // sanitizeClaudeWebSearchDomains removes empty allowed_domains/blocked_domains
@@ -1922,6 +1929,10 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 //	system[4]: doing tasks (no cache_control)
 //	system[5]: user system messages moved to first user message
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
+	return checkSystemInstructionsWithSigningModeAndThinkingStrip(payload, strictMode, experimentalCCHSigning, oauthMode, version, entrypoint, workload, true)
+}
+
+func checkSystemInstructionsWithSigningModeAndThinkingStrip(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string, stripThinking bool) []byte {
 	system := gjson.GetBytes(payload, "system")
 
 	// Extract original message text for fingerprint computation (before billing injection).
@@ -2000,7 +2011,9 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	// assistant message cannot be modified". Drop those blocks; the cloaked request
 	// can never carry thinking signed under a different system, and Anthropic accepts
 	// assistant turns that omit them.
-	payload = stripReplayedThinkingBlocks(payload)
+	if stripThinking {
+		payload = stripReplayedThinkingBlocks(payload)
+	}
 
 	return payload
 }
@@ -2197,7 +2210,8 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		billingVersion := helps.DefaultClaudeVersion(cfg)
 		entrypoint := parseEntrypointFromUA(clientUserAgent)
 		workload := getWorkloadFromContext(ctx)
-		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
+		stripThinking := shouldSanitizeClaudeMessagesForUpstream(model)
+		payload = checkSystemInstructionsWithSigningModeAndThinkingStrip(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload, stripThinking)
 	}
 
 	// Inject fake user ID
