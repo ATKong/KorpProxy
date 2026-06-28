@@ -64,6 +64,13 @@ plugins:
   # Additional plugin store registries. The built-in official registry is always included.
   # store-sources:
   #   - "https://example.com/cliproxy-plugins/registry.json"
+  # Optional plugin store auth rules. Values are read from environment variables;
+  # tokens are not written into plugin manifests or node status.
+  # store-auth:
+  #   - match: "https://example.com/cliproxy-plugins/"
+  #     apply-to: ["registry", "artifact"]
+  #     type: bearer
+  #     token-env: "CLIPROXY_PLUGIN_STORE_TOKEN"
   configs:
     example:
       enabled: true
@@ -236,6 +243,7 @@ nonstream-keepalive-interval: 0
 #     models:
 #       - name: "gpt-5-codex"   # upstream model name
 #         alias: "codex-latest" # client alias mapped to the upstream model
+#         force-mapping: true    # optional: rewrite response model fields back to the alias
 #     excluded-models:
 #       - "gpt-5.1"         # exclude specific models (exact match)
 #       - "gpt-5-*"         # wildcard matching prefix (e.g. gpt-5-medium, gpt-5-codex)
@@ -256,6 +264,7 @@ nonstream-keepalive-interval: 0
 #     models:
 #       - name: "claude-3-5-sonnet-20241022" # upstream model name
 #         alias: "claude-sonnet-latest"      # client alias mapped to the upstream model
+#         force-mapping: true                 # optional: rewrite response model fields back to the alias
 #     excluded-models:
 #       - "claude-opus-4-5-20251101" # exclude specific models (exact match)
 #       - "claude-3-*"               # wildcard matching prefix (e.g. claude-3-7-sonnet-20250219)
