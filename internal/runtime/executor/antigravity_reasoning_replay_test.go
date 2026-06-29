@@ -118,11 +118,16 @@ func TestPrepareAntigravityGeminiReasoningReplayPayloadAppendsStaleThoughtSignat
 	internalcache.ClearAntigravityReasoningReplayCache()
 	t.Cleanup(internalcache.ClearAntigravityReasoningReplayCache)
 
+<<<<<<< HEAD
 	const thoughtSignature = "sig-text-1234567890"
 	item := []byte(`{"type":"thought_signature","contentIndex":8,"partIndex":3,"thoughtSignature":"` + thoughtSignature + `"}`)
 	if !internalcache.CacheAntigravityReasoningReplayItems("gemini-3-flash-agent", "session:sess-stale-text", [][]byte{item}) {
 		t.Fatal("cache write failed")
 	}
+=======
+	item := []byte(`{"type":"thought_signature","contentIndex":8,"partIndex":3,"thoughtSignature":"stale-thought-sig-ok12"}`)
+	internalcache.CacheAntigravityReasoningReplayItems("gemini-3-flash-agent", "session:sess-stale-text", [][]byte{item})
+>>>>>>> v7.2.47
 
 	payload := []byte(`{"sessionId":"sess-stale-text","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"visible answer"}]},{"role":"user","parts":[{"text":"next"}]}]}}`)
 	out, _, err := prepareAntigravityGeminiReasoningReplayPayload(context.Background(), "gemini-3-flash-agent", cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, payload)
@@ -142,8 +147,13 @@ func TestPrepareAntigravityGeminiReasoningReplayPayloadAppendsStaleThoughtSignat
 	if got := parts[0].Get("text").String(); got != "visible answer" {
 		t.Fatalf("text part = %q, want visible answer; body=%s", got, out)
 	}
+<<<<<<< HEAD
 	if got := parts[1].Get("thoughtSignature").String(); got != thoughtSignature {
 		t.Fatalf("thoughtSignature = %q, want %s; body=%s", got, thoughtSignature, out)
+=======
+	if got := parts[1].Get("thoughtSignature").String(); got != "stale-thought-sig-ok12" {
+		t.Fatalf("thoughtSignature = %q, want stale-thought-sig-ok12; body=%s", got, out)
+>>>>>>> v7.2.47
 	}
 }
 
