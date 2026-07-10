@@ -117,7 +117,12 @@ func TestGetOAuthCallbackDoesNotAliasPluginProvider(t *testing.T) {
 }
 
 func TestWriteOAuthCallbackFileForPendingSessionCreatesMissingAuthDirForCallbackProviders(t *testing.T) {
+<<<<<<< HEAD
 	providers := []string{"anthropic", "codex", "antigravity", "xai"}
+=======
+	// xAI uses device-code flow and no longer writes callback files.
+	providers := []string{"anthropic", "codex", "gemini", "antigravity"}
+>>>>>>> v7.2.65
 	for _, provider := range providers {
 		t.Run(provider, func(t *testing.T) {
 			authDir := filepath.Join(t.TempDir(), "missing-auth")
