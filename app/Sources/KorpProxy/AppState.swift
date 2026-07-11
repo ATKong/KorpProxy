@@ -37,6 +37,10 @@ final class AppState {
     var status: ProxyStatus = .stopped
     var logTail: [String] = []
 
+    /// Shared main-window navigation, so the menu bar can open the window at a
+    /// specific section and toggle the command palette.
+    let nav = Navigation()
+
     let config = ConfigStore()
     let customModels: CustomModelsStore
     let updater = UpdaterManager()

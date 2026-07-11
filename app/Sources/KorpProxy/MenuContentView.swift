@@ -3,16 +3,16 @@ import SwiftUI
 
 struct MenuContentView: View {
     @Environment(AppState.self) private var app
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
     @State private var accounts = AccountsModel()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
             controls
-            Divider()
+            Divider().overlay(Theme.Colors.border)
             accountsSection
-            Divider()
+            Divider().overlay(Theme.Colors.border)
             footer
         }
         .padding(14)
@@ -41,11 +41,11 @@ struct MenuContentView: View {
                         .foregroundStyle(statusColor)
                 )
             VStack(alignment: .leading, spacing: 1) {
-                Text("KorpProxy").font(.headline)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                Text("KorpProxy").font(Theme.Font.headerTitle)
+                Text(subtitle).font(Theme.Font.caption).foregroundStyle(Theme.Colors.textSecondary)
             }
             Spacer()
-            statusPill
+            StatusPill(text: EngineStatusStyle.pillText(app.status), color: statusColor)
         }
     }
 
@@ -58,43 +58,24 @@ struct MenuContentView: View {
         }
     }
 
-    private var statusPill: some View {
-        HStack(spacing: 5) {
-            Circle().fill(statusColor).frame(width: 7, height: 7)
-            Text(pillText).font(.caption2.weight(.medium))
-        }
-        .padding(.horizontal, 8).padding(.vertical, 4)
-        .background(statusColor.opacity(0.12), in: Capsule())
-        .foregroundStyle(statusColor)
-    }
-
-    private var pillText: String {
-        switch app.status {
-        case .running: return "On"
-        case .starting: return "Starting"
-        case .failed: return "Error"
-        case .stopped: return "Off"
-        }
-    }
-
     // MARK: Controls
 
     private var controls: some View {
         HStack(spacing: 8) {
             if app.status.isRunning {
-                Button { app.proxy.stop() } label: { Label("Stop", systemImage: "stop.fill") }
-                Button { app.proxy.restart() } label: { Label("Restart", systemImage: "arrow.clockwise") }
+                EngineActionButton(title: "Stop", symbol: "stop.fill", tint: Theme.Colors.failed) { app.proxy.stop() }
+                EngineActionButton(title: "Restart", symbol: "arrow.clockwise", tint: Theme.Colors.textSecondary) { app.proxy.restart() }
             } else {
-                Button { app.proxy.start() } label: { Label("Start", systemImage: "play.fill") }
+                EngineActionButton(title: "Start", symbol: "play.fill", tint: Theme.Colors.running) { app.proxy.start() }
             }
             Spacer()
             if app.status.isRunning, let url = dashboardURL {
-                Link(destination: url) { Image(systemName: "safari") }
-                    .help("Open dashboard")
+                Link(destination: url) {
+                    Image(systemName: "safari").foregroundStyle(Theme.Colors.textSecondary)
+                }
+                .help("Open dashboard")
             }
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
     }
 
     private var dashboardURL: URL? { URL(string: "http://127.0.0.1:\(app.config.port)/") }
@@ -104,32 +85,32 @@ struct MenuContentView: View {
     private var accountsSection: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("ACCOUNTS").font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+                SectionHeader(title: "Accounts")
                 Spacer()
                 if accounts.loading {
                     ProgressView().controlSize(.mini)
                 } else if app.status.isRunning {
-                    Text("\(accounts.accounts.count)").font(.caption2).foregroundStyle(.secondary)
+                    Text("\(accounts.accounts.count)").font(Theme.Font.caption).foregroundStyle(Theme.Colors.textSecondary)
                 }
             }
 
             if !app.status.isRunning {
                 Text("Start the engine to manage accounts.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(Theme.Font.caption).foregroundStyle(Theme.Colors.textSecondary)
             } else if accounts.accounts.isEmpty {
                 Text("No accounts yet — models won’t serve until you add one.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(Theme.Font.caption).foregroundStyle(Theme.Colors.textSecondary)
             } else {
                 ForEach(accounts.accounts.prefix(4)) { acct in
                     let info = accounts.usage(for: acct)
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 8) {
                             ProviderIcon(provider: acct.provider, size: 16)
-                            Text(acct.email ?? acct.name).font(.caption).lineLimit(1)
+                            Text(acct.email ?? acct.name).font(Theme.Font.caption).lineLimit(1)
                             Spacer()
                             if info?.isRateLimited == true { RateLimitedPill() }
                             Circle()
-                                .fill(acct.disabled == true ? Color.orange : Color.green)
+                                .fill(acct.disabled == true ? Theme.Colors.starting : Theme.Colors.running)
                                 .frame(width: 6, height: 6)
                         }
                         if let u = info?.usage, u.hasData {
@@ -139,11 +120,11 @@ struct MenuContentView: View {
                 }
                 if accounts.accounts.count > 4 {
                     Text("+\(accounts.accounts.count - 4) more")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(Theme.Font.caption).foregroundStyle(Theme.Colors.textTertiary)
                 }
             }
 
-            MenuRow(icon: "person.2", title: "Manage accounts…") { openSettingsWindow() }
+            MenuRow(icon: "person.2", title: "Manage accounts…") { openMainWindow(section: .accounts) }
         }
     }
 
@@ -158,34 +139,28 @@ struct MenuContentView: View {
                 app.updater.checkForUpdates()
             }
             .disabled(!app.updater.canCheckForUpdates)
-            MenuRow(icon: "gearshape", title: "Settings…") { openSettingsWindow() }
+            MenuRow(icon: "gearshape", title: "Settings…") { openMainWindow(section: .settings) }
             MenuRow(icon: "power", title: "Quit KorpProxy") {
                 NSApplication.shared.terminate(nil)
             }
         }
     }
 
-    /// Opens Settings and brings it to the front. KorpProxy is a menu-bar
-    /// accessory (LSUIElement), so without explicit activation the Settings
-    /// window can open behind whatever app currently has focus.
-    private func openSettingsWindow() {
-        openSettings()
+    /// Opens the main window at the given section and brings it to the front.
+    /// KorpProxy is a menu-bar accessory (LSUIElement), so without explicit
+    /// activation the window can open behind whatever app currently has focus.
+    private func openMainWindow(section: AppSection) {
+        app.nav.selection = section
+        openWindow(id: mainWindowID)
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows
-                .first { $0.identifier?.rawValue == "com_apple_SwiftUI_Settings_window" }?
+                .first { $0.identifier?.rawValue == mainWindowID }?
                 .makeKeyAndOrderFront(nil)
         }
     }
 
-    private var statusColor: Color {
-        switch app.status {
-        case .running: return .green
-        case .starting: return .yellow
-        case .failed: return .red
-        case .stopped: return .gray
-        }
-    }
+    private var statusColor: Color { EngineStatusStyle.color(app.status) }
 }
 
 /// A menu-style row button with hover highlight.
@@ -207,12 +182,12 @@ private struct MenuRowLabel: View {
 
     var body: some View {
         HStack(spacing: 9) {
-            Image(systemName: icon).frame(width: 16).foregroundStyle(.secondary)
-            Text(title)
+            Image(systemName: icon).frame(width: 16).foregroundStyle(Theme.Colors.textSecondary)
+            Text(title).font(Theme.Font.body).foregroundStyle(Theme.Colors.textPrimary)
             Spacer()
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
-        .background(hovering ? Color.primary.opacity(0.08) : .clear,
+        .background(hovering ? Theme.Colors.hover : .clear,
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
