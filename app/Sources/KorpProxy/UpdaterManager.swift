@@ -6,8 +6,8 @@ import Sparkle
 /// checks and toggle automatic updates. Created once and held by `AppState`.
 ///
 /// The update feed (`SUFeedURL`) and signing key (`SUPublicEDKey`) are declared
-/// in `project.yml` → Info.plist. Releases are published to the public
-/// `KorpProxy-releases` repo (appcast served via GitHub Pages); see RELEASING.md.
+/// in `project.yml` → Info.plist. Releases are published on this repo's
+/// GitHub Releases (appcast served via GitHub Pages); see RELEASING.md.
 @Observable
 final class UpdaterManager {
     @ObservationIgnored private let controller: SPUStandardUpdaterController

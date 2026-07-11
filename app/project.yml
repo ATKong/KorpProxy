@@ -34,10 +34,7 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # Sparkle auto-update. Feed is served from THIS repo via GitHub Pages
         # (gh-pages branch); SUPublicEDKey verifies update signatures (private
-        # key is the SPARKLE_PRIVATE_KEY CI secret). The legacy public
-        # KorpProxy-releases feed is still written at release time as a bridge so
-        # already-installed 0.2.0-0.2.2 builds (which only poll the old URL) can
-        # discover 0.2.3 and migrate. See RELEASING.md.
+        # key is the SPARKLE_PRIVATE_KEY CI secret). See RELEASING.md.
         SUFeedURL: "https://atkong.github.io/KorpProxy/appcast.xml"
         SUPublicEDKey: "Vy+hU7sQEtUWg3I6uIGv6LPhWZ2VpWgrfCXZS7W+z+E="
         SUEnableAutomaticChecks: true

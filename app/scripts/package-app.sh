@@ -37,7 +37,7 @@ if [ -z "${VERSION:-}" ]; then
 fi
 [ -z "${VERSION:-}" ] && { echo "error: set VERSION (or tag app-vX.Y.Z)" >&2; exit 1; }
 BUILD="${BUILD:-$(git rev-list --count HEAD)}"
-DOWNLOAD_URL_PREFIX="${DOWNLOAD_URL_PREFIX:-https://github.com/ATKong/KorpProxy-releases/releases/download/app-v${VERSION}}"
+DOWNLOAD_URL_PREFIX="${DOWNLOAD_URL_PREFIX:-https://github.com/ATKong/KorpProxy/releases/download/app-v${VERSION}}"
 DEVELOPER_ID_APP="${DEVELOPER_ID_APP:-}"
 [ -z "$DEVELOPER_ID_APP" ] && { echo "error: set DEVELOPER_ID_APP" >&2; exit 1; }
 

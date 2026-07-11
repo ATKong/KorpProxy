@@ -6,10 +6,6 @@ name: app-release
 #
 # Canonical home is THIS repo: release assets + GitHub Release + the Sparkle
 # appcast on the `gh-pages` branch (served at https://atkong.github.io/KorpProxy/).
-# The same appcast is also written to the legacy public KorpProxy-releases feed
-# as a BRIDGE, so already-installed 0.2.0-0.2.2 builds (which only poll the old
-# URL baked into their binary) can discover the new release and migrate. Drop the
-# bridge step once installs are on 0.2.3+.
 
 on:
   push:
@@ -61,11 +57,7 @@ jobs:
       - name: Seed current appcast (preserve release history)
         run: |
           mkdir -p app
-          # Prefer this repo's canonical feed; fall back to the legacy feed during
-          # the migration so existing release history is carried forward either way.
-          curl -fsSL https://atkong.github.io/KorpProxy/appcast.xml -o app/appcast.xml \
-            || curl -fsSL https://atkong.github.io/KorpProxy-releases/appcast.xml -o app/appcast.xml \
-            || true
+          curl -fsSL https://atkong.github.io/KorpProxy/appcast.xml -o app/appcast.xml || true
 
       - name: Build · sign · notarize · package
         working-directory: ${{ github.workspace }}
@@ -112,32 +104,6 @@ jobs:
           git commit -m "release: KorpProxy ${V}" || echo "appcast unchanged"
           git push origin gh-pages
           git checkout -
-
-      # Bridge: also write the appcast to the legacy public feed so already-installed
-      # 0.2.0-0.2.2 builds (which only poll the old URL) can see this release and
-      # migrate. Assets in this feed point back at THIS repo's public release.
-      # Safe to delete this step + the old repo once installs are on 0.2.3+.
-      - name: Bridge appcast to legacy feed (migration)
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-          V="${GITHUB_REF_NAME#app-v}"
-          REPO="ATKong/KorpProxy-releases"
-          # Update appcast.xml via the Contents API so the token (GH_TOKEN) is only
-          # ever read from the environment by gh — never embedded in a clone URL.
-          content="$(base64 < app/dist/appcast.xml | tr -d '\n')"
-          sha="$(gh api "repos/${REPO}/contents/appcast.xml" -q .sha 2>/dev/null || true)"
-          if [ -n "$sha" ]; then
-            gh api -X PUT "repos/${REPO}/contents/appcast.xml" \
-              -f message="bridge: KorpProxy ${V} (canonical on ATKong/KorpProxy)" \
-              -f content="$content" -f sha="$sha" >/dev/null
-          else
-            gh api -X PUT "repos/${REPO}/contents/appcast.xml" \
-              -f message="bridge: KorpProxy ${V} (canonical on ATKong/KorpProxy)" \
-              -f content="$content" >/dev/null
-          fi
-          echo "Bridged appcast to ${REPO}."
 
       - name: Clean up keychain
         if: always()

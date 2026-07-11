@@ -10,8 +10,8 @@ KorpProxy.entitlements
 # keep this local copy out of git). The matching public key lives in project.yml.
 .sparkle_private_key.txt
 
-# Release packaging output + transient appcast (the canonical feed lives in the
-# public KorpProxy-releases repo, not here).
+# Release packaging output + transient appcast (the canonical feed lives on
+# this repo's gh-pages branch, not here).
 dist/
 appcast.xml
 
