@@ -23,16 +23,18 @@ struct ModelsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             explainer
-            Divider()
+            Divider().overlay(Theme.Colors.border)
             List {
                 availableSection
                 customSection
             }
             .listStyle(.inset)
-            Divider()
+            .scrollContentBackground(.hidden)
+            Divider().overlay(Theme.Colors.border)
             footer
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Theme.Colors.background)
         .task {
             available.configure(port: app.config.port, apiKey: app.config.apiKey)
             await available.refresh()

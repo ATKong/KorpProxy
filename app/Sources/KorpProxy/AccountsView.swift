@@ -10,10 +10,11 @@ struct AccountsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            Divider()
+            Divider().overlay(Theme.Colors.border)
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Theme.Colors.background)
         .task {
             model.configure(port: app.config.port, secret: app.config.managementSecret)
             await model.refresh()
@@ -29,7 +30,6 @@ struct AccountsView: View {
 
     private var header: some View {
         HStack(spacing: 10) {
-            Text("Accounts").font(.headline)
             if model.loading { ProgressView().controlSize(.small) }
             Spacer()
             if let updated = model.lastUsageRefresh {
@@ -72,6 +72,7 @@ struct AccountsView: View {
                 }
             }
             .listStyle(.inset)
+            .scrollContentBackground(.hidden)
         }
     }
 
