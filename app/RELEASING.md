@@ -5,31 +5,22 @@ Two independent pipelines, triggered by different git tags on the private
 
 | What | Tag | Workflow | Output |
 | --- | --- | --- | --- |
-| **macOS app** (Sparkle auto-update) | `app-vX.Y.Z` | `.github/workflows/app-release.yml` | signed+notarized `KorpProxy-X.Y.Z.dmg` (drag-to-Applications) + `KorpProxy-X.Y.Z.zip` (Sparkle) + `appcast.xml` → this repo (`gh-pages`), mirrored to legacy `KorpProxy-releases` during migration |
+| **macOS app** (Sparkle auto-update) | `app-vX.Y.Z` | `.github/workflows/app-release.yml` | signed+notarized `KorpProxy-X.Y.Z.dmg` (drag-to-Applications) + `KorpProxy-X.Y.Z.zip` (Sparkle) + `appcast.xml` → this repo (`gh-pages`) |
 | **Go engine** binaries | `vX.Y.Z` | `.github/workflows/release.yaml` (goreleaser) | per-platform tarballs → private repo Releases |
 
 The app **bundles** the engine, so a normal user only ever needs app updates;
 the engine tarballs are for headless/CLI use.
 
-### Where app releases live (single public repo + a temporary bridge)
+### Where app releases live
 
-`ATKong/KorpProxy` is now **public**, so it hosts everything itself: the release
+`ATKong/KorpProxy` is **public**, so it hosts everything itself: the release
 assets, the GitHub Release, and the Sparkle `appcast.xml` (served from the
 `gh-pages` branch at `https://atkong.github.io/KorpProxy/appcast.xml`). That is
 the **source of truth** for downloads and updates. `SUFeedURL` in
 `app/project.yml` points there.
 
-**Migration bridge (temporary).** Apps shipped as **0.2.0–0.2.2** have the *old*
-feed URL (`…/KorpProxy-releases/appcast.xml`) compiled into their binary, so they
-only see updates posted there. Until those installs move to **0.2.3+**,
-`app-release.yml` also writes the same appcast to the legacy
-`ATKong/KorpProxy-releases` repo ("Bridge appcast to legacy feed" step). Both
-feeds carry identical `<item>`s whose download URLs point at **this** repo's
-public release assets, so an update resolves no matter which feed an install
-polls. Once everything is on 0.2.3+, delete the bridge step and the old repo.
-
-> The `RELEASES_REPO_TOKEN` secret is only used by the bridge step. When you drop
-> the bridge, that secret and the `KorpProxy-releases` repo can both go away.
+> The legacy `ATKong/KorpProxy-releases` bridge feed (for 0.2.0–0.2.2 installs)
+> was removed after that repo was deleted; those builds must be updated manually.
 
 ## Auto-update architecture (app)
 
@@ -39,8 +30,7 @@ polls. Once everything is on 0.2.3+, delete the bridge step and the old repo.
 - Each release uploads a `.dmg` (drag KorpProxy to Applications — what humans
   download) and a `.zip` (the Sparkle update artifact) as GitHub Release assets
   on **this** repo, and prepends an `<item>` to `appcast.xml`, which is served
-  from the `gh-pages` branch via GitHub Pages (mirrored to the legacy feed during
-  migration — see above).
+  from the `gh-pages` branch via GitHub Pages.
 - The app checks the feed daily (and via the menu "Check for Updates…").
 
 ## One-time setup
@@ -77,15 +67,6 @@ Create an API key at https://appstoreconnect.apple.com/access/integrations/api
 base64 -i AuthKey_XXXX.p8 | gh secret set NOTARY_KEY_P8_BASE64
 gh secret set NOTARY_KEY_ID                # the key's Key ID
 gh secret set NOTARY_ISSUER_ID             # the Issuer ID
-```
-
-### 4. Cross-repo publish token
-The release job pushes the dmg + zip + appcast to the **public** repo. The
-default `GITHUB_TOKEN` can't write cross-repo, so create a **classic** PAT with
-the `repo` scope (fine-grained tokens returned 403 on the releases API) and add it:
-
-```bash
-gh secret set RELEASES_REPO_TOKEN          # classic repo-scope PAT for KorpProxy-releases
 ```
 
 ## Cutting an app release
