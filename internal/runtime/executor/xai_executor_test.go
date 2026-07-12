@@ -1573,6 +1573,28 @@ func TestXAIExecutorReasoningReplayCacheReplaysFunctionCallForClaudeToolResult(t
 	}
 }
 
+func TestXAIBaseURLSource(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		want    string
+	}{
+		{name: "default api", baseURL: xaiauth.DefaultAPIBaseURL, want: "DefaultAPIBaseURL"},
+		{name: "default api trailing slash", baseURL: xaiauth.DefaultAPIBaseURL + "/", want: "DefaultAPIBaseURL"},
+		{name: "cli chat proxy", baseURL: xaiauth.CLIChatProxyBaseURL, want: "CLIChatProxyBaseURL"},
+		{name: "cli chat proxy trailing slash", baseURL: xaiauth.CLIChatProxyBaseURL + "/", want: "CLIChatProxyBaseURL"},
+		{name: "custom", baseURL: "https://gateway.example.com/v1", want: "custom"},
+		{name: "empty treated as custom", baseURL: "", want: "custom"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := xaiBaseURLSource(tt.baseURL); got != tt.want {
+				t.Fatalf("xaiBaseURLSource(%q) = %q, want %q", tt.baseURL, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestXAIChatBaseURL(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1733,6 +1755,9 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
 			t.Fatalf("%s = %q, want empty for official API", xaiClientVersionHeader, got)
 		}
+		if got := req.Header.Get("User-Agent"); got != "" {
+			t.Fatalf("User-Agent = %q, want empty for official API", got)
+		}
 	})
 
 	t.Run("OAuth defaults to cli chat proxy headers", func(t *testing.T) {
@@ -1757,6 +1782,9 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		if got := req.Header.Get(xaiClientVersionHeader); got != xaiClientVersionValue {
 			t.Fatalf("%s = %q, want %q", xaiClientVersionHeader, got, xaiClientVersionValue)
 		}
+		if got := req.Header.Get("User-Agent"); got != "xai-grok-workspace/"+xaiClientVersionValue {
+			t.Fatalf("User-Agent = %q, want xai-grok-workspace/%s", got, xaiClientVersionValue)
+		}
 	})
 
 	t.Run("no cli headers on custom gateway with using_api false", func(t *testing.T) {
@@ -1774,6 +1802,9 @@ func TestApplyXAIChatHeaders(t *testing.T) {
 		}
 		if got := req.Header.Get(xaiClientVersionHeader); got != "" {
 			t.Fatalf("%s = %q, want empty for custom gateway", xaiClientVersionHeader, got)
+		}
+		if got := req.Header.Get("User-Agent"); got != "" {
+			t.Fatalf("User-Agent = %q, want empty for custom gateway", got)
 		}
 	})
 
