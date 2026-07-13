@@ -129,6 +129,20 @@ func TestCodexClientModelsResponse_InputModalitiesFromRegistry(t *testing.T) {
 	}
 }
 
+func TestCodexClientModelsResponse_AppliesDisplayNameToTemplateModel(t *testing.T) {
+	resp := CodexClientModelsResponse([]map[string]any{{
+		"id":           "gpt-5.5",
+		"display_name": "Configured Codex Name",
+	}})
+	models, ok := resp["models"].([]map[string]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("models = %#v, want one model", resp["models"])
+	}
+	if got := stringModelValue(models[0], "display_name"); got != "Configured Codex Name" {
+		t.Fatalf("display_name = %q, want Configured Codex Name", got)
+	}
+}
+
 func TestCodexClientModelsResponse_PreservesUltraReasoningEffort(t *testing.T) {
 	resp := CodexClientModelsResponse([]map[string]any{{"id": "gpt-5.6-sol"}})
 	models, ok := resp["models"].([]map[string]any)
@@ -159,4 +173,56 @@ func TestCodexClientModelsResponse_PreservesUltraReasoningEffort(t *testing.T) {
 	}
 
 	t.Fatalf("supported_reasoning_levels = %#v, want ultra", levels)
+}
+
+func TestLoadCodexClientModelTemplatesRefreshesOnRevision(t *testing.T) {
+	codexClientModelTemplatesMu.Lock()
+	previousLoaded := codexClientModelTemplatesLoaded
+	previousRevision := codexClientModelTemplatesRevision
+	previousTemplates := codexClientModelTemplates
+	previousDefault := codexClientDefaultTemplate
+	previousErr := codexClientModelTemplatesErr
+	codexClientModelTemplatesLoaded = false
+	codexClientModelTemplatesMu.Unlock()
+	t.Cleanup(func() {
+		codexClientModelTemplatesMu.Lock()
+		codexClientModelTemplatesLoaded = previousLoaded
+		codexClientModelTemplatesRevision = previousRevision
+		codexClientModelTemplates = previousTemplates
+		codexClientDefaultTemplate = previousDefault
+		codexClientModelTemplatesErr = previousErr
+		codexClientModelTemplatesMu.Unlock()
+	})
+
+	first := []byte(`{"models":[{"slug":"gpt-5.5","display_name":"First"}]}`)
+	templates, defaultTemplate, err := loadCodexClientModelTemplatesSnapshot(first, 100)
+	if err != nil {
+		t.Fatalf("load first snapshot: %v", err)
+	}
+	if got := stringModelValue(templates["gpt-5.5"], "display_name"); got != "First" {
+		t.Fatalf("first display_name = %q, want First", got)
+	}
+	if got := stringModelValue(defaultTemplate, "display_name"); got != "First" {
+		t.Fatalf("first default display_name = %q, want First", got)
+	}
+
+	second := []byte(`{"models":[{"slug":"gpt-5.5","display_name":"Second"}]}`)
+	templates, defaultTemplate, err = loadCodexClientModelTemplatesSnapshot(second, 101)
+	if err != nil {
+		t.Fatalf("load second snapshot: %v", err)
+	}
+	if got := stringModelValue(templates["gpt-5.5"], "display_name"); got != "Second" {
+		t.Fatalf("second display_name = %q, want Second", got)
+	}
+	if got := stringModelValue(defaultTemplate, "display_name"); got != "Second" {
+		t.Fatalf("second default display_name = %q, want Second", got)
+	}
+
+	templates, _, err = loadCodexClientModelTemplatesSnapshot(first, 101)
+	if err != nil {
+		t.Fatalf("reload cached revision: %v", err)
+	}
+	if got := stringModelValue(templates["gpt-5.5"], "display_name"); got != "Second" {
+		t.Fatalf("cached display_name = %q, want Second", got)
+	}
 }
