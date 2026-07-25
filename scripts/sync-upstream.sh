@@ -31,7 +31,8 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 echo "▸ Fetching ${UPSTREAM_REMOTE} (with tags)…"
-git fetch --tags "${UPSTREAM_REMOTE}"
+# --force: upstream occasionally re-tags existing releases.
+git fetch --tags --force "${UPSTREAM_REMOTE}"
 
 # Resolve the ref to merge: latest release tag unless the caller pinned one.
 if [ -z "${UPSTREAM_REF}" ]; then

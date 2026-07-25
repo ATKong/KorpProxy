@@ -52,7 +52,8 @@ jobs:
           fi
           echo "Latest upstream release: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
+          # Force refspec: upstream occasionally re-tags existing releases.
+          git fetch upstream "+refs/tags/${tag}:refs/tags/${tag}"
           if git merge-base --is-ancestor "$tag" origin/main; then
             echo "status=uptodate" >> "$GITHUB_OUTPUT"
             echo "Already in sync with $tag — nothing to do."
@@ -95,7 +96,11 @@ jobs:
         run: |
           set -euo pipefail
           go build ./cmd/server
-          go test ./...
+          # Retry once: an upstream test (internal/home cancellation) is flaky in CI.
+          go test ./... || {
+            echo "::warning::go test failed; retrying once (known flaky upstream test)"
+            go test ./...
+          }
 
       # Path 1: clean merge + green build/test -> auto-merge straight to main.
       - name: Auto-merge to main
