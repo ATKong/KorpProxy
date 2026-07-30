@@ -5,6 +5,7 @@ package chat_completions
 import (
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/antigravity/gemini"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -71,6 +72,22 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 	if maxTok := gjson.GetBytes(rawJSON, "max_tokens"); maxTok.Exists() && maxTok.Type == gjson.Number {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.maxOutputTokens", maxTok.Num)
+	}
+
+	// Map OpenAI response_format to Antigravity structured output settings.
+	if responseFormat := gjson.GetBytes(rawJSON, "response_format"); responseFormat.Exists() {
+		switch responseFormatType := strings.ToLower(strings.TrimSpace(responseFormat.Get("type").String())); responseFormatType {
+		case "json_object", "json_schema":
+			for _, schemaKey := range []string{"responseSchema", "responseJsonSchema", "response_schema", "response_json_schema"} {
+				out, _ = sjson.DeleteBytes(out, "request.generationConfig."+schemaKey)
+			}
+			out, _ = sjson.SetBytes(out, "request.generationConfig.responseMimeType", "application/json")
+			if responseFormatType == "json_schema" {
+				if schema := responseFormat.Get("json_schema.schema"); schema.Exists() {
+					out, _ = sjson.SetRawBytes(out, "request.generationConfig.responseSchema", []byte(schema.Raw))
+				}
+			}
+		}
 	}
 
 	// Candidate count (OpenAI 'n' parameter)
@@ -409,6 +426,9 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 
 	out = applyOpenAIToolChoiceToAntigravity(out, rawJSON, functionNameMap)
+	if strings.Contains(strings.ToLower(modelName), "claude") {
+		out = gemini.SanitizeAntigravityClaudeGeminiRequestSignatures(modelName, out)
+	}
 	return common.AttachDefaultSafetySettings(out, "request.safetySettings")
 }
 
