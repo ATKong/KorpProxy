@@ -27,13 +27,14 @@ var (
 )
 
 var codexClientAllowedReasoningLevels = map[string]struct{}{
-	"none":   {},
-	"low":    {},
-	"medium": {},
-	"high":   {},
-	"xhigh":  {},
-	"max":    {},
-	"ultra":  {},
+	"none":    {},
+	"minimal": {},
+	"low":     {},
+	"medium":  {},
+	"high":    {},
+	"xhigh":   {},
+	"max":     {},
+	"ultra":   {},
 }
 
 // BuildResponse builds a Codex client model response from available models.
@@ -59,6 +60,7 @@ func buildCodexClientModels(models []map[string]any, providersForModel Providers
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
 			applyCodexClientDisplayName(entry, model)
+			applyCodexClientMaxContextLengthOverride(entry, model)
 			applyCodexClientSearchToolSupport(entry, id, true, providersForModel)
 			sanitizeCodexClientReasoningMetadata(entry)
 			applyCodexClientVisibilityOverride(entry, id)
@@ -181,6 +183,13 @@ func applyCodexClientDisplayName(entry map[string]any, model map[string]any) {
 	}
 }
 
+func applyCodexClientMaxContextLengthOverride(entry map[string]any, model map[string]any) {
+	if maxContextLength := intModelValue(model, "max_context_length"); maxContextLength > 0 {
+		entry["context_window"] = maxContextLength
+		entry["max_context_window"] = maxContextLength
+	}
+}
+
 func applyCodexClientSearchToolSupport(entry map[string]any, id string, templateModel bool, providersForModel ProvidersForModelFunc) {
 	supportsSearch, _ := entry["supports_search_tool"].(bool)
 	if !supportsSearch {
@@ -234,6 +243,10 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 			applyCodexClientInputModalitiesMetadata(entry, info.SupportedInputModalities)
 		}
 		applyCodexClientThinkingMetadata(entry, info.Thinking)
+	}
+
+	if maxContextWindow := intModelValue(model, "max_context_length"); maxContextWindow > 0 {
+		contextWindow = maxContextWindow
 	}
 
 	if displayName == "" {
@@ -392,6 +405,8 @@ func codexClientReasoningDescription(level string) string {
 	switch level {
 	case "none":
 		return "No reasoning"
+	case "minimal":
+		return "Fastest responses with minimal reasoning"
 	case "low":
 		return "Fast responses with lighter reasoning"
 	case "medium":
