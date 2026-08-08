@@ -95,11 +95,11 @@ func defaultPluginInstanceConfigNode() *yaml.Node {
 	}
 }
 
-// ClaudeHeaderDefaults configures default header values injected into Claude API requests.
-// In legacy mode, UserAgent/PackageVersion/RuntimeVersion/Timeout act as fallbacks when
-// the client omits them, while OS/Arch remain runtime-derived. When stabilized device
-// profiles are enabled, OS/Arch become the pinned platform baseline, while
-// UserAgent/PackageVersion/RuntimeVersion seed the upgradeable software fingerprint.
+// ClaudeHeaderDefaults configures the measured Claude Code software baseline.
+// Verified native requests preserve their entrypoint and software shape only when their
+// Claude Code, package, and runtime versions exactly match this baseline; unmeasured
+// versions use the configured values. Timeout remains a fallback. Stabilized profiles
+// also pin OS and Arch and never learn newer software versions automatically.
 type ClaudeHeaderDefaults struct {
 	UserAgent              string `yaml:"user-agent" json:"user-agent"`
 	PackageVersion         string `yaml:"package-version" json:"package-version"`
@@ -107,6 +107,7 @@ type ClaudeHeaderDefaults struct {
 	OS                     string `yaml:"os" json:"os"`
 	Arch                   string `yaml:"arch" json:"arch"`
 	Timeout                string `yaml:"timeout" json:"timeout"`
+	Timezone               string `yaml:"timezone" json:"timezone"`
 	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
 }
 
@@ -122,6 +123,12 @@ type CodexHeaderDefaults struct {
 type XAIConfig struct {
 	// InjectXSearch injects xAI's native x_search tool when the request does not declare it.
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
+}
+
+// AntigravityConfig configures provider-wide Antigravity request behavior.
+type AntigravityConfig struct {
+	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
+	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 }
 
 // CodexConfig configures provider-wide Codex request behavior.
@@ -290,14 +297,14 @@ type PayloadModelRule struct {
 // Cloaking disguises API requests to appear as originating from the official Claude Code CLI.
 type CloakConfig struct {
 	// Mode controls cloaking behavior: "auto" (default), "always", or "never".
-	// - "auto": cloak only when client is not Claude Code (based on User-Agent)
-	// - "always": always apply cloaking regardless of client
+	// - "auto": cloak unless strong request signals identify a verified native entrypoint
+	// - "always": cloak every unconfirmed client; confirmed native Claude Code remains passthrough
 	// - "never": never apply cloaking
 	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
 
-	// StrictMode controls how system prompts are handled when cloaking.
-	// - false (default): prepend Claude Code prompt to user system messages
-	// - true: strip all user system messages, keep only Claude Code prompt
+	// StrictMode controls how caller system prompts are handled when cloaking.
+	// - false (default): legacy-model whitelist uses a user reminder; all other models use a mid-conversation system message
+	// - true: strip caller system prompts and keep only the Claude Code billing and identity blocks
 	StrictMode bool `yaml:"strict-mode,omitempty" json:"strict-mode,omitempty"`
 
 	// SensitiveWords is a list of words to obfuscate with zero-width characters.
@@ -351,9 +358,8 @@ type ClaudeKey struct {
 	// Cloak configures request cloaking for non-Claude-Code clients.
 	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
 
-	// ExperimentalCCHSigning enables opt-in final-body cch signing for cloaked
-	// Claude /v1/messages requests. It is disabled by default so upstream seed
-	// changes do not alter the proxy's legacy behavior.
+	// ExperimentalCCHSigning is retained for configuration compatibility.
+	// CCH signing is automatic for Claude OAuth and supported direct upstreams.
 	ExperimentalCCHSigning bool `yaml:"experimental-cch-signing,omitempty" json:"experimental-cch-signing,omitempty"`
 }
 
@@ -382,6 +388,10 @@ type ClaudeModel struct {
 	// ForceMapping rewrites upstream response model fields back to Alias.
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 
+	// IsCompat preserves thinking blocks with empty signatures for compatible upstreams.
+	// Default false keeps the normal signature validation behavior.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
+
 	// Thinking configures the thinking/reasoning capability for this model.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
@@ -393,6 +403,7 @@ func (m ClaudeModel) GetAlias() string { return m.Alias }
 func (m ClaudeModel) GetDisplayName() string   { return m.DisplayName }
 func (m ClaudeModel) GetMaxContextLength() int { return m.MaxContextLength }
 func (m ClaudeModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m ClaudeModel) GetIsCompat() bool        { return m.IsCompat }
 
 func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
@@ -464,6 +475,13 @@ type CodexModel struct {
 	// ForceMapping rewrites upstream response model fields back to Alias.
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 
+	// IsCompat converts Codex MultiAgentV2 agent_message items into portable
+	// Responses message/user input when codex.optimize-multi-agent-v2 is also true.
+	// Use this for third-party Responses-compatible endpoints that do not accept
+	// native agent_message items or empty-signature thinking blocks. Default false
+	// keeps the native behavior unchanged.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
+
 	// Thinking configures the thinking/reasoning capability for this model.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
@@ -475,6 +493,7 @@ func (m CodexModel) GetAlias() string { return m.Alias }
 func (m CodexModel) GetDisplayName() string   { return m.DisplayName }
 func (m CodexModel) GetMaxContextLength() int { return m.MaxContextLength }
 func (m CodexModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m CodexModel) GetIsCompat() bool        { return m.IsCompat }
 
 func (m CodexModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
@@ -545,6 +564,10 @@ type GeminiModel struct {
 	// ForceMapping rewrites upstream response model fields back to Alias.
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 
+	// IsCompat preserves thinking blocks with empty signatures for compatible upstreams.
+	// Default false keeps the normal signature validation behavior.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
+
 	// Thinking configures the thinking/reasoning capability for this model.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
@@ -556,6 +579,7 @@ func (m GeminiModel) GetAlias() string { return m.Alias }
 func (m GeminiModel) GetDisplayName() string   { return m.DisplayName }
 func (m GeminiModel) GetMaxContextLength() int { return m.MaxContextLength }
 func (m GeminiModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m GeminiModel) GetIsCompat() bool        { return m.IsCompat }
 
 func (m GeminiModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
@@ -635,6 +659,10 @@ type OpenAICompatibilityModel struct {
 	// OutputModalities declares supported output modalities when known (e.g. text, image).
 	OutputModalities []string `yaml:"output-modalities,omitempty" json:"output-modalities,omitempty"`
 
+	// IsCompat preserves Claude thinking blocks for compatible upstreams.
+	// Default false keeps the normal signature validation behavior.
+	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
+
 	// Thinking configures the thinking/reasoning capability for this model.
 	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
@@ -647,5 +675,6 @@ func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
 func (m OpenAICompatibilityModel) GetDisplayName() string   { return m.DisplayName }
 func (m OpenAICompatibilityModel) GetMaxContextLength() int { return m.MaxContextLength }
 func (m OpenAICompatibilityModel) GetForceMapping() bool    { return m.ForceMapping }
+func (m OpenAICompatibilityModel) GetIsCompat() bool        { return m.IsCompat }
 
 func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
