@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -175,7 +176,7 @@ func (h *Handler) Handle(c *gin.Context) {
 
 	body, errRead := readBody(c.Request.Body)
 	if errRead != nil {
-		status := http.StatusBadRequest
+		status := clienterror.HTTPStatusFromErrorOr(errRead, http.StatusBadRequest)
 		if errors.Is(errRead, errBodyTooLarge) {
 			status = http.StatusRequestEntityTooLarge
 		}
@@ -246,7 +247,7 @@ func (h *Handler) Handle(c *gin.Context) {
 			authIndex:  selectedIndex,
 		})
 		if errSDP != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"error": errSDP.Error()})
+			c.JSON(clienterror.HTTPStatusFromErrorOr(errSDP, http.StatusBadGateway), gin.H{"error": errSDP.Error()})
 			return
 		}
 		defer func() {
@@ -263,46 +264,76 @@ func (h *Handler) Handle(c *gin.Context) {
 		}
 	}
 
-	headers := protocolHeaders(c.Request.Header)
-	headers.Set("Content-Type", upstreamContentType)
-	setAccountHeader(headers, selected)
-	req, errRequest := h.authManager.NewHttpRequest(ctx, selected, http.MethodPost, upstreamCallURL, upstreamBody, headers)
-	if errRequest != nil {
-		if selection != nil {
-			selection.End("request_build_failed")
+	baseHeaders := protocolHeaders(c.Request.Header)
+	baseHeaders.Set("Content-Type", upstreamContentType)
+	performRequest := func(current *auth.Auth) (*http.Response, error) {
+		headers := baseHeaders.Clone()
+		setAccountHeader(headers, current)
+		req, errRequest := h.authManager.NewHttpRequest(ctx, current, http.MethodPost, upstreamCallURL, upstreamBody, headers)
+		if errRequest != nil {
+			return nil, errRequest
 		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": errRequest.Error()})
-		return
+		authType, authValue := current.AccountInfo()
+		helps.RecordAPIRequest(ctx, runtimeConfig, helps.UpstreamRequestLog{
+			URL:       upstreamCallURL,
+			Method:    http.MethodPost,
+			Headers:   headersForLogging(req.Header),
+			Body:      upstreamBody,
+			Provider:  "codex",
+			AuthID:    current.ID,
+			AuthLabel: current.Label,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		return h.authManager.HttpRequest(ctx, current, req)
 	}
-
-	authType, authValue := selected.AccountInfo()
-	helps.RecordAPIRequest(ctx, runtimeConfig, helps.UpstreamRequestLog{
-		URL:       upstreamCallURL,
-		Method:    http.MethodPost,
-		Headers:   headersForLogging(req.Header),
-		Body:      upstreamBody,
-		Provider:  "codex",
-		AuthID:    selected.ID,
-		AuthLabel: selected.Label,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
 
 	if errContext := ctx.Err(); errContext != nil {
 		if selection != nil {
 			selection.End("attempt_canceled")
 		}
-		c.JSON(http.StatusRequestTimeout, gin.H{"error": errContext.Error()})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errContext, http.StatusRequestTimeout), gin.H{"error": errContext.Error()})
 		return
 	}
-	resp, errRequest := h.authManager.HttpRequest(ctx, selected, req)
+	resp, errRequest := performRequest(selected)
 	if errRequest != nil {
 		if selection != nil {
 			selection.End("request_failed")
 		}
 		helps.RecordAPIResponseError(ctx, runtimeConfig, errRequest)
-		c.JSON(http.StatusBadGateway, gin.H{"error": errRequest.Error()})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errRequest, http.StatusBadGateway), gin.H{"error": errRequest.Error()})
 		return
+	}
+	if selection != nil && resp.StatusCode == http.StatusUnauthorized {
+		h.authManager.ReportHomeUnauthorized(ctx, selected, "codex", model)
+		helps.RecordAPIResponseMetadata(ctx, runtimeConfig, resp.StatusCode, callResponseHeaders(resp.Header))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("codex live: close unauthorized response body error: %v", errClose)
+		}
+		refreshed, didRefresh, errRefresh := h.authManager.RefreshHomeSelectionAfterUnauthorized(ctx, selection, selected)
+		if errRefresh != nil {
+			selection.End("refresh_failed")
+			writeSelectionError(c, errRefresh)
+			return
+		}
+		if !didRefresh || refreshed == nil {
+			selection.End("refresh_unavailable")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Codex credential unauthorized"})
+			return
+		}
+		selected = refreshed
+		logging.SetGinCPATraceID(c, selected.EnsureIndex())
+		resp, errRequest = performRequest(selected)
+		if errRequest != nil {
+			selection.End("retry_failed")
+			helps.RecordAPIResponseError(ctx, runtimeConfig, errRequest)
+			c.JSON(clienterror.HTTPStatusFromErrorOr(errRequest, http.StatusBadGateway), gin.H{"error": errRequest.Error()})
+			return
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			h.authManager.ReportHomeUnauthorized(ctx, selected, "codex", model)
+		}
 	}
 
 	var closeResponseOnce sync.Once
@@ -331,10 +362,12 @@ func (h *Handler) Handle(c *gin.Context) {
 	if errResponse != nil {
 		helps.RecordAPIResponseError(ctx, runtimeConfig, errResponse)
 		message := "Failed to read Codex live response"
+		status := clienterror.HTTPStatusFromErrorOr(errResponse, http.StatusBadGateway)
 		if errors.Is(errResponse, errBodyTooLarge) {
 			message = "Codex live response body too large"
+			status = http.StatusBadGateway
 		}
-		c.JSON(http.StatusBadGateway, gin.H{"error": message})
+		c.JSON(status, gin.H{"error": message})
 		return
 	}
 	helps.AppendAPIResponseChunk(ctx, runtimeConfig, responseBody)
@@ -359,7 +392,7 @@ func (h *Handler) Handle(c *gin.Context) {
 		}
 		downstreamAnswer, errAnswer := mediaSession.AcceptUpstreamAnswer(ctx, upstreamAnswer)
 		if errAnswer != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"error": errAnswer.Error()})
+			c.JSON(clienterror.HTTPStatusFromErrorOr(errAnswer, http.StatusBadGateway), gin.H{"error": errAnswer.Error()})
 			return
 		}
 		responseBodyToWrite = []byte(downstreamAnswer)
@@ -688,10 +721,7 @@ func writeResponseHeaders(destination, source http.Header) {
 }
 
 func writeSelectionError(c *gin.Context, err error) {
-	status := http.StatusServiceUnavailable
-	if statusError, ok := err.(interface{ StatusCode() int }); ok && statusError.StatusCode() > 0 {
-		status = statusError.StatusCode()
-	}
+	status := clienterror.HTTPStatusFromErrorOr(err, http.StatusServiceUnavailable)
 	for _, value := range auth.SafeResponseHeaders(err).Values("Retry-After") {
 		c.Writer.Header().Add("Retry-After", value)
 	}
