@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -26,6 +27,10 @@ const (
 	codexOptimizedCollaborationNamespace  = "collaboration-optimize"
 	codexOptimizedCollaborationNamePrefix = codexOptimizedCollaborationNamespace + "__"
 )
+
+// CodexMultiAgentV2ToolsPreparedContextKey marks a request whose collaboration
+// tool definitions were prepared at the Responses API boundary.
+const CodexMultiAgentV2ToolsPreparedContextKey = "codex_multi_agent_v2_tools_prepared"
 
 // codexCollaborationMessageTools are the collaboration tool names whose
 // parameters.properties.message.encrypted field must be stripped so that
@@ -75,6 +80,32 @@ func TranslateRequestWithCodexMultiAgentV2(ctx context.Context, headers http.Hea
 	return sdktranslator.TranslateRequest(from, to, model, payload, stream)
 }
 
+// PrepareCodexMultiAgentV2Tools prepares collaboration tool definitions at the
+// Responses API boundary without changing the collaboration namespace.
+func PrepareCodexMultiAgentV2Tools(ctx context.Context, headers http.Header, payload []byte, enabled, homeEnabled bool) ([]byte, bool) {
+	if !codexMultiAgentV2ClientEnabled(ctx, headers, enabled) {
+		return payload, false
+	}
+
+	toolPaths := codexSpawnAgentToolPaths(payload)
+	messageToolPaths := codexCollaborationMessageToolPaths(payload)
+	if len(toolPaths) == 0 && len(messageToolPaths) == 0 {
+		return payload, true
+	}
+	if hasCodexOptimizedCollaborationConflict(payload) {
+		return removeCodexCollaborationMessageEncryption(payload, messageToolPaths), true
+	}
+
+	var models []codexSpawnAgentModel
+	var formattedMarkdown string
+	if len(toolPaths) > 0 {
+		models, formattedMarkdown = codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
+	}
+
+	updated := rewriteCodexCollaborationTools(payload, messageToolPaths, toolPaths, models, formattedMarkdown)
+	return updated, true
+}
+
 // OptimizeCodexMultiAgentV2Request rewrites an eligible spawn_agent request and
 // reports whether the collaboration namespace was renamed for upstream use.
 func OptimizeCodexMultiAgentV2Request(ctx context.Context, headers http.Header, payload []byte, cfg *config.Config) ([]byte, bool) {
@@ -82,18 +113,37 @@ func OptimizeCodexMultiAgentV2Request(ctx context.Context, headers http.Header, 
 		return payload, false
 	}
 	updated := rewriteCodexAgentMessageContent(payload)
-	updated = removeCodexCollaborationMessageEncryption(updated, codexCollaborationMessageToolPaths(updated))
+	if codexMultiAgentV2ToolsPrepared(ctx) {
+		updated = removeCodexCollaborationMessageEncryption(updated, codexCollaborationMessageToolPaths(updated))
+	} else {
+		updated, _ = PrepareCodexMultiAgentV2Tools(ctx, headers, updated, cfg.Codex.OptimizeMultiAgentV2, cfg.Home.Enabled)
+	}
 	toolPaths := codexSpawnAgentToolPaths(updated)
 	if len(toolPaths) == 0 || hasCodexOptimizedCollaborationConflict(updated) {
 		return updated, false
 	}
-	models := codexSpawnAgentModelsForRequest(ctx, headers, cfg.Home.Enabled)
-	updated = rewriteCodexSpawnAgentTools(updated, toolPaths, models)
 	return optimizeCodexCollaborationNamespace(updated, toolPaths)
 }
 
 func codexMultiAgentV2Enabled(ctx context.Context, headers http.Header, cfg *config.Config) bool {
-	return cfg != nil && cfg.Codex.OptimizeMultiAgentV2 && isCodexMultiAgentClient(codexClientUserAgent(ctx, headers))
+	return cfg != nil && codexMultiAgentV2ClientEnabled(ctx, headers, cfg.Codex.OptimizeMultiAgentV2)
+}
+
+func codexMultiAgentV2ClientEnabled(ctx context.Context, headers http.Header, enabled bool) bool {
+	return enabled && isCodexMultiAgentClient(codexClientUserAgent(ctx, headers))
+}
+
+func codexMultiAgentV2ToolsPrepared(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return false
+	}
+	prepared, ok := ginCtx.Get(CodexMultiAgentV2ToolsPreparedContextKey)
+	isPrepared, _ := prepared.(bool)
+	return ok && isPrepared
 }
 
 func codexClientUserAgent(ctx context.Context, headers http.Header) string {
@@ -125,19 +175,141 @@ func headerValueCaseInsensitive(headers http.Header, name string) string {
 	return ""
 }
 
-func isCodexMultiAgentClient(userAgent string) bool {
+// IsCodexClientUserAgent reports whether a request uses an official Codex client identity.
+func IsCodexClientUserAgent(userAgent string) bool {
 	userAgent = strings.TrimSpace(userAgent)
-	return strings.HasPrefix(userAgent, "Codex Desktop/") || strings.HasPrefix(userAgent, "codex-tui/")
+	return strings.HasPrefix(userAgent, "Codex Desktop/") ||
+		strings.HasPrefix(userAgent, "codex-tui/") ||
+		userAgent == "codex_cli_rs" ||
+		strings.HasPrefix(userAgent, "codex_cli_rs/")
+}
+
+func isCodexMultiAgentClient(userAgent string) bool {
+	return IsCodexClientUserAgent(userAgent)
+}
+
+var (
+	codexCatalogTemplatesMu       sync.RWMutex
+	codexCatalogTemplatesLoaded   bool
+	codexCatalogTemplatesRevision uint64
+	codexCatalogTemplates         map[string]map[string]any
+	codexCatalogDefaultTemplate   map[string]any
+
+	codexSpawnAgentCacheMu         sync.RWMutex
+	codexSpawnAgentCacheRevision   uint64
+	codexSpawnAgentCacheGeneration uint64
+	codexSpawnAgentCachedModels    []codexSpawnAgentModel
+	codexSpawnAgentCachedMarkdown  string
+)
+
+func loadCodexCatalogTemplates() (map[string]map[string]any, map[string]any, uint64, error) {
+	currentRevision := registry.GetCodexClientModelsRevision()
+
+	codexCatalogTemplatesMu.RLock()
+	if codexCatalogTemplatesLoaded && codexCatalogTemplatesRevision == currentRevision {
+		templates := codexCatalogTemplates
+		defaultTemplate := codexCatalogDefaultTemplate
+		codexCatalogTemplatesMu.RUnlock()
+		return templates, defaultTemplate, currentRevision, nil
+	}
+	codexCatalogTemplatesMu.RUnlock()
+
+	codexCatalogTemplatesMu.Lock()
+	defer codexCatalogTemplatesMu.Unlock()
+	if codexCatalogTemplatesLoaded && codexCatalogTemplatesRevision == currentRevision {
+		return codexCatalogTemplates, codexCatalogDefaultTemplate, currentRevision, nil
+	}
+
+	raw, revision := registry.GetCodexClientModelsSnapshot()
+
+	var catalog codexClientModelsCatalog
+	errUnmarshal := json.Unmarshal(raw, &catalog)
+	if errUnmarshal != nil || len(catalog.Models) == 0 {
+		codexCatalogTemplatesLoaded = true
+		codexCatalogTemplatesRevision = revision
+		codexCatalogTemplates = nil
+		codexCatalogDefaultTemplate = nil
+		return nil, nil, revision, errUnmarshal
+	}
+
+	templates := make(map[string]map[string]any, len(catalog.Models))
+	var defaultTemplate map[string]any
+	for _, model := range catalog.Models {
+		modelID := mapString(model, "slug")
+		if modelID == "" {
+			continue
+		}
+		templates[modelID] = model
+		if modelID == "gpt-5.5" {
+			defaultTemplate = model
+		}
+	}
+
+	codexCatalogTemplatesLoaded = true
+	codexCatalogTemplatesRevision = revision
+	codexCatalogTemplates = templates
+	codexCatalogDefaultTemplate = defaultTemplate
+	return templates, defaultTemplate, revision, nil
+}
+
+func codexSpawnAgentModelsAndMarkdownForRequest(ctx context.Context, headers http.Header, homeEnabled bool) ([]codexSpawnAgentModel, string) {
+	if homeEnabled {
+		availableModels := codexHomeAvailableModels(ctx, headers)
+		templates, defaultTemplate, _, errLoad := loadCodexCatalogTemplates()
+		if errLoad != nil || defaultTemplate == nil {
+			return nil, ""
+		}
+		models := codexSpawnAgentModelsFromTemplates(availableModels, templates, defaultTemplate, func(modelID string) *registry.ModelInfo {
+			return registry.LookupModelInfo(modelID)
+		})
+		formatted := formatCodexSpawnAgentModels(models)
+		return models, formatted
+	}
+
+	currentRevision := registry.GetCodexClientModelsRevision()
+	currentGeneration := registry.GetGlobalRegistry().GetGeneration()
+
+	codexSpawnAgentCacheMu.RLock()
+	if codexSpawnAgentCachedModels != nil && codexSpawnAgentCacheRevision == currentRevision && codexSpawnAgentCacheGeneration == currentGeneration {
+		models := codexSpawnAgentCachedModels
+		markdown := codexSpawnAgentCachedMarkdown
+		codexSpawnAgentCacheMu.RUnlock()
+		return models, markdown
+	}
+	codexSpawnAgentCacheMu.RUnlock()
+
+	templates, defaultTemplate, _, errLoad := loadCodexCatalogTemplates()
+	if errLoad != nil || defaultTemplate == nil {
+		return nil, ""
+	}
+
+	availableModels := registry.GetGlobalRegistry().GetAvailableModels("openai")
+	lookup := func(modelID string) *registry.ModelInfo {
+		return registry.LookupModelInfo(modelID)
+	}
+	models := codexSpawnAgentModelsFromTemplates(availableModels, templates, defaultTemplate, lookup)
+	formatted := formatCodexSpawnAgentModels(models)
+
+	codexSpawnAgentCacheMu.Lock()
+	if currentRevision == registry.GetCodexClientModelsRevision() && currentGeneration == registry.GetGlobalRegistry().GetGeneration() {
+		codexSpawnAgentCacheRevision = currentRevision
+		codexSpawnAgentCacheGeneration = currentGeneration
+		codexSpawnAgentCachedModels = models
+		codexSpawnAgentCachedMarkdown = formatted
+	}
+	codexSpawnAgentCacheMu.Unlock()
+
+	return models, formatted
 }
 
 func codexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) []codexSpawnAgentModel {
-	availableModels := registry.GetGlobalRegistry().GetAvailableModels("openai")
-	if homeEnabled {
-		availableModels = codexHomeAvailableModels(ctx, headers)
-	}
-	return codexSpawnAgentModelsFromSources(availableModels, registry.GetCodexClientModelsJSON(), func(modelID string) *registry.ModelInfo {
-		return registry.LookupModelInfo(modelID)
-	})
+	models, _ := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
+	return models
+}
+
+func formatCodexSpawnAgentModelsForRequest(ctx context.Context, headers http.Header, homeEnabled bool) string {
+	_, formatted := codexSpawnAgentModelsAndMarkdownForRequest(ctx, headers, homeEnabled)
+	return formatted
 }
 
 func codexHomeAvailableModels(ctx context.Context, headers http.Header) []map[string]any {
@@ -219,6 +391,14 @@ func codexSpawnAgentModelsFromSources(availableModels []map[string]any, catalogJ
 			defaultTemplate = model
 		}
 	}
+	if defaultTemplate == nil {
+		return nil
+	}
+
+	return codexSpawnAgentModelsFromTemplates(availableModels, templates, defaultTemplate, lookupModel)
+}
+
+func codexSpawnAgentModelsFromTemplates(availableModels []map[string]any, templates map[string]map[string]any, defaultTemplate map[string]any, lookupModel func(string) *registry.ModelInfo) []codexSpawnAgentModel {
 	if defaultTemplate == nil {
 		return nil
 	}
@@ -405,12 +585,18 @@ func rewriteCodexSpawnAgentDescription(payload []byte, models []codexSpawnAgentM
 }
 
 func rewriteCodexSpawnAgentTools(payload []byte, toolPaths []string, models []codexSpawnAgentModel) []byte {
-	if len(toolPaths) == 0 {
+	return rewriteCodexCollaborationTools(payload, toolPaths, toolPaths, models, "")
+}
+
+func rewriteCodexCollaborationTools(payload []byte, messageToolPaths, spawnAgentToolPaths []string, models []codexSpawnAgentModel, modelList string) []byte {
+	if len(messageToolPaths) == 0 && len(spawnAgentToolPaths) == 0 {
 		return payload
 	}
-	modelList := formatCodexSpawnAgentModels(models)
+	if modelList == "" && len(models) > 0 {
+		modelList = formatCodexSpawnAgentModels(models)
+	}
 	updated := payload
-	for _, toolPath := range toolPaths {
+	for _, toolPath := range spawnAgentToolPaths {
 		descriptionPath := toolPath + ".description"
 		description := gjson.GetBytes(updated, descriptionPath)
 		if description.Type == gjson.String && modelList != "" {
@@ -423,14 +609,25 @@ func rewriteCodexSpawnAgentTools(payload []byte, toolPaths []string, models []co
 				}
 			}
 		}
+	}
 
-		var errDelete error
-		updated, errDelete = sjson.DeleteBytes(updated, toolPath+".parameters.properties.message.encrypted")
-		if errDelete != nil {
-			return payload
+	for _, toolPath := range messageToolPaths {
+		encryptedPath := toolPath + ".parameters.properties.message.encrypted"
+		if gjson.GetBytes(updated, encryptedPath).Exists() {
+			var errDelete error
+			updated, errDelete = sjson.DeleteBytes(updated, encryptedPath)
+			if errDelete != nil {
+				return payload
+			}
 		}
 	}
 	return updated
+}
+
+// HasCodexMultiAgentV2NamespaceConflict reports whether the request defines
+// the reserved optimized namespace, which must remain untouched.
+func HasCodexMultiAgentV2NamespaceConflict(payload []byte) bool {
+	return hasCodexOptimizedCollaborationConflict(payload)
 }
 
 func hasCodexOptimizedCollaborationConflict(payload []byte) bool {
@@ -669,8 +866,12 @@ func collectCodexToolPathsByNames(tools gjson.Result, path string, paths *[]stri
 func removeCodexCollaborationMessageEncryption(payload []byte, toolPaths []string) []byte {
 	updated := payload
 	for _, toolPath := range toolPaths {
+		encryptedPath := toolPath + ".parameters.properties.message.encrypted"
+		if !gjson.GetBytes(updated, encryptedPath).Exists() {
+			continue
+		}
 		var errDelete error
-		updated, errDelete = sjson.DeleteBytes(updated, toolPath+".parameters.properties.message.encrypted")
+		updated, errDelete = sjson.DeleteBytes(updated, encryptedPath)
 		if errDelete != nil {
 			return payload
 		}
@@ -757,6 +958,9 @@ func replaceCodexSpawnAgentModels(description, modelList string) string {
 }
 
 func removeCodexSpawnAgentModelSections(description string) (string, string) {
+	if !strings.Contains(description, codexSpawnAgentModelsHeading) {
+		return description, ""
+	}
 	lines := strings.SplitAfter(description, "\n")
 	var cleaned strings.Builder
 	headingIndent := ""
