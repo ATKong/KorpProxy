@@ -111,6 +111,31 @@ jobs:
           # Fails loudly (non-ff) if main moved mid-run; the next scheduled run retries.
           git push origin HEAD:main
 
+      # Housekeeping: both PR paths below supersede any earlier sync attempt, so
+      # close stale sync PRs (and delete their branches) before opening a new one.
+      - name: Close superseded sync PRs
+        if: steps.merge.outputs.merge == 'conflict' || (steps.merge.outputs.merge == 'clean' && steps.verify.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          for pr in $(gh pr list --state open --limit 200 \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | .number'); do
+            echo "Closing superseded sync PR #$pr"
+            gh pr close "$pr" \
+              --comment "Superseded by a newer sync attempt (\`${{ steps.merge.outputs.branch }}\`). Closing to keep the queue clean." \
+              --delete-branch || true
+          done
+          # Sweep orphaned sync branches whose PRs are already closed/merged.
+          git fetch origin --prune
+          for b in $(git branch -r --list 'origin/sync/upstream-*' | sed 's|^ *origin/||'); do
+            if [ "$b" != "${{ steps.merge.outputs.branch }}" ]; then
+              echo "Deleting orphaned branch $b"
+              git push origin --delete "$b" || true
+            fi
+          done
+
       # Path 2: clean merge but build/test failed -> open a PR for a human to fix.
       - name: Open PR (build/test failed)
         if: steps.merge.outputs.merge == 'clean' && steps.verify.outcome == 'failure'
