@@ -625,10 +625,36 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 	}
 
 	// Unconfirmed clients must not leak a copied or third-party software profile
-	// into the upstream Claude Code SDK fingerprint.
+	// into the upstream Claude Code SDK fingerprint, so the software tuple is
+	// always normalized to the configured Claude Code baseline.
+	//
+	// The platform (OS/Arch) follows the operator's intent rather than the
+	// hardcoded default fingerprint: an explicitly configured platform is
+	// honored, and when the operator left it at the default the runtime host
+	// platform is used instead, so a server does not masquerade as macOS by
+	// default. A confirmed client that failed plausibility keeps an explicit
+	// macOS preference; an unconfirmed client treats the default macOS as "no
+	// preference" and falls back to the host platform, which is the honest
+	// identity for a third-party caller.
+	var hd config.ClaudeHeaderDefaults
+	if cfg != nil {
+		hd = cfg.ClaudeHeaderDefaults
+	}
+	osName := profile.OS
+	archName := profile.Arch
+	if strings.TrimSpace(hd.OS) == "" {
+		osName = mapStainlessOS()
+	} else if !confirmedClaudeCode && osName == defaultClaudeFingerprintOS {
+		osName = mapStainlessOS()
+	}
+	if strings.TrimSpace(hd.Arch) == "" {
+		archName = mapStainlessArch()
+	} else if !confirmedClaudeCode && archName == defaultClaudeFingerprintArch {
+		archName = mapStainlessArch()
+	}
 	r.Header.Set("X-Stainless-Runtime-Version", profile.RuntimeVersion)
 	r.Header.Set("X-Stainless-Package-Version", profile.PackageVersion)
-	r.Header.Set("X-Stainless-Os", profile.OS)
-	r.Header.Set("X-Stainless-Arch", profile.Arch)
+	r.Header.Set("X-Stainless-Os", osName)
+	r.Header.Set("X-Stainless-Arch", archName)
 	r.Header.Set("User-Agent", profile.UserAgent)
 }
