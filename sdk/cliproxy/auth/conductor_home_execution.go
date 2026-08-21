@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/sjson"
@@ -139,7 +140,9 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 				}
 				return selection.Executor.Execute(execCtx, preparedAuth, execReq, execOpts)
 			}
+			startHomeExec := time.Now()
 			response, errExecute = execute()
+			durationHomeExec := time.Since(startHomeExec)
 			refreshAuth := preparedAuth
 			if countTokens {
 				if observedAuth, fingerprint := getEffectiveAuth(); isUnauthorizedError(errExecute) {
@@ -152,17 +155,25 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 			if errExecute != nil {
 				if refreshed, okRefresh, errRefresh := m.tryRefreshExecutionAuthAfterUnauthorized(execCtx, selection.Executor, refreshAuth, errExecute, didRefreshOnUnauthorized, true); errRefresh != nil {
 					errExecute = errRefresh
+					warnLogUpstreamFailure(execCtx, entry, selection.Provider, upstreamModel, preparedAuth, durationHomeExec, errExecute)
 				} else if okRefresh {
 					preparedAuth = refreshed
 					m.replaceHomeSelectionAuth(selection, preparedAuth)
 					didRefreshOnUnauthorized = true
 					publishSelectedAuthMetadata(opts.Metadata, preparedAuth)
 					setEffectiveAuth(preparedAuth)
+					startHomeRetry := time.Now()
 					response, errExecute = execute()
-					if countTokens && isUnauthorizedError(errExecute) {
-						_, fingerprint := getEffectiveAuth()
-						m.reportHomeUnauthorized(execCtx, preparedAuth, selection.Provider, resultModel, fingerprint)
+					durationHomeRetry := time.Since(startHomeRetry)
+					if errExecute != nil {
+						warnLogUpstreamFailure(execCtx, entry, selection.Provider, upstreamModel, preparedAuth, durationHomeRetry, errExecute)
+						if countTokens && isUnauthorizedError(errExecute) {
+							_, fingerprint := getEffectiveAuth()
+							m.reportHomeUnauthorized(execCtx, preparedAuth, selection.Provider, resultModel, fingerprint)
+						}
 					}
+				} else {
+					warnLogUpstreamFailure(execCtx, entry, selection.Provider, upstreamModel, preparedAuth, durationHomeExec, errExecute)
 				}
 			}
 			result := Result{AuthID: preparedAuth.ID, Provider: selection.Provider, Model: resultModel, Success: errExecute == nil, Options: execOpts}

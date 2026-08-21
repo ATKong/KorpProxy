@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"reflect"
@@ -1078,12 +1079,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
+		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAvailable)
 		return nil, nil, errAvailable
 	}
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
 		return nil, nil, errPick
 	}
 	if !handled {
@@ -1093,6 +1096,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			if isBuiltInSelector(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
 			}
+			m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
 			return nil, nil, errPick
 		}
 	}
@@ -1316,6 +1320,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	}
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
 		return nil, nil, errPick
 	}
 	if selected == nil {
@@ -1405,12 +1410,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
+		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)
 		return nil, nil, "", errAvailable
 	}
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
 		return nil, nil, "", errPick
 	}
 	if !handled {
@@ -1420,6 +1427,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			if isBuiltInSelector(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
 			}
+			m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
 			return nil, nil, "", errPick
 		}
 	}
@@ -1508,6 +1516,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 	}
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, eligibleProviders, model, opts, tried, errPick)
 		return nil, nil, "", errPick
 	}
 	if selected == nil {
@@ -1527,4 +1536,108 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		m.mu.Unlock()
 	}
 	return authCopy, executor, providerKey, nil
+}
+
+func isAuthUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		return authErr.Code == "auth_unavailable" || authErr.Code == "model_cooldown"
+	}
+	var cooldownErr *modelCooldownError
+	return errors.As(err, &cooldownErr) && cooldownErr != nil
+}
+
+func authCoolingSummary(auth *Auth, model string, next time.Time, now time.Time) string {
+	if auth == nil {
+		return ""
+	}
+	ident := formatAuthIdentity(auth, auth.Provider)
+	reason := ""
+	if model != "" && len(auth.ModelStates) > 0 {
+		if state, ok := auth.ModelStates[model]; ok && state != nil {
+			reason = cooldownReason(state.StatusMessage, state.Quota, state.LastError)
+		} else if state, ok := auth.ModelStates[canonicalModelKey(model)]; ok && state != nil {
+			reason = cooldownReason(state.StatusMessage, state.Quota, state.LastError)
+		}
+	}
+	if reason == "" {
+		reason = cooldownReason(auth.StatusMessage, auth.Quota, auth.LastError)
+	}
+	if reason == "" {
+		reason = "cooldown"
+	}
+	remaining := "0s"
+	if !next.IsZero() && next.After(now) {
+		remaining = next.Sub(now).Round(time.Second).String()
+	}
+	return fmt.Sprintf("[%s, reason=%s, remaining=%s]", ident, reason, remaining)
+}
+
+func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, err error) {
+	if m == nil || err == nil || !isAuthUnavailableError(err) {
+		return
+	}
+	now := time.Now()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, p := range providers {
+		if norm := strings.TrimSpace(strings.ToLower(p)); norm != "" && norm != "mixed" {
+			providerSet[norm] = struct{}{}
+		}
+	}
+	registryRef := registry.GetGlobalRegistry()
+
+	coolingSummaries := make([]string, 0)
+	totalCandidates := 0
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		providerKey := executorKeyFromAuth(candidate)
+		if len(providerSet) > 0 {
+			if _, ok := providerSet[providerKey]; !ok {
+				continue
+			}
+		}
+		if _, ok := m.executors[providerKey]; !ok {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		if !eligibility.allows(candidate) {
+			continue
+		}
+		if tried != nil {
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+		}
+		if model != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
+		}
+		totalCandidates++
+		checkModel := m.selectionModelForAuth(candidate, model)
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		if blocked && reason == blockReasonCooldown {
+			coolingSummaries = append(coolingSummaries, authCoolingSummary(candidate, checkModel, next, now))
+		}
+	}
+
+	if len(coolingSummaries) > 0 {
+		sort.Strings(coolingSummaries)
+		entry := logEntryWithRequestID(ctx)
+		providerText := strings.Join(providers, ",")
+		if len(providers) == 1 {
+			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (provider=%s) are in cooldown: %s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "))
+		} else {
+			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (providers=%s) are in cooldown: %s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "))
+		}
+	}
 }
