@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -353,7 +355,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if !restoreExecutionModel {
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
 			}
+			startExec := time.Now()
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			durationExec := time.Since(startExec)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -361,12 +365,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
+					startRetry := time.Now()
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+					durationRetry := time.Since(startRetry)
 					if errExec != nil {
+						warnLogUpstreamFailure(execCtx, entry, provider, upstreamModel, auth, durationRetry, errExec)
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
+				} else {
+					warnLogUpstreamFailure(execCtx, entry, provider, upstreamModel, auth, durationExec, errExec)
 				}
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
@@ -383,7 +392,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
-				m.MarkResult(execCtx, result)
+				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) {
+					m.recordAvailabilityNeutralResult(execCtx, result)
+				} else {
+					m.MarkResult(execCtx, result)
+				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
 						return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
@@ -394,7 +407,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 					continue
 				}
-				if isRequestInvalidError(errExec) {
+				if isResponsesCompactRequestFaultError(execOpts, errExec) || isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -420,7 +433,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				continue
 			}
-			if isRequestInvalidError(authErr) {
+			if isResponsesCompactRequestFaultError(opts, authErr) || isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
@@ -509,7 +522,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if !restoreExecutionModel {
 				execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, upstreamModel)
 			}
+			startExec := time.Now()
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+			durationExec := time.Since(startExec)
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -517,12 +532,17 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
+					startRetry := time.Now()
 					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
+					durationRetry := time.Since(startRetry)
 					if errExec != nil {
+						warnLogUpstreamFailure(execCtx, entry, provider, upstreamModel, auth, durationRetry, errExec)
 						if errCtx := execCtx.Err(); errCtx != nil {
 							return cliproxyexecutor.Response{}, errCtx
 						}
 					}
+				} else {
+					warnLogUpstreamFailure(execCtx, entry, provider, upstreamModel, auth, durationExec, errExec)
 				}
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
@@ -1276,6 +1296,68 @@ func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string
 		return accountInfo
 	}
 	return strings.Join(parts, " ")
+}
+
+func formatAuthIdentity(auth *Auth, provider string) string {
+	if auth == nil {
+		return "auth=nil"
+	}
+	accountType, accountInfo := auth.AccountInfo()
+	switch accountType {
+	case "api_key":
+		return fmt.Sprintf("api_key=%s", util.HideAPIKey(accountInfo))
+	case "oauth":
+		return formatOauthIdentity(auth, provider, accountInfo)
+	default:
+		if auth.FileName != "" {
+			return fmt.Sprintf("auth_file=%s", filepath.Base(auth.FileName))
+		}
+		if auth.ID != "" {
+			return fmt.Sprintf("auth_id=%s", auth.ID)
+		}
+		if accountInfo != "" {
+			return accountInfo
+		}
+		return "unknown"
+	}
+}
+
+func summarizeErrorForLog(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	const maxRunes = 300
+	runes := []rune(msg)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "..."
+	}
+	return msg
+}
+
+func warnLogUpstreamFailure(ctx context.Context, entry *log.Entry, provider, model string, auth *Auth, duration time.Duration, err error) {
+	if err == nil {
+		return
+	}
+	if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	if isRequestInvalidError(err) {
+		return
+	}
+	if entry == nil {
+		if ctx != nil {
+			entry = logEntryWithRequestID(ctx)
+		} else {
+			entry = log.NewEntry(log.StandardLogger())
+		}
+	}
+	authIdent := formatAuthIdentity(auth, provider)
+	errSummary := summarizeErrorForLog(err)
+	entry.Warnf("upstream execution failed: provider=%s model=%s auth=%s duration=%s err=%s", provider, model, authIdent, duration.Round(time.Millisecond), errSummary)
 }
 
 // InjectCredentials delegates per-provider HTTP request preparation when supported.
