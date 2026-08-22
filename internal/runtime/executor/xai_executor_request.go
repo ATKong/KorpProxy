@@ -98,6 +98,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	// configured x_search injection, so no surviving choice references a deleted tool.
 	body = normalizeXAINamespaceToolChoice(body)
 	body = normalizeXAIForcedWebSearchToolChoice(body)
+	body = normalizeXAIForcedImageGenerationToolChoice(body)
 	body = pruneXAIOrphanedToolChoice(body)
 	body = normalizeXAIToolChoiceForTools(body)
 	if e.cfg != nil && e.cfg.XAI.InjectXSearch {
@@ -276,15 +277,17 @@ func logXAIResolvedBaseURL(ctx context.Context, baseURL string) {
 	helps.LogWithRequestID(ctx).Infof("xai: using base_url=%s source=%s", baseURL, xaiBaseURLSource(baseURL))
 }
 
-func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
+func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, clientHeaders ...http.Header) {
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
-	applyXAICustomHeaders(r, auth)
+	applyXAICustomHeaders(r, auth, clientHeaders...)
 }
 
 func applyXAIDefaultHeaders(r *http.Request, token string, stream bool, sessionID string) {
 	r.Header.Set("Content-Type", "application/json")
 	if strings.TrimSpace(token) != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		r.Header.Del("Authorization")
 	}
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
@@ -297,12 +300,12 @@ func applyXAIDefaultHeaders(r *http.Request, token string, stream bool, sessionI
 	}
 }
 
-func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth) {
+func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth, clientHeaders ...http.Header) {
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
-	util.ApplyCustomHeadersFromAttrs(r, attrs)
+	util.ApplyCustomHeadersFromAttrs(r, attrs, clientHeaders...)
 }
 
 // applyXAIChatHeaders applies standard xAI headers for non-image/video chat
@@ -310,9 +313,9 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth) {
 // applyXAIHeaders behavior. CLI chat-proxy identity headers are only attached
 // when using_api is false and the resolved chat base URL is the official CLI
 // chat-proxy endpoint.
-func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
+func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, clientHeaders ...http.Header) {
 	if xaiUsingAPI(auth) {
-		applyXAIHeaders(r, auth, token, stream, sessionID)
+		applyXAIHeaders(r, auth, token, stream, sessionID, clientHeaders...)
 		return
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
@@ -323,7 +326,7 @@ func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string,
 		r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
 		r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
 	}
-	applyXAICustomHeaders(r, auth)
+	applyXAICustomHeaders(r, auth, clientHeaders...)
 }
 
 func xaiResolveComposerSessionID(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string) (string, error) {
@@ -528,6 +531,91 @@ func preserveXAIResponsesOutputControls(body, source []byte, from sdktranslator.
 	return body
 }
 
+// xaiGrokImageGenerationMinVersion is the first Grok line that accepts xAI's
+// native Responses image_generation tool. Older conversation models still
+// reject that hosted type, so the executor keeps stripping it there.
+var xaiGrokImageGenerationMinVersion = xaiGrokVersion{major: 4, minor: 6}
+
+type xaiGrokVersion struct {
+	major int
+	minor int
+}
+
+// xaiSupportsNativeImageGeneration reports whether the Grok model accepts
+// xAI's native Responses image_generation tool. grok-4.20-* is an older
+// product line whose dotted minor is not comparable to grok-4.6.
+func xaiSupportsNativeImageGeneration(model string) bool {
+	name := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	if name == "" || !strings.HasPrefix(name, "grok-") {
+		return false
+	}
+	rest := strings.TrimPrefix(name, "grok-")
+	if rest == "4.20" || strings.HasPrefix(rest, "4.20-") {
+		return false
+	}
+	ver, ok := xaiParseGrokVersionPrefix(rest)
+	if !ok {
+		return false
+	}
+	return xaiCompareGrokVersion(ver, xaiGrokImageGenerationMinVersion) >= 0
+}
+
+func xaiParseGrokVersionPrefix(rest string) (xaiGrokVersion, bool) {
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return xaiGrokVersion{}, false
+	}
+	major, err := strconv.Atoi(rest[:i])
+	if err != nil {
+		return xaiGrokVersion{}, false
+	}
+	if i == len(rest) || rest[i] != '.' {
+		return xaiGrokVersion{major: major, minor: -1}, true
+	}
+	j := i + 1
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		j++
+	}
+	if j == i+1 {
+		return xaiGrokVersion{major: major, minor: -1}, true
+	}
+	minor, err := strconv.Atoi(rest[i+1 : j])
+	if err != nil {
+		return xaiGrokVersion{}, false
+	}
+	return xaiGrokVersion{major: major, minor: minor}, true
+}
+
+func xaiCompareGrokVersion(a, b xaiGrokVersion) int {
+	if a.major != b.major {
+		if a.major < b.major {
+			return -1
+		}
+		return 1
+	}
+	aMinor := a.minor
+	if aMinor < 0 {
+		aMinor = 0
+	}
+	bMinor := b.minor
+	if bMinor < 0 {
+		bMinor = 0
+	}
+	if aMinor < bMinor {
+		return -1
+	}
+	if aMinor > bMinor {
+		return 1
+	}
+	return 0
+}
+
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	// stop is supported by Chat Completions but not by xAI's Responses API.
 	body, _ = sjson.DeleteBytes(body, "stop")
@@ -588,8 +676,18 @@ func ensureXAINativeXSearchAllowedTools(body []byte) []byte {
 // normalizeXAIForcedWebSearchToolChoice rewrites Codex's hosted-tool choice
 // into the allowed_tools form accepted by xAI's ModelToolChoice schema.
 func normalizeXAIForcedWebSearchToolChoice(body []byte) []byte {
+	return normalizeXAIForcedHostedToolChoice(body, xaiWebSearchToolType)
+}
+
+// normalizeXAIForcedImageGenerationToolChoice rewrites a forced image_generation
+// choice into the same allowed_tools form used for web_search.
+func normalizeXAIForcedImageGenerationToolChoice(body []byte) []byte {
+	return normalizeXAIForcedHostedToolChoice(body, xaiImageGenerationToolType)
+}
+
+func normalizeXAIForcedHostedToolChoice(body []byte, toolType string) []byte {
 	choice := gjson.GetBytes(body, "tool_choice")
-	if !choice.IsObject() || strings.TrimSpace(choice.Get("type").String()) != xaiWebSearchToolType {
+	if !choice.IsObject() || strings.TrimSpace(choice.Get("type").String()) != toolType {
 		return body
 	}
 
@@ -729,13 +827,14 @@ func normalizeXAITools(body []byte) []byte {
 	if !gjson.ValidBytes(body) {
 		return body
 	}
+	keepImageGeneration := xaiSupportsNativeImageGeneration(gjson.GetBytes(body, "model").String())
 	original := body
 	normalizeAtPath := func(path string) bool {
 		tools := gjson.GetBytes(body, path)
 		if !tools.Exists() || !tools.IsArray() {
 			return true
 		}
-		filtered, changed, ok := normalizeXAIToolArray(tools)
+		filtered, changed, ok := normalizeXAIToolArray(tools, keepImageGeneration)
 		if !ok {
 			return false
 		}
@@ -825,7 +924,7 @@ func promoteXAIAdditionalTools(body []byte) []byte {
 	return updated
 }
 
-func normalizeXAIToolArray(tools gjson.Result) ([]byte, bool, bool) {
+func normalizeXAIToolArray(tools gjson.Result, keepImageGeneration bool) ([]byte, bool, bool) {
 	toolItems := tools.Array()
 	filtered := make([][]byte, 0, len(toolItems))
 	changed := false
@@ -836,7 +935,7 @@ func normalizeXAIToolArray(tools gjson.Result) ([]byte, bool, bool) {
 			namespaceName := tool.Get("name").String()
 			if namespaceTools := tool.Get("tools"); namespaceTools.IsArray() {
 				for _, nestedTool := range namespaceTools.Array() {
-					nestedRaw, nestedChanged, ok := normalizeXAITool(nestedTool, namespaceName)
+					nestedRaw, nestedChanged, ok := normalizeXAITool(nestedTool, namespaceName, keepImageGeneration)
 					if !ok {
 						return nil, false, false
 					}
@@ -848,7 +947,7 @@ func normalizeXAIToolArray(tools gjson.Result) ([]byte, bool, bool) {
 			}
 			continue
 		}
-		raw, toolChanged, ok := normalizeXAITool(tool, "")
+		raw, toolChanged, ok := normalizeXAITool(tool, "", keepImageGeneration)
 		if !ok {
 			return nil, false, false
 		}
@@ -942,10 +1041,13 @@ func normalizeXAINamespaceToolChoice(body []byte) []byte {
 	return body
 }
 
-func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bool) {
+func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGeneration bool) ([]byte, bool, bool) {
 	toolType := tool.Get("type").String()
 	changed := false
-	if toolType == xaiToolSearchType || toolType == xaiImageGenerationToolType {
+	if toolType == xaiToolSearchType {
+		return nil, true, true
+	}
+	if toolType == xaiImageGenerationToolType && !keepImageGeneration {
 		return nil, true, true
 	}
 	if toolType == xaiCustomToolType && tool.Get("name").String() == "apply_patch" {
