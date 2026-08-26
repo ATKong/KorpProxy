@@ -60,10 +60,6 @@ PackyCodeは当ソフトウェアのユーザーに特別割引を提供して�
 <td>本プロジェクトにご支援いただいた BmoPlus に感謝いたします！BmoPlusは、AIサブスクリプションのヘビーユーザー向けに特化した信頼性の高いAIアカウントサービスプロバイダーであり、安定した ChatGPT Plus / ChatGPT Pro (完全保証) / Claude Pro / Super Grok / Gemini Pro の公式代行チャージおよび即納アカウントを提供しています。こちらの<a href="https://shop.bmoplus.com/?utm_source=github">BmoPlus AIアカウント専門店/代行チャージ</a>経由でご登録・ご注文いただいたユーザー様は、GPTを <b>公式サイト価格の約1割（90% OFF）</b> という驚異的な価格でご利用いただけます！</td>
 </tr>
 <tr>
-<td width="180"><a href="https://visioncoder.cn/"><img src="./assets/visioncoder.png" alt="VisionCoder" width="150"></a></td>
-<td>VisionCoderのご支援に感謝します。<a href="https://visioncoder.cn/">VisionCoder 開発プラットフォーム</a> は、信頼性が高く効率的なAPIリレーサービスプロバイダーで、Claude Code、Codex、Geminiなどの主要AIモデルを提供し、開発者やチームがより簡単にAI機能を統合して生産性を向上できるよう支援します。さらに、VisionCoderは <b>Claude Max 200 と GPT Pro 200 高級即納アカウント</b> の独占販売チャネルを提供しており、最高クラスのAI算力と体験を手軽に体験できます。</td>
-</tr>
-<tr>
 <td width="180"><a href="https://apikey.fun/register?aff=CLIProxyAPI"><img src="./assets/apikey.png" alt="APIKEY.FUN" width="150"></a></td>
 <td>APIKEY.FUNのスポンサーシップに感謝します！APIKEY.FUNはプロフェッショナルなエンタープライズ向けAIリレーサービスで、企業および個人開発者に安定・高効率・低コストなAIモデルAPI接続サービスを提供しています。Claude、OpenAI、Geminiなどの主要人気モデルに対応し、価格は公式価格の7%から利用できます。本プロジェクトの<a href="https://apikey.fun/register?aff=CLIProxyAPI">専用リンク</a>から登録すると、さらに<b>チャージが永続的に5%割引</b>となる特別優待を受けられます。</td>
 </tr>
@@ -100,12 +96,16 @@ PackyCodeは当ソフトウェアのユーザーに特別割引を提供して�
 <td><a href="https://www.fastaitoken.com/">FastAIToken</a> のスポンサーシップに感謝します！FastAIToken は開発者向けの AI API 集約プラットフォームで、速度と安定性を重視しています。OpenAI、Claude、Gemini などの主要 AI モデルに対応し、チャージ比率は 1:1（1元 = 1ドル分の API クレジット）のため、開発者はより低コストで便利に世界トップクラスの AI モデルを利用できます。<a href="https://t.me/+stwq0MLi0PtkZTZl">Telegram サポートグループ</a><br/>プラットフォームでは用途に応じて複数のチャネルを選択できます：超低価格の 0.02× OpenAI プロモーション枠（期間限定）、0.25× からの OpenAI チャネル、95% 固定キャッシュの 0.7× Claude、1.2× Claude Max チャネル。また、各チャネルの稼働率、遅延、運用状況をリアルタイム表示する公開ステータスページも提供しており、透明で信頼性の高いサービスを実現しています。さらに FastAIToken は 24時間365日の真人テクニカルサポート（ボットではありません）を提供し、開発者のニーズに迅速に対応します。エンタープライズ顧客向けには、安定性を保証する SLA 対応の専用チャネルプールを提供し、契約対応、請求書発行、専任保守にも対応しています。</td>
 </tr>
 <tr>
-<td width="180"><a href="https://api.lmuai.com/register?promo=CLIPROXYAPI-%E4%BC%98%E6%83%A0%E7%A0%81"><img src="./assets/lmuai.png" alt="LMU" width="150"></a></td>
-<td><a href="https://api.lmuai.com/">LMU（灵眸 AI）</a>による本プロジェクトへのご支援に感謝します！LMUは、Claude Code、Codex、その他のコーディングエージェント向けのAnthropicおよびOpenAI互換リレーサービスで、中国国内モデル（DeepSeek、GLM、Qwenなど）と主要な海外プロバイダーの両方に対応しています。<code>ANTHROPIC_BASE_URL</code>をLMUエンドポイントに設定するだけで、コードを変更せずに標準の<code>/v1/messages</code> API経由で接続できます。実際のClaude CodeセッションではPrompt Cacheのヒット率が90%を超えており、長時間のセッションにかかるコストを削減できます。未使用のチャージ残高は申請により返金可能です。エンタープライズプランでは、グループ化されたチーム管理のAPIキーを利用でき、IP・クォータ制限、レートウィンドウ、有効期限を設定できるほか、トラフィック監視と請求書発行にも対応しています。<a href="https://api.lmuai.com/register?promo=CLIPROXYAPI-%E4%BC%98%E6%83%A0%E7%A0%81">LMU CLIProxyAPI専用リンク</a>から登録すると、無料テストクレジットを受け取れます。</td>
+<td width="180"><a href="https://api.lmuai.ai/register?promo=CLIPROXYAPI-%E4%BC%98%E6%83%A0%E7%A0%81"><img src="./assets/lmuai.png" alt="LMU" width="150"></a></td>
+<td><a href="https://api.lmuai.ai/register?promo=CLIPROXYAPI-%E4%BC%98%E6%83%A0%E7%A0%81">LMU（灵眸 AI）</a>による本プロジェクトへのご支援に感謝します！LMUは、Claude Code、Codex、その他のコーディングエージェント向けのAnthropicおよびOpenAI互換リレーサービスで、中国国内モデル（DeepSeek、GLM、Qwenなど）と主要な海外プロバイダーの両方に対応しています。<code>ANTHROPIC_BASE_URL</code>をLMUエンドポイントに設定するだけで、コードを変更せずに標準の<code>/v1/messages</code> API経由で接続できます。実際のClaude CodeセッションではPrompt Cacheのヒット率が90%を超えており、長時間のセッションにかかるコストを削減できます。未使用のチャージ残高は申請により返金可能です。エンタープライズプランでは、グループ化されたチーム管理のAPIキーを利用でき、IP・クォータ制限、レートウィンドウ、有効期限を設定できるほか、トラフィック監視と請求書発行にも対応しています。<a href="https://api.lmuai.ai/register?promo=CLIPROXYAPI-%E4%BC%98%E6%83%A0%E7%A0%81">LMU CLIProxyAPI専用リンク</a>から登録すると、無料テストクレジットを受け取れます。</td>
 </tr>
 <tr>
 <td width="180"><a href="https://infistar.ai/register?aff=FQKC6J6R&amp;ref_source=link"><img src="./assets/infistar.png" alt="Infistar.ai" width="150"></a></td>
 <td>モデルの水増し、性能低下、あるいは不透明な価格設定が心配ですか？世界をリードするモデル集約サービス Infistar.ai では、提供するすべてのモデルを実際の呼び出しによって検証しています。供給元は公式 API と公式アカウントプールで、10,000 を超える供給経路を負荷分散し、低遅延とピーク時の安定性を確保します。ChatGPT、Claude、Gemini、Grok、GLM、DeepSeek、Kimi、Qwen、MiniMax など国内外の主要モデルを網羅し、テキスト、動画、画像、埋め込み、リランキングなどのフルモーダル機能に対応しています。価格と利用量は透明かつ明確で確認しやすく、モデルは公式価格の 10% から利用できます。CLIProxyAPI ユーザーは専用入口から登録してお試しいただけます。招待リンク：<a href="https://infistar.ai/register?aff=FQKC6J6R&amp;ref_source=link">https://infistar.ai/register?aff=FQKC6J6R&amp;ref_source=link</a></td>
+</tr>
+<tr>
+<td width="180"><a href="https://go.apimart.ai/gh-cliproxyapi"><img src="./assets/apimart-en.png" alt="APIMart" width="150"></a></td>
+<td>APIMartによる本プロジェクトへのご支援に感謝します！APIMartは、AI画像・動画生成に特化した低価格APIプラットフォームです。GPT-Image-2は1枚あたりわずか&#36;0.006で、1ドルで160枚以上の画像を生成できます。画像と動画の両方を1つの非同期APIで扱えます。タスクを送信してIDを取得し、ポーリングまたはコールバックで結果を受け取れます。数万枚規模の画像をタイムアウトなしでバッチ生成でき、コードを変更せずにモデルを切り替えられます。従量課金制で月額料金は不要です。<a href="https://go.apimart.ai/gh-cliproxyapi">こちらの登録リンク</a>からすぐに始められます。</td>
 </tr>
 </tbody>
 </table>
