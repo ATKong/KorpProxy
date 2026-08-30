@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"reflect"
@@ -160,79 +161,208 @@ func (m *Manager) RefreshSchedulerAll() {
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
 // registry snapshot for one auth.
 //
-// Supported models are reset to a clean state because re-registration already
-// cleared the registry-side cooldown/suspension snapshot. ModelStates for
-// models that are no longer present in the registry are pruned entirely so
+// Active cooldown and quota states for supported models (including models
+// reachable via alias routes) are preserved, while stale/expired errors on
+// supported models are reset. ModelStates for models that are no longer
+// reachable either directly or via alias routes are pruned entirely so
 // renamed/removed models cannot keep auth-level status stale.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
 		return
 	}
 
-	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
-	supported := make(map[string]struct{}, len(supportedModels))
-	for _, model := range supportedModels {
-		if model == nil {
-			continue
-		}
-		modelKey := canonicalModelKey(model.ID)
-		if modelKey == "" {
-			continue
-		}
-		supported[modelKey] = struct{}{}
-	}
-
-	var snapshot *Auth
-	now := time.Now()
+	globalReg := registry.GetGlobalRegistry()
+	var (
+		snapshot             *Auth
+		supportedModels      []*registry.ModelInfo
+		regEpoch             uint64
+		now                  time.Time
+		cooldownStateChanged bool
+	)
 
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
-	if ok && auth != nil && len(auth.ModelStates) > 0 {
-		changed := false
-		for modelKey, state := range auth.ModelStates {
-			baseModel := canonicalModelKey(modelKey)
-			if baseModel == "" {
-				baseModel = strings.TrimSpace(modelKey)
-			}
-			if _, supportedModel := supported[baseModel]; !supportedModel {
-				// Drop state for models that disappeared from the current registry
-				// snapshot. Keeping them around leaks stale errors into auth-level
-				// status, management output, and websocket fallback checks.
-				delete(auth.ModelStates, modelKey)
-				changed = true
-				continue
-			}
-			if state == nil {
-				continue
-			}
-			if modelStateIsClean(state) {
-				continue
-			}
-			resetModelState(state, now)
-			changed = true
+	if ok && auth != nil {
+		now = time.Now()
+		trackCooldownState := m.cooldownStore != nil
+		var cooldownRecordsBefore []CooldownStateRecord
+		if trackCooldownState {
+			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
-		if len(auth.ModelStates) == 0 {
-			auth.ModelStates = nil
-		}
-		if changed {
-			updateAggregatedAvailability(auth, now)
-			if !hasModelError(auth, now) {
-				auth.LastError = nil
-				auth.StatusMessage = ""
-				auth.Status = StatusActive
+
+		for retry := 0; retry < 10; retry++ {
+			supportedModels, regEpoch = globalReg.GetModelsAndEpochForClient(authID)
+			candidateAuth := &Auth{
+				ID:          auth.ID,
+				Provider:    auth.Provider,
+				Attributes:  auth.Attributes,
+				ModelStates: cloneModelStates(auth.ModelStates),
 			}
-			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+			candidateChanged := normalizeModelStates(candidateAuth)
+
+			// Historical alias migration:
+			// Migrate legacy alias state strictly based on registered route keys from supportedModels.
+			// Two-phase safe migration:
+			// Phase 1: Collect authoritative target keys and route-to-target mappings.
+			if len(candidateAuth.ModelStates) > 0 && len(supportedModels) > 0 {
+				authoritativeTargets := make(map[string]bool, len(supportedModels))
+				routeToTarget := make(map[string]string, len(supportedModels))
+				for _, sm := range supportedModels {
+					if sm == nil || strings.TrimSpace(sm.ID) == "" {
+						continue
+					}
+					routeID := strings.TrimSpace(sm.ID)
+					canonicalRoute := canonicalModelKey(routeID)
+					targetKey := m.selectionModelKeyForAuth(auth, routeID)
+					if targetKey == "" {
+						targetKey = canonicalRoute
+					}
+					if targetKey != "" {
+						authoritativeTargets[targetKey] = true
+					}
+					if canonicalRoute != "" {
+						routeToTarget[canonicalRoute] = targetKey
+					}
+				}
+
+				// Phase 2: For each registered routeKey, migrate legacy state to target ONLY if
+				// routeKey != target AND routeKey is not itself an authoritative target for any route.
+				for _, sm := range supportedModels {
+					if sm == nil || strings.TrimSpace(sm.ID) == "" {
+						continue
+					}
+					routeID := strings.TrimSpace(sm.ID)
+					canonicalRoute := canonicalModelKey(routeID)
+					targetKey := routeToTarget[canonicalRoute]
+					if targetKey == "" || canonicalRoute == "" {
+						continue
+					}
+					if canonicalRoute != targetKey && !authoritativeTargets[canonicalRoute] {
+						aliasKeys := []string{canonicalRoute}
+						if routeID != canonicalRoute {
+							aliasKeys = append(aliasKeys, routeID)
+						}
+						for _, aliasKey := range aliasKeys {
+							if state, hasAliasState := candidateAuth.ModelStates[aliasKey]; hasAliasState {
+								if state != nil && (!modelStateIsClean(state) || isModelStateActiveCooldown(state, now)) {
+									if existingTarget, exists := candidateAuth.ModelStates[targetKey]; exists && existingTarget != nil {
+										candidateAuth.ModelStates[targetKey] = mergeModelState(existingTarget, state)
+									} else {
+										candidateAuth.ModelStates[targetKey] = state.Clone()
+									}
+								}
+								delete(candidateAuth.ModelStates, aliasKey)
+								candidateChanged = true
+							}
+						}
+					}
+				}
 			}
-			snapshot = auth.Clone()
+
+			supported := make(map[string]struct{}, len(supportedModels))
+			for _, model := range supportedModels {
+				if model == nil || strings.TrimSpace(model.ID) == "" {
+					continue
+				}
+				stateKey := m.selectionModelKeyForAuth(auth, model.ID)
+				if stateKey == "" {
+					stateKey = canonicalModelKey(model.ID)
+				}
+				if stateKey != "" {
+					supported[stateKey] = struct{}{}
+				}
+			}
+
+			for modelKey, state := range candidateAuth.ModelStates {
+				baseModel := canonicalModelKey(modelKey)
+				if baseModel == "" {
+					baseModel = strings.TrimSpace(modelKey)
+				}
+				if _, isSupported := supported[baseModel]; !isSupported {
+					// Drop state for models that disappeared from the current registry
+					// snapshot and are not reachable via any alias route.
+					delete(candidateAuth.ModelStates, modelKey)
+					candidateChanged = true
+					continue
+				}
+				if state == nil {
+					continue
+				}
+				if modelStateIsClean(state) {
+					continue
+				}
+				if isModelStateActiveCooldown(state, now) {
+					continue
+				}
+				clonedState := state.Clone()
+				resetModelState(clonedState, now)
+				candidateAuth.ModelStates[modelKey] = clonedState
+				candidateChanged = true
+			}
+			if len(candidateAuth.ModelStates) == 0 {
+				candidateAuth.ModelStates = nil
+			}
+
+			if globalReg.ClientRegistrationEpoch(authID) == regEpoch {
+				auth.ModelStates = candidateAuth.ModelStates
+				if candidateChanged {
+					updateAggregatedAvailability(auth, now)
+					if !hasModelError(auth, now) {
+						auth.LastError = nil
+						auth.StatusMessage = ""
+						auth.Status = StatusActive
+					}
+					auth.Generation++
+					auth.UpdatedAt = now
+					if errPersist := m.persist(context.Background(), auth); errPersist != nil {
+						logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+					}
+				}
+				if trackCooldownState {
+					cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
+					cooldownStateChanged = candidateChanged || !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
+				}
+				snapshot = auth.Clone()
+				break
+			}
 		}
 	}
 	m.mu.Unlock()
 
-	if m.scheduler != nil && snapshot != nil {
+	if snapshot == nil {
+		return
+	}
+
+	projections := make([]registry.ClientModelProjection, 0, len(supportedModels))
+	for _, sm := range supportedModels {
+		if sm == nil || strings.TrimSpace(sm.ID) == "" {
+			continue
+		}
+		projections = append(projections, m.clientModelProjectionForAuth(snapshot, sm.ID, now))
+	}
+	globalReg.ApplyClientModelProjections(authID, regEpoch, snapshot.Generation, projections)
+
+	if m.scheduler != nil {
 		m.scheduler.upsertAuth(snapshot)
 	}
+	if cooldownStateChanged {
+		m.persistCooldownStates(context.Background())
+	}
+}
+
+func cloneModelStates(states map[string]*ModelState) map[string]*ModelState {
+	if len(states) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*ModelState, len(states))
+	for k, v := range states {
+		if v != nil {
+			cloned[k] = v.Clone()
+		} else {
+			cloned[k] = nil
+		}
+	}
+	return cloned
 }
 
 func isSameSelector(a, b Selector) bool {
@@ -708,14 +838,92 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
 }
 
-func (m *Manager) closestCooldownWait(providers []string, model string, attempt int) (time.Duration, bool) {
+func effectiveRequestRetryLimit(auth *Auth, defaultRetry int) int {
+	if defaultRetry < 0 {
+		defaultRetry = 0
+	}
+	if override, ok := auth.RequestRetryOverride(); ok {
+		return override
+	}
+	return defaultRetry
+}
+
+func (m *Manager) requestRetryRoundExclusions(retryRound int, defaultRequestRetry int) map[string]struct{} {
+	excluded := make(map[string]struct{})
+	if m == nil || retryRound <= 0 {
+		return excluded
+	}
+	if defaultRequestRetry < 0 {
+		defaultRequestRetry = 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		if effectiveRequestRetryLimit(auth, defaultRequestRetry) < retryRound {
+			excluded[auth.ID] = struct{}{}
+		}
+	}
+	return excluded
+}
+
+func retryRoundAvailabilityForAuth(auth *Auth, model string, now time.Time) (bool, time.Time) {
+	blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+	if !blocked {
+		return true, time.Time{}
+	}
+	if auth == nil || next.IsZero() || reason == blockReasonDisabled {
+		return false, time.Time{}
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+		return credentialRetryRoundStateEligible(auth.LastError, true), next
+	}
+
+	modelKey := canonicalModelKey(model)
+	if modelKey != "" && len(auth.ModelStates) > 0 {
+		matchedBlocked := false
+		for stateModel, state := range auth.ModelStates {
+			if state == nil || canonicalModelKey(stateModel) != modelKey {
+				continue
+			}
+			if state.Status == StatusDisabled {
+				return false, time.Time{}
+			}
+			stateBlocked, _, stateNext := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+			if !stateBlocked {
+				continue
+			}
+			matchedBlocked = true
+			if stateNext.IsZero() || !credentialRetryRoundStateEligible(state.LastError, state.Quota.Exceeded) {
+				return false, time.Time{}
+			}
+		}
+		if matchedBlocked {
+			return true, next
+		}
+	}
+	if !credentialRetryRoundStateEligible(auth.LastError, auth.Quota.Exceeded) {
+		return false, time.Time{}
+	}
+	return true, next
+}
+
+func credentialRetryRoundStateEligible(lastErr *Error, quotaExceeded bool) bool {
+	if lastErr == nil {
+		return quotaExceeded
+	}
+	return isCredentialRetryRoundStatus(statusCodeFromResult(lastErr))
+}
+
+func (m *Manager) closestCooldownWait(providers []string, model string, attempt int, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int) (time.Duration, bool) {
 	if m == nil || len(providers) == 0 {
 		return 0, false
 	}
 	now := time.Now()
-	defaultRetry := int(m.requestRetry.Load())
-	if defaultRetry < 0 {
-		defaultRetry = 0
+	if defaultRequestRetry < 0 {
+		defaultRequestRetry = 0
 	}
 	providerSet := make(map[string]struct{}, len(providers))
 	for i := range providers {
@@ -725,6 +933,7 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		}
 		providerSet[key] = struct{}{}
 	}
+	registryRef := registry.GetGlobalRegistry()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var (
@@ -732,20 +941,23 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		minWait time.Duration
 	)
 	for _, auth := range m.auths {
-		if auth == nil {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+			continue
+		}
+		if !eligibility.allows(auth) {
 			continue
 		}
 		providerKey := executorKeyFromAuth(auth)
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
-		effectiveRetry := defaultRetry
-		if override, ok := auth.RequestRetryOverride(); ok {
-			effectiveRetry = override
+		if model != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
+			continue
 		}
-		if effectiveRetry < 0 {
-			effectiveRetry = 0
-		}
+		effectiveRetry := effectiveRequestRetryLimit(auth, defaultRequestRetry)
 		if attempt >= effectiveRetry {
 			continue
 		}
@@ -753,9 +965,12 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if strings.TrimSpace(model) != "" {
 			checkModel = m.selectionModelForAuth(auth, model)
 		}
-		blocked, reason, next := isAuthBlockedForModel(auth, checkModel, now)
-		if !blocked || next.IsZero() || reason == blockReasonDisabled {
+		retryEligible, next := retryRoundAvailabilityForAuth(auth, checkModel, now)
+		if !retryEligible {
 			continue
+		}
+		if next.IsZero() {
+			return 0, true
 		}
 		wait := next.Sub(now)
 		if wait < 0 {
@@ -769,13 +984,13 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	return minWait, found
 }
 
-func (m *Manager) retryAllowed(attempt int, providers []string) bool {
+func (m *Manager) retryAllowed(attempt int, providers []string, model string, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int) bool {
 	if m == nil || attempt < 0 || len(providers) == 0 {
 		return false
 	}
-	defaultRetry := int(m.requestRetry.Load())
-	if defaultRetry < 0 {
-		defaultRetry = 0
+	now := time.Now()
+	if defaultRequestRetry < 0 {
+		defaultRequestRetry = 0
 	}
 	providerSet := make(map[string]struct{}, len(providers))
 	for i := range providers {
@@ -789,24 +1004,35 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 		return false
 	}
 
+	registryRef := registry.GetGlobalRegistry()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, auth := range m.auths {
-		if auth == nil {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+			continue
+		}
+		if !eligibility.allows(auth) {
 			continue
 		}
 		providerKey := executorKeyFromAuth(auth)
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
-		effectiveRetry := defaultRetry
-		if override, ok := auth.RequestRetryOverride(); ok {
-			effectiveRetry = override
+		if model != "" && !m.authSupportsRouteModel(registryRef, auth, model) {
+			continue
 		}
-		if effectiveRetry < 0 {
-			effectiveRetry = 0
+		effectiveRetry := effectiveRequestRetryLimit(auth, defaultRequestRetry)
+		if attempt >= effectiveRetry {
+			continue
 		}
-		if attempt < effectiveRetry {
+		checkModel := model
+		if strings.TrimSpace(model) != "" {
+			checkModel = m.selectionModelForAuth(auth, model)
+		}
+		if retryEligible, _ := retryRoundAvailabilityForAuth(auth, checkModel, now); retryEligible {
 			return true
 		}
 	}
@@ -814,14 +1040,21 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 }
 
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
+	defaultRequestRetry, _, _ := m.retrySettings()
+	return m.shouldRetryAfterErrorWithHomeRetryLimit(context.Background(), cliproxyexecutor.Options{}, err, attempt, providers, model, maxWait, -1, defaultRequestRetry)
+}
+
+// maxWait limits only positive cooldown waits between credential retry rounds.
+// A non-positive value means no waiting: it does not disable same-round
+// credential failover or an additional round that request-retry permits to start
+// immediately. If every eligible credential still needs a positive cooldown,
+// retry stops without waiting.
+func (m *Manager) shouldRetryAfterErrorWithHomeRetryLimit(ctx context.Context, opts cliproxyexecutor.Options, err error, attempt int, providers []string, model string, maxWait time.Duration, homeRetryLimit int, defaultRequestRetry int) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
 	}
 	var homeBusy *HomeConcurrencyBusyError
 	if errors.As(err, &homeBusy) && homeBusy != nil {
-		return 0, false
-	}
-	if maxWait <= 0 {
 		return 0, false
 	}
 	status := statusCodeFromError(err)
@@ -831,24 +1064,119 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if isRequestInvalidError(err) || isRequestStopError(err) {
 		return 0, false
 	}
-	wait, found := m.closestCooldownWait(providers, model, attempt)
+	if m.HomeEnabled() {
+		var cooldownErr *homeDispatchRetryAfterError
+		if errors.As(err, &cooldownErr) && cooldownErr != nil {
+			observeHomeCooldownRetryLimit(cooldownErr, &homeRetryLimit, pinnedAuthIDFromMetadata(opts.Metadata) == "")
+		}
+	}
+	var exhausted *homeRetryRoundExhaustedError
+	if m.HomeEnabled() && errors.As(err, &exhausted) && exhausted != nil {
+		if !isCredentialRetryRoundStatus(status) || !m.homeRetryAllowed(attempt, homeRetryLimit) {
+			return 0, false
+		}
+		if exhausted.retryNow {
+			return 0, true
+		}
+		if retryAfter := retryAfterFromError(err); retryAfter != nil {
+			if *retryAfter < 0 || (*retryAfter > 0 && (maxWait <= 0 || *retryAfter > maxWait)) {
+				return 0, false
+			}
+			return *retryAfter, true
+		}
+		// Home will provide a cooldown error on the next round if all
+		// credentials are still cooling down; otherwise retry immediately.
+		return 0, true
+	}
+	if m.HomeEnabled() {
+		if status != http.StatusTooManyRequests || !m.homeRetryAllowed(attempt, homeRetryLimit) {
+			return 0, false
+		}
+		retryAfter := retryAfterFromError(err)
+		if retryAfter == nil || *retryAfter <= 0 || (maxWait <= 0 || *retryAfter > maxWait) {
+			return 0, false
+		}
+		return *retryAfter, true
+	}
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	if !isCredentialRetryRoundStatus(status) || !m.retryAllowed(attempt, providers, model, eligibility, pinnedAuthID, defaultRequestRetry) {
+		return 0, false
+	}
+	wait, found := m.closestCooldownWait(providers, model, attempt, eligibility, pinnedAuthID, defaultRequestRetry)
 	if found {
-		if wait > maxWait {
+		if wait > 0 && (maxWait <= 0 || wait > maxWait) {
 			return 0, false
 		}
 		return wait, true
 	}
-	if status != http.StatusTooManyRequests {
-		return 0, false
+	if retryAfter := retryAfterFromError(err); retryAfter != nil {
+		if *retryAfter < 0 || (*retryAfter > 0 && (maxWait <= 0 || *retryAfter > maxWait)) {
+			return 0, false
+		}
+		return *retryAfter, true
 	}
-	if !m.retryAllowed(attempt, providers) {
-		return 0, false
+	return 0, true
+}
+
+func (m *Manager) homeRetryAllowed(attempt int, retryLimit int) bool {
+	if m == nil || !m.HomeEnabled() || attempt < 0 {
+		return false
 	}
-	retryAfter := retryAfterFromError(err)
-	if retryAfter == nil || *retryAfter <= 0 || *retryAfter > maxWait {
-		return 0, false
+	if retryLimit < 0 {
+		retryLimit = int(m.requestRetry.Load())
+		if retryLimit < 0 {
+			retryLimit = 0
+		}
 	}
-	return *retryAfter, true
+	return attempt < retryLimit
+}
+
+func (m *Manager) observeHomeRetryLimit(auth *Auth, selection *HomeDispatchSelection, retryLimit *int) {
+	if m == nil || retryLimit == nil {
+		return
+	}
+	if selection != nil && selection.hasRequestRetry {
+		*retryLimit = selection.requestRetry
+		return
+	}
+	if auth == nil {
+		return
+	}
+	limit := int(m.requestRetry.Load())
+	if override, ok := auth.RequestRetryOverride(); ok {
+		limit = override
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	if *retryLimit < 0 || limit > *retryLimit {
+		*retryLimit = limit
+	}
+}
+
+func observeHomeCooldownRetryLimit(cooldown *homeDispatchRetryAfterError, retryLimit *int, acceptRemoteRetryLimit bool) {
+	if cooldown == nil || retryLimit == nil || !acceptRemoteRetryLimit {
+		return
+	}
+	if remoteLimit, ok := cooldown.RequestRetryLimit(); ok {
+		*retryLimit = remoteLimit
+	}
+}
+
+func isCredentialRetryRoundStatus(status int) bool {
+	switch status {
+	case http.StatusForbidden,
+		http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 // cooldownWaitJitterCap bounds the random jitter added to cooldown waits so a
@@ -859,7 +1187,7 @@ const cooldownWaitJitterCap = 2 * time.Second
 // concurrent requests waiting on the same recovery deadline do not wake in
 // lockstep and stampede the first credential that recovers. The jitter never
 // pushes the total wait past maxWait, which callers have already enforced as
-// the retry ceiling; maxWait <= 0 means no ceiling.
+// the retry ceiling; maxWait <= 0 is reserved for immediate retries.
 func jitteredCooldownWait(wait, maxWait time.Duration) time.Duration {
 	if wait <= 0 {
 		return wait
@@ -1078,12 +1406,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
+		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAvailable)
 		return nil, nil, errAvailable
 	}
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
 		return nil, nil, errPick
 	}
 	if !handled {
@@ -1093,6 +1423,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			if isBuiltInSelector(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
 			}
+			m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
 			return nil, nil, errPick
 		}
 	}
@@ -1195,6 +1526,7 @@ func (m *Manager) SelectHomeAuthWithCredentialPolicy(ctx context.Context, provid
 	tried := make(map[string]struct{})
 	for {
 		selectionOpts := withHomeAuthCount(opts, homeAuthCount)
+		selectionOpts = withHomeExcludedAuthIDs(selectionOpts, tried)
 		selection, errSelection := m.pickHomeDispatchSelection(selectionCtx, model, selectionOpts)
 		if errSelection != nil {
 			return nil, errSelection
@@ -1241,6 +1573,7 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 	tried := make(map[string]struct{})
 	for {
 		selectionOpts := withHomeAuthCount(opts, homeAuthCount)
+		selectionOpts = withHomeExcludedAuthIDs(selectionOpts, tried)
 		selection, errSelection := m.pickHomeDispatchSelection(ctx, model, selectionOpts)
 		if errSelection != nil {
 			return nil, errSelection
@@ -1316,6 +1649,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 	}
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
 		return nil, nil, errPick
 	}
 	if selected == nil {
@@ -1405,12 +1739,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
+		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)
 		return nil, nil, "", errAvailable
 	}
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
 		return nil, nil, "", errPick
 	}
 	if !handled {
@@ -1420,6 +1756,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			if isBuiltInSelector(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
 			}
+			m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
 			return nil, nil, "", errPick
 		}
 	}
@@ -1508,6 +1845,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 	}
 	if errPick != nil {
+		m.warnLogAuthUnavailable(ctx, eligibleProviders, model, opts, tried, errPick)
 		return nil, nil, "", errPick
 	}
 	if selected == nil {
@@ -1527,4 +1865,108 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		m.mu.Unlock()
 	}
 	return authCopy, executor, providerKey, nil
+}
+
+func isAuthUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		return authErr.Code == "auth_unavailable" || authErr.Code == "model_cooldown"
+	}
+	var cooldownErr *modelCooldownError
+	return errors.As(err, &cooldownErr) && cooldownErr != nil
+}
+
+func authCoolingSummary(auth *Auth, model string, next time.Time, now time.Time) string {
+	if auth == nil {
+		return ""
+	}
+	ident := formatAuthIdentity(auth, auth.Provider)
+	reason := ""
+	if model != "" && len(auth.ModelStates) > 0 {
+		if state, ok := auth.ModelStates[model]; ok && state != nil {
+			reason = cooldownReason(state.StatusMessage, state.Quota, state.LastError)
+		} else if state, ok := auth.ModelStates[canonicalModelKey(model)]; ok && state != nil {
+			reason = cooldownReason(state.StatusMessage, state.Quota, state.LastError)
+		}
+	}
+	if reason == "" {
+		reason = cooldownReason(auth.StatusMessage, auth.Quota, auth.LastError)
+	}
+	if reason == "" {
+		reason = "cooldown"
+	}
+	remaining := "0s"
+	if !next.IsZero() && next.After(now) {
+		remaining = next.Sub(now).Round(time.Second).String()
+	}
+	return fmt.Sprintf("[%s, reason=%s, remaining=%s]", ident, reason, remaining)
+}
+
+func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, err error) {
+	if m == nil || err == nil || !isAuthUnavailableError(err) {
+		return
+	}
+	now := time.Now()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, p := range providers {
+		if norm := strings.TrimSpace(strings.ToLower(p)); norm != "" && norm != "mixed" {
+			providerSet[norm] = struct{}{}
+		}
+	}
+	registryRef := registry.GetGlobalRegistry()
+
+	coolingSummaries := make([]string, 0)
+	totalCandidates := 0
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		providerKey := executorKeyFromAuth(candidate)
+		if len(providerSet) > 0 {
+			if _, ok := providerSet[providerKey]; !ok {
+				continue
+			}
+		}
+		if _, ok := m.executors[providerKey]; !ok {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		if !eligibility.allows(candidate) {
+			continue
+		}
+		if tried != nil {
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+		}
+		if model != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
+		}
+		totalCandidates++
+		checkModel := m.selectionModelForAuth(candidate, model)
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		if blocked && reason == blockReasonCooldown {
+			coolingSummaries = append(coolingSummaries, authCoolingSummary(candidate, checkModel, next, now))
+		}
+	}
+
+	if len(coolingSummaries) > 0 {
+		sort.Strings(coolingSummaries)
+		entry := logEntryWithRequestID(ctx)
+		providerText := strings.Join(providers, ",")
+		if len(providers) == 1 {
+			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (provider=%s) are in cooldown: %s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "))
+		} else {
+			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (providers=%s) are in cooldown: %s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "))
+		}
+	}
 }
