@@ -120,6 +120,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = reconcileClaudeCodeContextManagement(body, contextManagementState)
 	body = normalizeClaudeSamplingForUpstream(body, confirmedClaudeCode)
 
+	// Runs before cache_control placement so the breakpoint lands on the message
+	// that actually reaches the upstream.
+	body = dropTrailingClaudeAssistantPrefillWithLog(ctx, body, isAnthropicUpstreamBase(baseURL))
+
 	// Default cache_control for translated entrypoints (Responses/Chat/Gemini) and other
 	// non-native callers. Confirmed native Claude Code owns its marker placement and must
 	// not be rewritten. Cloaked requests always run section-independent ensure so cloaking's
