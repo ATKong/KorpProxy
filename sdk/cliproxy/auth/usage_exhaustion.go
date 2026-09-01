@@ -74,16 +74,22 @@ func (m *Manager) MarkUsageExhausted(authID string, reset time.Time) {
 			state.Status = StatusError
 			state.StatusMessage = "usage limit reached"
 			state.NextRetryAfter = reset
-			state.Quota = QuotaState{
+			// applyCooldownFields keeps the observation watermarks that a
+			// wholesale QuotaState assignment would wipe.
+			applyCooldownFields(&state.Quota, QuotaState{
 				Exceeded:      true,
 				Reason:        usageLimitReason,
 				NextRecoverAt: reset,
-			}
+			})
 			state.UpdatedAt = now
 			changed = true
 		}
 		if changed {
 			updateAggregatedAvailability(auth, now)
+			// The scheduler drops upserts whose generation is not newer than the
+			// snapshot it already holds, so a block must advance the generation
+			// to survive a MarkResult racing in between.
+			auth.Generation++
 			auth.UpdatedAt = now
 			if errPersist := m.persist(context.Background(), auth); errPersist != nil {
 				log.Warnf("usage-rotation: persist account %s failed: %v", authID, errPersist)
