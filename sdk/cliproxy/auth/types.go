@@ -47,6 +47,10 @@ func GetRequestInfo(ctx context.Context) *RequestInfo {
 type Auth struct {
 	// ID uniquely identifies the auth record across restarts.
 	ID string `json:"id"`
+	// RegistrationEpoch tracks monotonic registration cycles across unregister/re-register.
+	RegistrationEpoch uint64 `json:"registration_epoch,omitempty"`
+	// Generation tracks monotonic mutations to resolve scheduler/reconcile snapshot races.
+	Generation uint64 `json:"generation,omitempty"`
 	// Index is a stable runtime identifier derived from auth metadata (not persisted).
 	Index string `json:"-"`
 	// Provider is the upstream provider key (e.g. "gemini", "claude").
@@ -174,6 +178,27 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+	// ObservedAt is the time the current Signals snapshot was observed.
+	ObservedAt time.Time `json:"observed_at,omitempty"`
+	// Signals stores bounded, provider-specific quota watermark values observed
+	// from upstream response headers or websocket quota events. It is a snapshot
+	// of one upstream response, not an accumulation across responses, so an
+	// expired watermark cannot linger after the response that produced it.
+	// Cooldown transitions must use applyCooldownFields so they cannot replace
+	// this snapshot.
+	Signals map[string]string `json:"signals,omitempty"`
+}
+
+// Clone returns an independent copy of the quota state.
+func (q QuotaState) Clone() QuotaState {
+	copyQuota := q
+	if len(q.Signals) > 0 {
+		copyQuota.Signals = make(map[string]string, len(q.Signals))
+		for key, value := range q.Signals {
+			copyQuota.Signals[key] = value
+		}
+	}
+	return copyQuota
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
@@ -264,6 +289,7 @@ func (a *Auth) Clone() *Auth {
 		return nil
 	}
 	copyAuth := *a
+	copyAuth.Quota = a.Quota.Clone()
 	if len(a.Attributes) > 0 {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
 		for key, value := range a.Attributes {
@@ -406,6 +432,7 @@ func (m *ModelState) Clone() *ModelState {
 		return nil
 	}
 	copyState := *m
+	copyState.Quota = m.Quota.Clone()
 	if m.LastError != nil {
 		copyState.LastError = &Error{
 			Code:       m.LastError.Code,
@@ -578,8 +605,8 @@ func (a *Auth) AccountInfo() (string, string) {
 }
 
 // ExpirationTime attempts to extract the credential expiration timestamp from metadata.
-// It inspects common keys such as "expired", "expire", "expires_at", and also
-// nested "token" objects to remain compatible with legacy auth file formats.
+// It inspects common absolute expiry keys, expires_in plus timestamp, and nested
+// token objects to remain compatible with legacy auth file formats.
 func (a *Auth) ExpirationTime() (time.Time, bool) {
 	if a == nil {
 		return time.Time{}, false
@@ -618,6 +645,11 @@ func expirationFromMap(meta map[string]any) (time.Time, bool) {
 			}
 		}
 	}
+	if expiresIn, okExpiresIn := parseRelativeExpirySeconds(meta); okExpiresIn {
+		if timestamp, okTimestamp := parseRelativeExpiryTimestamp(meta); okTimestamp {
+			return timestamp.Add(time.Duration(expiresIn) * time.Second), true
+		}
+	}
 	for _, nestedKey := range []string{"token", "Token"} {
 		if nested, ok := meta[nestedKey]; ok {
 			switch val := nested.(type) {
@@ -633,6 +665,28 @@ func expirationFromMap(meta map[string]any) (time.Time, bool) {
 				if ts, ok1 := expirationFromMap(temp); ok1 {
 					return ts, true
 				}
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+func parseRelativeExpirySeconds(meta map[string]any) (int, bool) {
+	for _, key := range []string{"expires_in", "expiresIn"} {
+		if value, ok := meta[key]; ok {
+			if seconds, okSeconds := parseIntAny(value); okSeconds && seconds > 0 {
+				return seconds, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func parseRelativeExpiryTimestamp(meta map[string]any) (time.Time, bool) {
+	for _, key := range []string{"timestamp", "issued_at", "issuedAt"} {
+		if value, ok := meta[key]; ok {
+			if timestamp, okTimestamp := parseTimeValue(value); okTimestamp && !timestamp.IsZero() {
+				return timestamp, true
 			}
 		}
 	}
@@ -683,6 +737,10 @@ func parseTimeValue(v any) (time.Time, bool) {
 			return normaliseUnix(unix), true
 		}
 	case float64:
+		return normaliseUnix(int64(value)), true
+	case int:
+		return normaliseUnix(int64(value)), true
+	case int32:
 		return normaliseUnix(int64(value)), true
 	case int64:
 		return normaliseUnix(value), true
