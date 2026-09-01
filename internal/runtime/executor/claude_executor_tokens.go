@@ -188,6 +188,9 @@ func (e *ClaudeExecutor) countTokensUpstream(ctx context.Context, auth *cliproxy
 		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, mcpAliases)
 	}
 	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel, helps.APIKeyModelIsCompat(req))
+	// Anthropic applies the same prefill validation to count_tokens as to
+	// Messages, so a wedged trailing assistant turn would fail counting too.
+	body = dropTrailingClaudeAssistantPrefillWithLog(ctx, body, directAnthropic)
 	// Two different reasons converge on the same deletions, and they must stay
 	// separable.
 	//

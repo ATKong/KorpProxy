@@ -472,11 +472,7 @@ func disableThinkingIfToolChoiceForced(body []byte) []byte {
 //   - thinking active: temperature must be 1, top_p must be >= 0.95, top_k unset
 //   - otherwise: temperature and top_p cannot both be specified
 func normalizeClaudeSamplingForUpstream(body []byte, nativeOwned bool) []byte {
-	thinkingActive := false
-	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())) {
-	case "enabled", "adaptive", "auto":
-		thinkingActive = true
-	}
+	thinkingActive := claudeThinkingActive(body)
 
 	if !nativeOwned {
 		body, _ = sjson.DeleteBytes(body, "temperature")
@@ -503,6 +499,123 @@ func normalizeClaudeSamplingForUpstream(body []byte, nativeOwned bool) []byte {
 		body, _ = sjson.DeleteBytes(body, "top_p")
 	}
 	return body
+}
+
+// claudeThinkingActive reports whether the outgoing body still asks Anthropic for
+// extended thinking.
+func claudeThinkingActive(body []byte) bool {
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())) {
+	case "enabled", "adaptive", "auto":
+		return true
+	}
+	return false
+}
+
+// dropTrailingClaudeAssistantPrefillWithLog drops a trailing assistant prefill and
+// reports what it discarded. prefillUnsupported marks an upstream that rejects
+// prefill outright, which is every model Anthropic itself currently serves.
+func dropTrailingClaudeAssistantPrefillWithLog(ctx context.Context, body []byte, prefillUnsupported bool) []byte {
+	updated, discardedText, dropped := dropTrailingClaudeAssistantPrefill(body, prefillUnsupported)
+	if !dropped {
+		return body
+	}
+	if discardedText {
+		helps.LogWithRequestID(ctx).Info("claude executor: dropped a non-empty trailing assistant prefill; this upstream requires the conversation to end with a user message")
+	} else {
+		helps.LogWithRequestID(ctx).Debug("claude executor: dropped a blank trailing assistant prefill")
+	}
+	return updated
+}
+
+// dropTrailingClaudeAssistantPrefill removes trailing prefill-shaped assistant
+// messages so the conversation reaches the upstream ending on a user turn. It
+// reports whether it discarded any non-blank prefill text, and whether it changed
+// the body.
+//
+// Anthropic rejects assistant prefill with "This model does not support assistant
+// message prefill. The conversation must end with a user message." A client that
+// resumes an interrupted turn resends the partial assistant text as the final
+// message, so once that turn is in the transcript every retry of the conversation
+// fails and the caller is stuck with an unusable session.
+//
+// prefillUnsupported therefore drops the prefill even when it carries text:
+// answering without the seed degrades the request, while forwarding it fails the
+// request outright. Any other upstream keeps a text-carrying prefill and only loses
+// one that could never be used anyway — thinking and prefill are mutually exclusive
+// on Anthropic, and a blank prefill carries nothing in the first place.
+//
+// A trailing assistant turn holding tool_use or any other structural block is left
+// untouched: that is history the caller owns, not a prefill this function can
+// discard. Thinking blocks do not protect a trailing turn either — Anthropic
+// rejects a final assistant message containing thinking blocks, and the signature
+// sanitizer would strip them after this pass, recreating the text-only shape.
+func dropTrailingClaudeAssistantPrefill(body []byte, prefillUnsupported bool) ([]byte, bool, bool) {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return body, false, false
+	}
+	items := messages.Array()
+	keep := len(items)
+	discardedText := false
+	// Dropping the only message would leave an empty conversation, which the
+	// upstream rejects in turn.
+	for keep > 1 {
+		last := items[keep-1]
+		if !strings.EqualFold(strings.TrimSpace(last.Get("role").String()), "assistant") {
+			break
+		}
+		text, prefillShaped := claudeAssistantPrefillText(last.Get("content"))
+		if !prefillShaped {
+			break
+		}
+		hasText := strings.TrimSpace(text) != ""
+		if hasText && !prefillUnsupported && !claudeThinkingActive(body) {
+			break
+		}
+		discardedText = discardedText || hasText
+		keep--
+	}
+	if keep == len(items) {
+		return body, false, false
+	}
+	var rebuilt bytes.Buffer
+	rebuilt.WriteByte('[')
+	for i := 0; i < keep; i++ {
+		if i > 0 {
+			rebuilt.WriteByte(',')
+		}
+		rebuilt.WriteString(items[i].Raw)
+	}
+	rebuilt.WriteByte(']')
+	updated, errSet := sjson.SetRawBytes(body, "messages", rebuilt.Bytes())
+	if errSet != nil {
+		return body, false, false
+	}
+	return updated, discardedText, true
+}
+
+// claudeAssistantPrefillText returns the concatenated text of an assistant message
+// when every content block is text or thinking. Text blocks are the prefill itself;
+// thinking blocks are inert at the trailing position (Anthropic never accepts them
+// there), so they do not protect the turn from being a prefill.
+func claudeAssistantPrefillText(content gjson.Result) (string, bool) {
+	if content.Type == gjson.String {
+		return content.String(), true
+	}
+	if !content.IsArray() {
+		return "", false
+	}
+	var builder strings.Builder
+	for _, block := range content.Array() {
+		switch block.Get("type").String() {
+		case "text":
+			builder.WriteString(block.Get("text").String())
+		case "thinking", "redacted_thinking":
+		default:
+			return "", false
+		}
+	}
+	return builder.String(), true
 }
 
 type compositeReadCloser struct {
