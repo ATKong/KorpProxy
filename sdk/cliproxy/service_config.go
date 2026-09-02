@@ -2,7 +2,9 @@ package cliproxy
 
 import (
 	"context"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
@@ -52,6 +54,49 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		}
 	}
 	return state
+}
+
+// claudeCacheRoutingRisk reports whether the routing setup will alternate
+// Claude credentials within a session. Anthropic's prompt cache is per account,
+// so alternating turns a warm multi-turn session into cold cache writes.
+// Returns the number of enabled Claude credentials when the risk applies.
+func claudeCacheRoutingRisk(state routingRuntimeState, auths []*coreauth.Auth) (int, bool) {
+	if state.sessionAffinity || state.strategy == "fill-first" {
+		return 0, false
+	}
+	count := 0
+	for _, auth := range auths {
+		if auth == nil || auth.Disabled {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+			count++
+		}
+	}
+	return count, count > 1
+}
+
+var (
+	claudeCacheRoutingWarnMu   sync.Mutex
+	claudeCacheRoutingWarnLast string
+)
+
+// warnClaudeCacheRoutingRisk logs once per distinct (strategy, credential count)
+// so config reloads that leave routing unchanged do not repeat the warning.
+func warnClaudeCacheRoutingRisk(cfg *config.Config, auths []*coreauth.Auth) {
+	state := normalizedRoutingRuntimeState(cfg)
+	count, risky := claudeCacheRoutingRisk(state, auths)
+	key := ""
+	if risky {
+		key = state.strategy + ":" + strconv.Itoa(count)
+	}
+	claudeCacheRoutingWarnMu.Lock()
+	changed := key != claudeCacheRoutingWarnLast
+	claudeCacheRoutingWarnLast = key
+	claudeCacheRoutingWarnMu.Unlock()
+	if risky && changed {
+		log.Warnf("routing: %d Claude credentials with strategy %q and session-affinity disabled; multi-turn sessions will alternate accounts and miss Anthropic prompt cache. Set routing.session-affinity: true (or routing.strategy: fill-first)", count, state.strategy)
+	}
 }
 
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
@@ -166,6 +211,7 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 	if s.coreManager != nil {
 		auths = s.coreManager.List()
 	}
+	warnClaudeCacheRoutingRisk(cfg, auths)
 	s.registerAvailableExecutors(registrationCtx, executorRegistrationOptions{
 		includeBaseline:   cfg.Home.Enabled,
 		forceReplaceAuths: true,

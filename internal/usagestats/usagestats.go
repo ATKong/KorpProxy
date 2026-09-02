@@ -5,12 +5,106 @@
 package usagestats
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
+
+func init() {
+	coreusage.RegisterPlugin(promptCachePlugin{})
+}
+
+// PromptCache accumulates prompt-cache token counts for an account since
+// process start. HitRatio is cache_read / (input + cache_read + cache_write).
+type PromptCache struct {
+	Requests         int64   `json:"requests"`
+	InputTokens      int64   `json:"input_tokens"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	HitRatio         float64 `json:"hit_ratio"`
+	UpdatedAt        int64   `json:"updated_at"`
+}
+
+var (
+	promptCacheMu    sync.RWMutex
+	promptCacheStore = make(map[string]PromptCache)
+)
+
+// promptCachePlugin folds successful usage records into per-account cache stats.
+type promptCachePlugin struct{}
+
+func (promptCachePlugin) HandleUsage(_ context.Context, record coreusage.Record) {
+	if record.Failed || strings.TrimSpace(record.AuthID) == "" {
+		return
+	}
+	input, cacheRead, cacheWrite := promptCacheBuckets(record.Detail)
+	if input <= 0 && cacheRead <= 0 && cacheWrite <= 0 {
+		return
+	}
+	RecordPromptCache(record.AuthID, input, cacheRead, cacheWrite)
+}
+
+// promptCacheBuckets returns non-overlapping (uncached, cache read, cache write)
+// input counts. The canonical TokenBreakdown is preferred; the raw fields are a
+// fallback for records that never went through accounting. CachedTokens alone
+// is ambiguous (Claude mirrors cache writes into it on a cold turn), so it only
+// counts as reads when no write count was reported.
+func promptCacheBuckets(d coreusage.Detail) (input, cacheRead, cacheWrite int64) {
+	if d.TokenBreakdown.Valid() && d.TokenBreakdown.Quality == coreusage.TokenAccountingQualityComplete {
+		in := d.TokenBreakdown.Input
+		return in.UncachedTokens, in.CacheReadTokens, in.CacheWriteTokens
+	}
+	cacheRead = d.CacheReadTokens
+	if cacheRead == 0 && d.CacheCreationTokens == 0 && d.CachedTokens > 0 {
+		cacheRead = d.CachedTokens
+	}
+	return d.InputTokens, cacheRead, d.CacheCreationTokens
+}
+
+// RecordPromptCache adds one request's token counts to authID's cache stats.
+func RecordPromptCache(authID string, input, cacheRead, cacheWrite int64) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	promptCacheMu.Lock()
+	pc := promptCacheStore[authID]
+	pc.Requests++
+	pc.InputTokens += maxInt64(input, 0)
+	pc.CacheReadTokens += maxInt64(cacheRead, 0)
+	pc.CacheWriteTokens += maxInt64(cacheWrite, 0)
+	pc.HitRatio = promptCacheHitRatio(pc.InputTokens, pc.CacheReadTokens, pc.CacheWriteTokens)
+	pc.UpdatedAt = time.Now().Unix()
+	promptCacheStore[authID] = pc
+	promptCacheMu.Unlock()
+}
+
+func promptCacheHitRatio(input, cacheRead, cacheWrite int64) float64 {
+	total := input + cacheRead + cacheWrite
+	if total <= 0 {
+		return 0
+	}
+	return float64(cacheRead) / float64(total)
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func getPromptCache(authID string) (PromptCache, bool) {
+	promptCacheMu.RLock()
+	pc, ok := promptCacheStore[authID]
+	promptCacheMu.RUnlock()
+	return pc, ok
+}
 
 // Window holds utilization for a single rolling rate-limit window.
 type Window struct {
@@ -30,6 +124,8 @@ type Usage struct {
 	RepresentativeClaim string  `json:"representative_claim,omitempty"`
 	// UpdatedAt is the unix epoch (seconds) when this snapshot was captured.
 	UpdatedAt int64 `json:"updated_at"`
+	// PromptCache is filled in by Get from the separate token-usage counters.
+	PromptCache *PromptCache `json:"prompt_cache,omitempty"`
 }
 
 var (
@@ -152,11 +248,16 @@ func parseCodexWindow(h http.Header, which string) *Window {
 	return w
 }
 
-// Get returns the latest snapshot for authID.
+// Get returns the latest snapshot for authID, merged with its prompt-cache
+// counters. ok is true when either source has data.
 func Get(authID string) (Usage, bool) {
 	mu.RLock()
 	snapshot, ok := store[authID]
 	mu.RUnlock()
+	if pc, okCache := getPromptCache(authID); okCache {
+		snapshot.PromptCache = &pc
+		ok = true
+	}
 	return snapshot, ok
 }
 
