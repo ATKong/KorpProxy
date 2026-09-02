@@ -28,7 +28,7 @@ func claudeNativeHelperHeaders(betas, compression string, structured bool) http.
 		"Accept":            {"application/json"},
 		"Accept-Encoding":   {compression},
 		"Content-Type":      {"application/json"},
-		"User-Agent":        {"claude-cli/2.1.220 (external, cli)"},
+		"User-Agent":        {"claude-cli/2.1.251 (external, cli)"},
 		"X-App":             {"cli"},
 		"Anthropic-Beta":    {betas},
 		"Anthropic-Version": {"2023-06-01"},
