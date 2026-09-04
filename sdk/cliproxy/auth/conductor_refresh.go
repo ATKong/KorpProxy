@@ -32,6 +32,7 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+<<<<<<< HEAD
 	// quotaSyntheticBackoffMax caps the cooldown used for a 429 when the provider
 	// did NOT supply a retry hint (no Retry-After / rate-limit reset header). The
 	// real reset, when present, is always honored verbatim and may legitimately be
@@ -39,6 +40,10 @@ const (
 	// omits the header can never trigger a multi-minute blackout across accounts.
 	quotaSyntheticBackoffMax = time.Minute
 	transientErrorCooldown   = time.Minute
+=======
+	minQuotaCooldownFloor     = 10 * time.Second
+	transientErrorCooldown    = time.Minute
+>>>>>>> v7.2.149
 )
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness
@@ -86,7 +91,8 @@ func (m *Manager) StopAutoRefresh() {
 		cancel()
 	}
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
-	if stoppable, ok := m.selector.(StoppableSelector); ok {
+	sel := m.Selector()
+	if stoppable, ok := sel.(StoppableSelector); ok && stoppable != nil {
 		stoppable.Stop()
 	}
 }
@@ -492,13 +498,29 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 			current.Generation++
 			current.UpdatedAt = now
 			current.LastError = refreshErrorFromError(err)
-			if unauthorized {
-				current.NextRefreshAfter = time.Time{}
+
+			hasValidAccessToken := current.HasValidAccessToken(now)
+			if !hasValidAccessToken {
 				current.Unavailable = true
 				current.Status = StatusError
-				current.StatusMessage = "unauthorized"
+				if unauthorized {
+					current.NextRefreshAfter = time.Time{}
+					current.StatusMessage = "unauthorized"
+				} else {
+					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+					current.StatusMessage = "token expired"
+				}
 			} else {
-				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+				// Access token remains valid. Preserve current in-flight/cooldown status without overwrite.
+				nextRetry := now.Add(refreshFailureBackoff)
+				if exp, ok := current.AccessTokenExpirationTime(); ok && !exp.IsZero() && nextRetry.After(exp) {
+					nextRetry = exp
+				}
+				current.NextRefreshAfter = nextRetry
+
+				if !current.Unavailable {
+					log.Warnf("credential refresh failed for %s (%s): %s; retaining active credential as access token is unexpired", current.Provider, current.ID, safeErrorDiagnosticForLog(err))
+				}
 			}
 			m.auths[id] = current
 			shouldReschedule = true
