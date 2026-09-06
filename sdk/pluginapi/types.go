@@ -1110,6 +1110,11 @@ type StreamChunkInterceptRequest struct {
 	Body        []byte
 	// HistoryChunks contains a bounded recent history of chunks already delivered downstream.
 	// The host currently retains at most 64 chunks and 1 MiB total history bytes.
+	// Always preserved on header-init (ChunkIndex == StreamChunkHeaderInitIndex) when non-empty.
+	// On payload chunks (ChunkIndex >= 0):
+	//   - schema_version >= 5: omitted (nil) to avoid per-chunk cloning and serialization
+	//   - schema_version < 5: populated as a fresh clone each call (legacy compatibility)
+	// Callers must treat these slices as read-only; hosts clone before delivery to keep snapshots isolated.
 	HistoryChunks [][]byte
 	// ChunkIndex starts at 0 for payload chunks. StreamChunkHeaderInitIndex marks the header-only initialization call.
 	ChunkIndex int
@@ -1349,6 +1354,10 @@ type UsageRecord struct {
 	Alias string
 	// APIKey is the client API key identifier when available.
 	APIKey string
+	// SessionID identifies the session when present.
+	SessionID string
+	// ParentSessionID identifies the parent session in a hierarchy or fork.
+	ParentSessionID string
 	// AuthID identifies the selected credential.
 	AuthID string
 	// AuthIndex identifies the credential index when applicable.
