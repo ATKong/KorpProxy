@@ -637,27 +637,37 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context, clientVersion strin
 
 	models := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
-		model := map[string]any{
-			"id":     entry.id,
-			"object": "model",
-		}
-		if entry.created > 0 {
-			model["created"] = entry.created
-		}
-		if entry.ownedBy != "" {
-			model["owned_by"] = entry.ownedBy
-		}
-		if entry.displayName != "" {
-			model["display_name"] = entry.displayName
-			model["description"] = entry.displayName
-		}
-		if entry.maxCompletionTokens > 0 {
-			model["max_completion_tokens"] = entry.maxCompletionTokens
-		}
-		models = append(models, model)
+		models = append(models, formatHomeCodexModel(entry))
 	}
 
 	c.JSON(http.StatusOK, codexmodels.BuildResponseForClient(models, nil, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
+}
+
+func formatHomeCodexModel(entry homeModelEntry) map[string]any {
+	model := map[string]any{
+		"id":     entry.id,
+		"object": "model",
+	}
+	if entry.created > 0 {
+		model["created"] = entry.created
+	}
+	if entry.ownedBy != "" {
+		model["owned_by"] = entry.ownedBy
+	}
+	if entry.displayName != "" {
+		model["display_name"] = entry.displayName
+		model["description"] = entry.displayName
+	}
+	if entry.contextLength > 0 {
+		model["context_length"] = entry.contextLength
+	}
+	if entry.maxCompletionTokens > 0 {
+		model["max_completion_tokens"] = entry.maxCompletionTokens
+	}
+	if entry.thinking != nil {
+		model["thinking"] = entry.thinking
+	}
+	return model
 }
 
 func (s *Server) geminiModelsHandler(geminiHandler *gemini.GeminiAPIHandler) gin.HandlerFunc {
@@ -689,6 +699,7 @@ type homeModelEntry struct {
 	displayName         string
 	contextLength       int
 	maxCompletionTokens int
+	thinking            *registry.ThinkingSupport
 }
 
 func (s *Server) handleHomeModels(c *gin.Context) {
@@ -984,6 +995,7 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 				displayName, _ = model["displayName"].(string)
 				displayName = strings.TrimSpace(displayName)
 			}
+			thinking := homeModelThinkingSupport(model)
 
 			out = append(out, homeModelEntry{
 				id:                  id,
@@ -992,6 +1004,7 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 				displayName:         displayName,
 				contextLength:       int(homeModelInt64Value(model, "context_length", "contextLength", "inputTokenLimit", "max_input_tokens")),
 				maxCompletionTokens: int(homeModelInt64Value(model, "max_completion_tokens", "maxCompletionTokens", "outputTokenLimit", "max_tokens")),
+				thinking:            thinking,
 			})
 		}
 	}
@@ -1001,6 +1014,22 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 		return nil, fmt.Errorf("home models payload contains no models")
 	}
 	return out, nil
+}
+
+func homeModelThinkingSupport(model map[string]any) *registry.ThinkingSupport {
+	raw, ok := model["thinking"]
+	if !ok || raw == nil {
+		return nil
+	}
+	data, errMarshal := json.Marshal(raw)
+	if errMarshal != nil {
+		return nil
+	}
+	var thinking registry.ThinkingSupport
+	if errUnmarshal := json.Unmarshal(data, &thinking); errUnmarshal != nil {
+		return nil
+	}
+	return &thinking
 }
 
 func homeModelInt64Value(model map[string]any, keys ...string) int64 {
