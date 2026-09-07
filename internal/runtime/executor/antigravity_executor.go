@@ -355,6 +355,25 @@ func ensureAntigravityGeminiLeadingUserContent(modelName string, payload []byte)
 	return helps.EnsureGeminiLeadingUserContent(payload, "request.contents")
 }
 
+// ensureAntigravityGeminiTrailingUserContent appends a synthetic empty user turn
+// if the final turn is a model turn. Claude targets are left unchanged because
+// the adapter rejects empty text parts.
+func ensureAntigravityGeminiTrailingUserContent(modelName string, payload []byte) []byte {
+	if strings.Contains(strings.ToLower(modelName), "claude") {
+		return payload
+	}
+	return helps.EnsureGeminiTrailingUserContent(payload, "request.contents")
+}
+
+// ensureAntigravityGeminiBoundaryUserContent normalizes both leading and trailing
+// turns for Gemini targets. Claude targets are left unchanged.
+func ensureAntigravityGeminiBoundaryUserContent(modelName string, payload []byte) []byte {
+	if strings.Contains(strings.ToLower(modelName), "claude") {
+		return payload
+	}
+	return helps.EnsureGeminiBoundaryUserContent(payload, "request.contents")
+}
+
 type antigravityContentEdit struct {
 	index       int64
 	start       int
@@ -426,26 +445,25 @@ func normalizeAntigravityGeminiFunctionResponseRoles(rawJSON []byte) []byte {
 
 		var contentJSON []byte
 		contentChanged := false
-		if len(pending) == len(responses) {
+		if len(pending) > 0 && len(responses) > 0 {
 			ordered := make([]json.RawMessage, 0, partCount)
 			used := make([]bool, len(responses))
 			for _, call := range pending {
-				matched := -1
 				for responseIndex, response := range responses {
 					if used[responseIndex] {
 						continue
 					}
 					if (call.id != "" && response.id == call.id) || (call.id == "" && call.name != "" && response.name == call.name) {
-						matched = responseIndex
+						used[responseIndex] = true
+						ordered = append(ordered, responseParts[responseIndex])
 						break
 					}
 				}
-				if matched < 0 {
-					ordered = nil
-					break
+			}
+			for responseIndex := range responses {
+				if !used[responseIndex] {
+					ordered = append(ordered, responseParts[responseIndex])
 				}
-				used[matched] = true
-				ordered = append(ordered, responseParts[matched])
 			}
 			if len(ordered) == len(responseParts) {
 				ordered = append(ordered, otherParts...)
