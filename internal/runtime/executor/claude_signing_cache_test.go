@@ -32,7 +32,7 @@ func TestSigningKeepsCacheablePrefixStable(t *testing.T) {
 				{"role": "user", "content": "` + lastUser + `"}
 			]
 		}`)
-		payload = checkSystemInstructionsWithSigningMode(payload, false, true, true, "2.1.251", "cli", "")
+		payload = checkSystemInstructionsWithSigningMode(payload, false, true, "2.1.258", "cli", "")
 		payload = ensureCacheControl(payload)
 		signed, err := signAnthropicMessagesBody(payload)
 		if err != nil {
