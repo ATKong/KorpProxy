@@ -858,16 +858,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
 								if result.RetryAfter != nil {
-<<<<<<< HEAD
-									// Provider told us exactly when capacity returns; honor it verbatim.
-									next = now.Add(*result.RetryAfter)
-=======
+									// Provider told us when capacity returns; honor it, floored
+									// only to avoid sub-second zero-wait retry loops.
 									cooldown := *result.RetryAfter
 									if cooldown < minQuotaCooldownFloor {
 										cooldown = minQuotaCooldownFloor
 									}
 									next = now.Add(cooldown).Round(0)
->>>>>>> v7.2.157
 								} else {
 									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
 								}
@@ -2073,48 +2070,12 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		} else {
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
 		}
-<<<<<<< HEAD
-		return
-	}
-	switch statusCode {
-	case 401:
-		auth.StatusMessage = "unauthorized"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
-		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
-		}
-	case 402, 403:
-		auth.StatusMessage = "payment_required"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
-		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
-		}
-	case 404:
-		auth.StatusMessage = "not_found"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
-		} else {
-			auth.NextRetryAfter = now.Add(12 * time.Hour)
-		}
-	case 429:
-		auth.StatusMessage = "quota exhausted"
-		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
-		var next time.Time
-		if !disableCooling {
-			if retryAfter != nil {
-				// Provider told us exactly when capacity returns; honor it verbatim.
-				next = now.Add(*retryAfter)
-=======
 	} else {
 		switch statusCode {
 		case 401:
 			auth.StatusMessage = "unauthorized"
 			if disableCooling {
 				auth.NextRetryAfter = time.Time{}
->>>>>>> v7.2.157
 			} else {
 				auth.NextRetryAfter = now.Add(30 * time.Minute)
 			}
@@ -2139,6 +2100,8 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			var next time.Time
 			if !disableCooling {
 				if retryAfter != nil {
+					// Provider told us when capacity returns; honor it, floored
+					// only to avoid sub-second zero-wait retry loops.
 					cooldown := *retryAfter
 					if cooldown < minQuotaCooldownFloor {
 						cooldown = minQuotaCooldownFloor

@@ -247,11 +247,7 @@ const claudeCodeFableReportingOutcomes = `# Reporting outcomes
 Report what actually happened, not what you intended. When you say something is done, sent, saved, fixed, or verified, that claim must rest on a result you observed in this session — tool output, the file as it now reads, the page as it now loads — not on what the step should have produced. If you did not check, say you did not check. If any step failed, was skipped, or came back different from what you expected, say so in the first sentence of your report, before anything else, even when the rest of the work succeeded. Never quietly work around a failure in a way that makes it look resolved; a problem the user can see is recoverable, one your summary hides is not. When you stop before the task is complete, your first line says so plainly and names what is left. Do not describe partial work as done, and do not let a summary read as more certain than the evidence behind it.`
 
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-<<<<<<< HEAD
-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.251", "cli", "")
-=======
 	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.258", "cli", "")
->>>>>>> v7.2.157
 }
 
 // checkSystemInstructionsWithSigningMode keeps the top-level system in Claude
@@ -259,28 +255,8 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 // mid-conversation system message after the first user turn, where supported
 // Claude models give it operator-level authority without changing the cached
 // top-level prefix.
-<<<<<<< HEAD
-func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, cchSigning bool, args ...any) []byte {
-	version, entrypoint, workload := "", "", ""
-	oauthMode := false
-	if len(args) == 4 {
-		oauthMode, _ = args[0].(bool)
-		version, _ = args[1].(string)
-		entrypoint, _ = args[2].(string)
-		workload, _ = args[3].(string)
-	} else if len(args) == 3 {
-		version, _ = args[0].(string)
-		entrypoint, _ = args[1].(string)
-		workload, _ = args[2].(string)
-	}
-	if oauthMode {
-		payload = stripReplayedThinkingBlocks(payload)
-	}
-	return checkSystemInstructionsWithSigningModeAt(payload, strictMode, cchSigning, version, entrypoint, workload, time.Now())
-=======
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, cchSigning bool, version, entrypoint, workload string) []byte {
 	return checkSystemInstructionsWithSigningModeAt(payload, strictMode, cchSigning, version, entrypoint, workload, time.Now(), false, "", "")
->>>>>>> v7.2.157
 }
 
 // isClaudeFable51Model reports whether the model is specifically Fable 5.1 / Mythos 5.1,

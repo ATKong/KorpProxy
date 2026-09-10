@@ -33,18 +33,15 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
-<<<<<<< HEAD
+	minQuotaCooldownFloor     = 10 * time.Second
 	// quotaSyntheticBackoffMax caps the cooldown used for a 429 when the provider
 	// did NOT supply a retry hint (no Retry-After / rate-limit reset header). The
-	// real reset, when present, is always honored verbatim and may legitimately be
-	// minutes long; this cap only bounds the guessed fallback so a provider that
-	// omits the header can never trigger a multi-minute blackout across accounts.
+	// real reset, when present, is always honored (subject only to the small
+	// minQuotaCooldownFloor) and may legitimately be minutes long; this cap only
+	// bounds the guessed fallback so a provider that omits the header can never
+	// trigger a multi-minute blackout across accounts.
 	quotaSyntheticBackoffMax = time.Minute
 	transientErrorCooldown   = time.Minute
-=======
-	minQuotaCooldownFloor     = 10 * time.Second
-	transientErrorCooldown    = time.Minute
->>>>>>> v7.2.157
 )
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness

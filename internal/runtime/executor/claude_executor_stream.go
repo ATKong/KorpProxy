@@ -434,19 +434,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				line := scanner.Bytes()
 				observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-<<<<<<< HEAD
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
+				streamUsage.ObserveClaudeStream(line)
 				if streamErr, consumed := claudeStreamErrorFromLine(line, nil); streamErr != nil {
 					emitResponseError(streamErr)
 					return
 				} else if consumed {
 					continue
 				}
-=======
-				streamUsage.ObserveClaudeStream(line)
->>>>>>> v7.2.157
 				restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
 				if errRestore != nil {
 					emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))
@@ -493,19 +487,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			line := scanner.Bytes()
 			observeClaudeStreamLine(line, &upstreamMessageID, &upstreamCompleted)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-<<<<<<< HEAD
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			streamUsage.ObserveClaudeStream(line)
 			if streamErr, consumed := claudeStreamErrorFromLine(line, nil); streamErr != nil {
 				emitResponseError(streamErr)
 				return
 			} else if consumed {
 				continue
 			}
-=======
-			streamUsage.ObserveClaudeStream(line)
->>>>>>> v7.2.157
 			restoredLine, errRestore := restoreClaudeOAuthToolNamesFromStreamLine(line, oauthToolNamesReverseMap)
 			if errRestore != nil {
 				emitResponseError(fmt.Errorf("restore Claude OAuth tool name from streaming response: %w", errRestore))

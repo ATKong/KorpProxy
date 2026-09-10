@@ -112,7 +112,7 @@ func TestCheckSystemInstructions_StripsThinkingWhenCloaking(t *testing.T) {
 		`{"type":"text","text":"prior answer"}]},` +
 		`{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
 
-	out := checkSystemInstructionsWithSigningMode(body, false, true, true, "2.1.63", "cli", "")
+	out := checkSystemInstructionsWithSigningMode(stripReplayedThinkingBlocks(body), false, true, "2.1.258", "cli", "")
 
 	if got := gjson.GetBytes(out, "system.1.text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Errorf("system not cloaked, got system.1.text=%q", got)
