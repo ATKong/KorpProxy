@@ -699,7 +699,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 						ad, _ = sjson.SetBytes(ad, "sequence_number", nextSeq())
 						ad, _ = sjson.SetBytes(ad, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
 						ad, _ = sjson.SetBytes(ad, "output_index", idx)
-						ad, _ = sjson.SetBytes(ad, "delta", argsJSON)
+						ad, _ = translatorcommon.SetStringWithoutHTMLEscape(ad, "delta", argsJSON)
 						out = append(out, emitEvent("response.function_call_arguments.delta", ad))
 					}
 
@@ -709,14 +709,14 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 						fcDone, _ = sjson.SetBytes(fcDone, "sequence_number", nextSeq())
 						fcDone, _ = sjson.SetBytes(fcDone, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
 						fcDone, _ = sjson.SetBytes(fcDone, "output_index", idx)
-						fcDone, _ = sjson.SetBytes(fcDone, "arguments", argsJSON)
+						fcDone, _ = translatorcommon.SetStringWithoutHTMLEscape(fcDone, "arguments", argsJSON)
 						out = append(out, emitEvent("response.function_call_arguments.done", fcDone))
 
 						itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`)
 						itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
 						itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
 						itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
-						itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", argsJSON)
+						itemDone, _ = translatorcommon.SetStringWithoutHTMLEscape(itemDone, "item.arguments", argsJSON)
 						itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.FuncCallIDs[idx])
 						itemDone = translatorcommon.SetResponsesToolCallIdentity(itemDone, name, namespace, "item")
 						out = append(out, emitEvent("response.output_item.done", itemDone))
@@ -786,14 +786,14 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 					fcDone, _ = sjson.SetBytes(fcDone, "sequence_number", nextSeq())
 					fcDone, _ = sjson.SetBytes(fcDone, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
 					fcDone, _ = sjson.SetBytes(fcDone, "output_index", idx)
-					fcDone, _ = sjson.SetBytes(fcDone, "arguments", args)
+					fcDone, _ = translatorcommon.SetStringWithoutHTMLEscape(fcDone, "arguments", args)
 					out = append(out, emitEvent("response.function_call_arguments.done", fcDone))
 
 					itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`)
 					itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
 					itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
 					itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
-					itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", args)
+					itemDone, _ = translatorcommon.SetStringWithoutHTMLEscape(itemDone, "item.arguments", args)
 					itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.FuncCallIDs[idx])
 					itemDone = translatorcommon.SetResponsesToolCallIdentity(itemDone, st.FuncNames[idx], st.FuncNamespaces[idx], "item")
 					out = append(out, emitEvent("response.output_item.done", itemDone))
@@ -916,7 +916,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 					}
 					item := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("fc_%s", callID))
-					item, _ = sjson.SetBytes(item, "arguments", args)
+					item, _ = translatorcommon.SetStringWithoutHTMLEscape(item, "arguments", args)
 					item, _ = sjson.SetBytes(item, "call_id", callID)
 					item = translatorcommon.SetResponsesToolCallIdentity(item, st.FuncNames[idx], st.FuncNamespaces[idx], "")
 					outputs = append(outputs, item)
@@ -935,11 +935,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 			// cached token details: align with OpenAI "cached_tokens" semantics.
 			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens_details.cached_tokens", um.Get("cachedContentTokenCount").Int())
 			// output tokens
-			if v := um.Get("candidatesTokenCount"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", v.Int())
-			} else {
-				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", 0)
-			}
+			completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", um.Get("candidatesTokenCount").Int()+um.Get("thoughtsTokenCount").Int())
 			if v := um.Get("thoughtsTokenCount"); v.Exists() {
 				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens_details.reasoning_tokens", v.Int())
 			} else {
@@ -1223,7 +1219,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					itemJSON = []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
 					itemJSON, _ = sjson.SetBytes(itemJSON, "id", fmt.Sprintf("fc_%s", callID))
 					itemJSON, _ = sjson.SetBytes(itemJSON, "call_id", callID)
-					itemJSON, _ = sjson.SetBytes(itemJSON, "arguments", argsStr)
+					itemJSON, _ = translatorcommon.SetStringWithoutHTMLEscape(itemJSON, "arguments", argsStr)
 					itemJSON = translatorcommon.SetResponsesToolCallIdentity(itemJSON, name, namespace, "")
 				}
 				functionIndex := len(functionOutputs)
@@ -1339,9 +1335,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		// cached token details: align with OpenAI "cached_tokens" semantics.
 		resp, _ = sjson.SetBytes(resp, "usage.input_tokens_details.cached_tokens", um.Get("cachedContentTokenCount").Int())
 		// output tokens
-		if v := um.Get("candidatesTokenCount"); v.Exists() {
-			resp, _ = sjson.SetBytes(resp, "usage.output_tokens", v.Int())
-		}
+		resp, _ = sjson.SetBytes(resp, "usage.output_tokens", um.Get("candidatesTokenCount").Int()+um.Get("thoughtsTokenCount").Int())
 		if v := um.Get("thoughtsTokenCount"); v.Exists() {
 			resp, _ = sjson.SetBytes(resp, "usage.output_tokens_details.reasoning_tokens", v.Int())
 		}
