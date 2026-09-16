@@ -143,11 +143,29 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 				hasEncounteredConversation = true
 				if _, isAssistantOutput := openAIResponsesAssistantVisibleText(item); !isAssistantOutput {
+					if len(pendingFunctionCallIDs) > 0 {
+						anyHasFutureOutput := false
+						for _, callID := range pendingFunctionCallIDs {
+							if responsesHasMatchingOutput(normalized[i:], callID) {
+								anyHasFutureOutput = true
+								break
+							}
+						}
+						if !anyHasFutureOutput {
+							var synthesizedParts [][]byte
+							for _, callID := range pendingFunctionCallIDs {
+								synthesizedParts = append(synthesizedParts, buildOpenAIResponsesSynthesizedFunctionResponsePart(callID, functionNamesByCallID))
+							}
+							if len(synthesizedParts) > 0 {
+								contentItems = append(contentItems, geminiContent("user", synthesizedParts))
+							}
+							pendingFunctionCallIDs = nil
+						}
+					}
 					if len(pendingDeveloperParts) > 0 {
 						contentItems = append(contentItems, geminiContent("user", pendingDeveloperParts))
 						pendingDeveloperParts = nil
 					}
-					pendingFunctionCallIDs = nil
 				}
 
 				// Handle regular messages
@@ -286,18 +304,70 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 
 			case "function_call_output", "custom_tool_call_output":
 				hasEncounteredConversation = true
-				orderedOutputs, consumedIndexes, remainingPending := collectOpenAIResponsesFunctionCallOutputs(normalized, i, pendingFunctionCallIDs)
-				pendingFunctionCallIDs = remainingPending
+				orderedOutputs, consumedIndexes, _ := collectOpenAIResponsesFunctionCallOutputs(normalized, i, pendingFunctionCallIDs)
 				for consumedIndex := range consumedIndexes {
 					consumedFunctionOutputIndexes[consumedIndex] = true
 				}
-				responseParts := make([][]byte, 0, len(orderedOutputs))
-				for _, output := range orderedOutputs {
-					responseParts = append(responseParts, buildOpenAIResponsesFunctionResponseParts(output, functionNamesByCallID)...)
+				end := i + len(consumedIndexes)
+				hasSubsequent := responsesHasSubsequentTurn(normalized[end:])
+
+				outputByCallID := make(map[string]gjson.Result)
+				var extraOutputs []gjson.Result
+				anyMatched := false
+				for _, out := range orderedOutputs {
+					id := extractOpenAIResponsesCallID(out)
+					if id != "" {
+						outputByCallID[id] = out
+					} else {
+						extraOutputs = append(extraOutputs, out)
+					}
 				}
+				for _, pendingID := range pendingFunctionCallIDs {
+					if _, ok := outputByCallID[pendingID]; ok {
+						anyMatched = true
+						break
+					}
+				}
+
+				responseParts := make([][]byte, 0, len(pendingFunctionCallIDs)+len(extraOutputs))
+				stillPending := make([]string, 0, len(pendingFunctionCallIDs))
+
+				for _, pendingID := range pendingFunctionCallIDs {
+					if out, ok := outputByCallID[pendingID]; ok {
+						responseParts = append(responseParts, buildOpenAIResponsesFunctionResponseParts(out, functionNamesByCallID)...)
+						delete(outputByCallID, pendingID)
+					} else if (hasSubsequent || anyMatched) && !responsesHasMatchingOutput(normalized[end:], pendingID) {
+						responseParts = append(responseParts, buildOpenAIResponsesSynthesizedFunctionResponsePart(pendingID, functionNamesByCallID))
+					} else {
+						stillPending = append(stillPending, pendingID)
+					}
+				}
+
+				var standaloneOutputContents [][]byte
+				appendStandaloneOutput := func(out gjson.Result) {
+					// Orphan outputs (no matching function_call, e.g. Codex
+					// send_message_to_thread cards) must not become unpaired
+					// functionResponse parts. Surface them as user text instead.
+					if parts := buildOpenAIResponsesStandaloneToolOutputTextParts(out); len(parts) > 0 {
+						standaloneOutputContents = append(standaloneOutputContents, geminiContent("user", parts))
+					}
+				}
+				for _, out := range orderedOutputs {
+					id := extractOpenAIResponsesCallID(out)
+					if _, remaining := outputByCallID[id]; remaining {
+						appendStandaloneOutput(out)
+						delete(outputByCallID, id)
+					}
+				}
+				for _, out := range extraOutputs {
+					appendStandaloneOutput(out)
+				}
+
+				pendingFunctionCallIDs = stillPending
 				if len(responseParts) > 0 {
 					contentItems = append(contentItems, geminiContent("user", responseParts))
 				}
+				contentItems = append(contentItems, standaloneOutputContents...)
 				if len(pendingFunctionCallIDs) == 0 && len(pendingDeveloperParts) > 0 {
 					contentItems = append(contentItems, geminiContent("user", pendingDeveloperParts))
 					pendingDeveloperParts = nil
@@ -909,6 +979,76 @@ func parseOpenAIResponsesArrayOutput(outputResult gjson.Result) (result string, 
 
 func extractOpenAIResponsesCallID(node gjson.Result) string {
 	return translatorcommon.ExtractResponsesCallID(node)
+}
+
+func buildOpenAIResponsesSynthesizedFunctionResponsePart(callID string, functionNamesByCallID map[string]string) []byte {
+	functionName := "unknown"
+	if matchedName, ok := functionNamesByCallID[callID]; ok && matchedName != "" {
+		functionName = matchedName
+	}
+	functionResponse := []byte(`{"functionResponse":{"name":"","response":{"result":"call interrupted, no output"}}}`)
+	functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.name", util.SanitizeFunctionName(functionName))
+	if callID != "" {
+		functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.id", callID)
+	}
+	return functionResponse
+}
+
+func responsesHasMatchingOutput(items []gjson.Result, callID string) bool {
+	if callID == "" {
+		return false
+	}
+	for _, item := range items {
+		typ := item.Get("type").String()
+		if typ == "function_call_output" || typ == "custom_tool_call_output" {
+			if extractOpenAIResponsesCallID(item) == callID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func responsesHasSubsequentTurn(items []gjson.Result) bool {
+	for _, item := range items {
+		typ := item.Get("type").String()
+		role := item.Get("role").String()
+		if typ == "message" || (typ == "" && role != "") {
+			return true
+		}
+		if typ == "function_call" || typ == "custom_tool_call" {
+			return true
+		}
+	}
+	return false
+}
+
+func buildOpenAIResponsesStandaloneToolOutputTextParts(item gjson.Result) [][]byte {
+	output := item.Get("output")
+	if !output.Exists() {
+		return nil
+	}
+	if output.IsArray() {
+		var parts [][]byte
+		output.ForEach(func(_, part gjson.Result) bool {
+			text := part.Get("text").String()
+			if strings.TrimSpace(text) == "" {
+				return true
+			}
+			textPart := []byte(`{"text":""}`)
+			textPart, _ = sjson.SetBytes(textPart, "text", text)
+			parts = append(parts, textPart)
+			return true
+		})
+		return parts
+	}
+	text := output.String()
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	textPart := []byte(`{"text":""}`)
+	textPart, _ = sjson.SetBytes(textPart, "text", text)
+	return [][]byte{textPart}
 }
 
 func buildOpenAIResponsesFunctionResponseParts(item gjson.Result, functionNamesByCallID map[string]string) [][]byte {
