@@ -733,24 +733,37 @@ func TestConvertClaudeRequestToOpenAI_ToolResultTextAndImageContent(t *testing.T
 	resultJSON := gjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
-	if len(messages) != 2 {
-		t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	if len(messages) != 3 {
+		t.Fatalf("Expected 3 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
 	}
 
-	toolContent := messages[1].Get("content")
-	if !toolContent.IsArray() {
-		t.Fatalf("Expected tool content array, got %s", toolContent.Raw)
+	// The tool message keeps only the textual payload; OpenAI drops image parts there.
+	if got := messages[1].Get("role").String(); got != "tool" {
+		t.Fatalf("Expected second message role %q, got %q", "tool", got)
 	}
-	if got := toolContent.Get("0.type").String(); got != "text" {
-		t.Fatalf("Expected first tool content type %q, got %q", "text", got)
+	if messages[1].Get("content").IsArray() {
+		t.Fatalf("Tool content must not be an array, got %s", messages[1].Get("content").Raw)
 	}
-	if got := toolContent.Get("0.text").String(); got != "tool ok" {
-		t.Fatalf("Expected first tool content text %q, got %q", "tool ok", got)
+	if got := messages[1].Get("content").String(); got != "tool ok" {
+		t.Fatalf("Expected tool content %q, got %q", "tool ok", got)
 	}
-	if got := toolContent.Get("1.type").String(); got != "image_url" {
-		t.Fatalf("Expected second tool content type %q, got %q", "image_url", got)
+
+	// The image is relayed as a user message directly after the tool result.
+	relay := messages[2]
+	if got := relay.Get("role").String(); got != "user" {
+		t.Fatalf("Expected relay message role %q, got %q", "user", got)
 	}
-	if got := toolContent.Get("1.image_url.url").String(); got != "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" {
+	relayContent := relay.Get("content")
+	if !relayContent.IsArray() {
+		t.Fatalf("Expected relay content array, got %s", relayContent.Raw)
+	}
+	if got := relayContent.Get("0.text").String(); got != toolResultImageRelayNotice {
+		t.Fatalf("Expected relay notice %q, got %q", toolResultImageRelayNotice, got)
+	}
+	if got := relayContent.Get("1.type").String(); got != "image_url" {
+		t.Fatalf("Expected relay content type %q, got %q", "image_url", got)
+	}
+	if got := relayContent.Get("1.image_url.url").String(); got != "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" {
 		t.Fatalf("Unexpected image_url: %q", got)
 	}
 }
@@ -788,19 +801,167 @@ func TestConvertClaudeRequestToOpenAI_ToolResultURLImageOnly(t *testing.T) {
 	resultJSON := gjson.ParseBytes(result)
 	messages := resultJSON.Get("messages").Array()
 
-	if len(messages) != 2 {
-		t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	if len(messages) != 3 {
+		t.Fatalf("Expected 3 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
 	}
 
-	toolContent := messages[1].Get("content")
-	if !toolContent.IsArray() {
-		t.Fatalf("Expected tool content array, got %s", toolContent.Raw)
+	// An image-only tool_result still needs a non-empty text payload on the tool message.
+	if got := messages[1].Get("content").String(); got != toolResultImagePlaceholder {
+		t.Fatalf("Expected tool content %q, got %q", toolResultImagePlaceholder, got)
 	}
-	if got := toolContent.Get("0.type").String(); got != "image_url" {
-		t.Fatalf("Expected tool content type %q, got %q", "image_url", got)
+
+	relayContent := messages[2].Get("content")
+	if got := messages[2].Get("role").String(); got != "user" {
+		t.Fatalf("Expected relay message role %q, got %q", "user", got)
 	}
-	if got := toolContent.Get("0.image_url.url").String(); got != "https://example.com/tool.png" {
+	if got := relayContent.Get("1.type").String(); got != "image_url" {
+		t.Fatalf("Expected relay content type %q, got %q", "image_url", got)
+	}
+	if got := relayContent.Get("1.image_url.url").String(); got != "https://example.com/tool.png" {
 		t.Fatalf("Unexpected image_url: %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolResultImageMergesIntoUserText(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_1", "name": "screenshot", "input": {}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "call_1",
+						"content": [
+							{
+								"type": "image",
+								"source": {
+									"type": "base64",
+									"media_type": "image/png",
+									"data": "iVBORw0KGgoAAAANSUhEUg=="
+								}
+							}
+						]
+					},
+					{"type": "text", "text": "What color?"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	// The relayed image joins the user text instead of adding a second user turn.
+	if len(messages) != 3 {
+		t.Fatalf("Expected 3 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	}
+	if got := messages[2].Get("role").String(); got != "user" {
+		t.Fatalf("Expected third message role %q, got %q", "user", got)
+	}
+
+	content := messages[2].Get("content")
+	if got := len(content.Array()); got != 3 {
+		t.Fatalf("Expected 3 user content parts, got %d: %s", got, content.Raw)
+	}
+	if got := content.Get("0.text").String(); got != toolResultImageRelayNotice {
+		t.Fatalf("Expected relay notice %q, got %q", toolResultImageRelayNotice, got)
+	}
+	if got := content.Get("1.type").String(); got != "image_url" {
+		t.Fatalf("Expected second part type %q, got %q", "image_url", got)
+	}
+	if got := content.Get("2.text").String(); got != "What color?" {
+		t.Fatalf("Expected trailing user text %q, got %q", "What color?", got)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_MultipleToolResultsWithImages(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_1", "name": "shot1", "input": {}},
+					{"type": "tool_use", "id": "call_2", "name": "shot2", "input": {}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "call_1",
+						"content": [
+							{"type": "text", "text": "result 1"},
+							{
+								"type": "image",
+								"source": {
+									"type": "base64",
+									"media_type": "image/png",
+									"data": "img1"
+								}
+							}
+						]
+					},
+					{
+						"type": "tool_result",
+						"tool_use_id": "call_2",
+						"content": {
+							"type": "image",
+							"source": {
+								"type": "url",
+								"url": "https://example.com/2.png"
+							}
+						}
+					}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	// Expected: assistant(2 tool calls), tool(call_1), tool(call_2), user(relay 2 images)
+	if len(messages) != 4 {
+		t.Fatalf("Expected 4 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	}
+	if got := messages[1].Get("role").String(); got != "tool" || messages[1].Get("tool_call_id").String() != "call_1" {
+		t.Fatalf("Expected tool 1 message, got: %s", messages[1].Raw)
+	}
+	if got := messages[1].Get("content").String(); got != "result 1" {
+		t.Fatalf("Expected tool 1 content 'result 1', got %q", got)
+	}
+	if got := messages[2].Get("role").String(); got != "tool" || messages[2].Get("tool_call_id").String() != "call_2" {
+		t.Fatalf("Expected tool 2 message, got: %s", messages[2].Raw)
+	}
+	if got := messages[2].Get("content").String(); got != toolResultImagePlaceholder {
+		t.Fatalf("Expected tool 2 placeholder, got %q", got)
+	}
+	if got := messages[3].Get("role").String(); got != "user" {
+		t.Fatalf("Expected user relay message, got: %s", messages[3].Raw)
+	}
+	relayContent := messages[3].Get("content").Array()
+	if len(relayContent) != 3 {
+		t.Fatalf("Expected 3 parts in relay (notice + 2 images), got %d: %s", len(relayContent), messages[3].Get("content").Raw)
+	}
+	if got := relayContent[0].Get("text").String(); got != toolResultImageRelayNotice {
+		t.Fatalf("Expected notice %q, got %q", toolResultImageRelayNotice, got)
+	}
+	if got := relayContent[1].Get("image_url.url").String(); got != "data:image/png;base64,img1" {
+		t.Fatalf("Expected image 1 url, got %q", got)
+	}
+	if got := relayContent[2].Get("image_url.url").String(); got != "https://example.com/2.png" {
+		t.Fatalf("Expected image 2 url, got %q", got)
 	}
 }
 
@@ -1154,5 +1315,112 @@ func TestConvertClaudeRequestToOpenAI_StripsPatternPropertiesIncompatibleKeys(t 
 	}
 	if _, exists := patternProps[`^[a-z]+$`]; !exists {
 		t.Errorf("expected patternProperties key '^[a-z]+$' to be preserved, got: %s", params.Get("patternProperties").Raw)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolResultPreservesFunctionName(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3.8-flash",
+		"max_tokens": 64,
+		"tools": [
+			{
+				"name": "get_weather",
+				"description": "Get weather",
+				"input_schema": {
+					"type": "object",
+					"properties": {"city": {"type": "string"}},
+					"required": ["city"]
+				}
+			},
+			{
+				"name": "get_time",
+				"description": "Get time",
+				"input_schema": {
+					"type": "object",
+					"properties": {"city": {"type": "string"}},
+					"required": ["city"]
+				}
+			}
+		],
+		"messages": [
+			{"role": "user", "content": "What's the weather and time in Jakarta?"},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "toolu_01ABC", "name": "get_weather", "input": {"city": "Jakarta"}},
+					{"type": "tool_use", "id": "toolu_02DEF", "name": "get_time", "input": {"city": "Jakarta"}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "toolu_01ABC", "content": "32C, humid"},
+					{"type": "tool_result", "tool_use_id": "toolu_02DEF", "content": "12:00 PM"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("gemini-3.8-flash", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	var toolMessages []gjson.Result
+	for _, msg := range messages {
+		if msg.Get("role").String() == "tool" {
+			toolMessages = append(toolMessages, msg)
+		}
+	}
+
+	if len(toolMessages) != 2 {
+		t.Fatalf("expected 2 tool messages, got %d. Output: %s", len(toolMessages), result)
+	}
+
+	if got := toolMessages[0].Get("tool_call_id").String(); got != "toolu_01ABC" {
+		t.Errorf("toolMessages[0].tool_call_id = %q, want %q", got, "toolu_01ABC")
+	}
+	if got := toolMessages[0].Get("name").String(); got != "get_weather" {
+		t.Errorf("toolMessages[0].name = %q, want %q", got, "get_weather")
+	}
+	if got := toolMessages[0].Get("content").String(); got != "32C, humid" {
+		t.Errorf("toolMessages[0].content = %q, want %q", got, "32C, humid")
+	}
+
+	if got := toolMessages[1].Get("tool_call_id").String(); got != "toolu_02DEF" {
+		t.Errorf("toolMessages[1].tool_call_id = %q, want %q", got, "toolu_02DEF")
+	}
+	if got := toolMessages[1].Get("name").String(); got != "get_time" {
+		t.Errorf("toolMessages[1].name = %q, want %q", got, "get_time")
+	}
+	if got := toolMessages[1].Get("content").String(); got != "12:00 PM" {
+		t.Errorf("toolMessages[1].content = %q, want %q", got, "12:00 PM")
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolResultUnknownIDNoName(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3.8-flash",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "orphan_call_1", "content": "result"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("gemini-3.8-flash", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	toolMsg := resultJSON.Get("messages.0")
+
+	if got := toolMsg.Get("role").String(); got != "tool" {
+		t.Fatalf("expected tool role, got %q", got)
+	}
+	if got := toolMsg.Get("tool_call_id").String(); got != "orphan_call_1" {
+		t.Errorf("tool_call_id = %q, want %q", got, "orphan_call_1")
+	}
+	if toolMsg.Get("name").Exists() {
+		t.Errorf("expected no name for unknown tool_use_id, got %q", toolMsg.Get("name").String())
 	}
 }
