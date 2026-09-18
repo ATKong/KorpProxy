@@ -68,6 +68,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	continuityCtx := &helps.ClaudeContinuityContext{}
 	ctx = helps.WithClaudeContinuityContext(ctx, continuityCtx)
 	ctx = helps.WithIncomingHeaders(ctx, incomingHeaders)
+	ctx = helps.WithClaudeExecutionMetadata(ctx, helps.ClaudeRequestHasExecutionMetadata(opts.Metadata, req.Metadata))
 	if claudeSessionID != "" {
 		ctx = helps.WithClaudeSessionID(ctx, claudeSessionID)
 	}
@@ -173,25 +174,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		// Declassified as probe (e.g. payload override changed max_tokens: 1 to normal request):
 		// Initialize continuity and diagnostics if cloaked and eligible.
 		if cloaked {
-			sessionID := helps.ClaudeSessionIDFromContext(ctx)
-			if sessionID == "" && auth != nil {
-				sessionID = helps.ClaudeAgentSessionUUIDForRequest(incomingHeaders, body, body, confirmedClaudeCode)
-			}
-			if sessionID != "" && auth != nil {
-				credIdentity := claudeDiagnosticsCredentialIdentity(auth)
-				isNewTurn := helps.IsClaudeNewPromptTurn(body)
-				continuityKey, seq, prevMsgID, storedPrevReq, storedPromptID := helps.BeginClaudeContinuity(credIdentity, sessionID, isNewTurn, "")
+			existingPrevReq, existingPromptID := helps.ExtractClaudeBillingTags(body)
+			prevReq, promptID, cCtx, ok := resolveClaudeContinuityTags(ctx, auth, incomingHeaders, body, confirmedClaudeCode, existingPrevReq, existingPromptID)
+			if ok {
 				if continuityCtx != nil {
-					continuityCtx.Key = continuityKey
-					continuityCtx.Sequence = seq
-					continuityCtx.PreviousMessageID = prevMsgID
-					continuityCtx.PreviousRequestID = storedPrevReq
-					continuityCtx.PromptID = storedPromptID
-					continuityCtx.Initialized = true
+					*continuityCtx = cCtx
 				}
-				body = helps.InjectClaudeBillingTags(body, storedPrevReq, storedPromptID)
+				body = helps.InjectClaudeBillingTags(body, prevReq, promptID)
 				if fp.InjectDiagnostics && isAnthropicUpstreamBase(baseURL) {
-					body, diagnosticsState = injectClaudeDiagnosticsWithState(body, continuityKey, seq, prevMsgID, storedPromptID)
+					body, diagnosticsState = injectClaudeDiagnosticsWithState(body, cCtx.Key, cCtx.Sequence, cCtx.PreviousMessageID, promptID)
 				}
 			}
 		}
@@ -353,7 +344,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
 			helps.LogWithRequestID(ctx).Warn(msg)
-			errClassified := classifyClaudeUpstreamError(httpResp.StatusCode, httpResp.Header, []byte(msg))
+			errClassified := classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, []byte(msg), e.modelLevelCooling())
 			if fastRequest {
 				return resp, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errClassified)
 			}
@@ -374,7 +365,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		if fastRequest {
 			return resp, newClaudeFastDirectResponseError(httpResp, b)
 		}
-		return resp, classifyClaudeUpstreamError(httpResp.StatusCode, httpResp.Header, b)
+		return resp, classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, b, e.modelLevelCooling())
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, claudeResponseContentEncoding(httpResp.Header))
 	if err != nil {
