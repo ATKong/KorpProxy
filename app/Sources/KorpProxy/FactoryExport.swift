@@ -53,13 +53,14 @@ enum FactoryExport {
     }
 
     /// Whether a model supports a Fast / priority tier:
-    /// - Claude: Opus 4.6 / 4.7 / 4.8 (`speed: "fast"`, per Anthropic Fast mode docs)
+    /// - Claude: Opus 4.6 / 4.7 / 4.8 / 5 / 5.5 (`speed: "fast"`, per Anthropic Fast mode docs)
     /// - OpenAI/Codex: GPT-5.4 / 5.5 (`service_tier: "priority"`, per OpenAI Codex Speed docs)
     /// Sending fast to an unsupported model can error upstream, so we gate it.
     static func fastEligible(modelID: String, isAnthropic: Bool) -> Bool {
         let id = modelID.lowercased()
         if isAnthropic {
             return id.contains("opus-4-6") || id.contains("opus-4-7") || id.contains("opus-4-8")
+                || id.contains("opus-5")
         }
         return id.contains("gpt-5.4") || id.contains("gpt-5.5")
     }

@@ -78,10 +78,10 @@ var claudeCodeTrailingBetas = []string{
 }
 
 // claudeCodeCLIBetas assembles the Anthropic-Beta baseline the way Claude Code
-// 2.1.258 does: the list is per-request, not a fixed string. requested holds the
+// 2.1.280 does: the list is per-request, not a fixed string. requested holds the
 // betas the caller asked for, which decide the capability flags below.
 //
-// Verified against api.anthropic.com with native 2.1.258 captures on interactive,
+// Verified against api.anthropic.com with native 2.1.280 captures on interactive,
 // non-interactive, subagent, and multi-model paths (Sonnet, Opus, Fable, Haiku).
 // The full observed order is:
 //
@@ -205,7 +205,7 @@ func claudeThinkingDisplayUpdates(body []byte) bool {
 }
 
 // claudeBodyUsesAdvancedToolUse reports whether the request needs
-// advanced-tool-use-2025-11-20. Claude Code 2.1.258 adds the beta only while
+// advanced-tool-use-2025-11-20. Claude Code 2.1.280 adds the beta only while
 // tool search is active, which puts a tool_search_tool_* server tool and
 // defer_loading tools on the wire; plain tool declarations no longer carry it
 // (measured 2026-09-02: 158 inline tools, no beta). Tool use examples
@@ -1090,7 +1090,7 @@ func applyClaudeHeadersWithNativeProfile(
 		}
 	}
 	applyBetaHeader := func() {
-		// Enforce strict native Claude Code 2.1.258 model & turn beta gating:
+		// Enforce strict native Claude Code 2.1.280 model & turn beta gating:
 		if !claudeRequestSupportsEffort(body, nil) {
 			baseBetas = withoutClaudeBeta(baseBetas, claudeEffortBeta)
 		}
@@ -1181,7 +1181,7 @@ func applyClaudeHeadersWithNativeProfile(
 	identityHeader("Anthropic-Version", "2023-06-01")
 	identityHeader("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	identityHeader("X-App", "cli")
-	// Values below match Claude Code 2.1.258 / @anthropic-ai/sdk 0.112.1.
+	// Values below match Claude Code 2.1.280 / @anthropic-ai/sdk 0.112.1.
 	identityHeader("X-Stainless-Retry-Count", "0")
 	identityHeader("X-Stainless-Runtime", "node")
 	identityHeader("X-Stainless-Lang", "js")
@@ -1236,7 +1236,7 @@ func applyClaudeHeadersWithNativeProfile(
 	// identityHeader prefers the incoming value for a confirmed client, so a confirmed
 	// helper keeps its own native request ID and this fresh UUID only covers a caller
 	// that sent none. Helpers opt in on custom gateways too, but only to carry the
-	// request ID they already sent: 2.1.258 attaches the header just for a first-party
+	// request ID they already sent: 2.1.280 attaches the header just for a first-party
 	// base URL, so a helper that arrived without one keeps it absent upstream rather
 	// than gaining a synthesized ID the real client would not have sent.
 	if isAnthropicBase || (helperProfile && helps.HeaderValueCaseInsensitive(incomingHeaders, "x-client-request-id") != "") {
@@ -1244,7 +1244,7 @@ func applyClaudeHeadersWithNativeProfile(
 	}
 	r.Header.Set("Connection", "keep-alive")
 	// Regular Claude Code requests negotiate transport identically for streaming
-	// and non-streaming requests. Claude Code 2.1.258 Haiku helpers offer the same
+	// and non-streaming requests. Claude Code 2.1.280 Haiku helpers offer the same
 	// full compression set as the main thread (2.1.220's minimal probe offered gzip
 	// only). Confirmed helpers preserve the incoming native values.
 	applyTransportNegotiation := func() {

@@ -273,7 +273,7 @@ func measuredClaudeCodeHelperHeadersMatch(headers http.Header, cfg *config.Confi
 	if !meetsClaudeDeviceProfileBaseline(candidate, profile) {
 		return false
 	}
-	// Claude Code 2.1.258 (@anthropic-ai/sdk 0.112.1), measured 2026-09-02 on the
+	// Claude Code 2.1.280 (@anthropic-ai/sdk 0.112.1), measured 2026-09-02 on the
 	// quota probe and the session-title helper: X-Stainless-Async is never sent
 	// and both shapes offer the full compression set. x-client-request-id is
 	// attached only when the client's base URL is api.anthropic.com, so a client

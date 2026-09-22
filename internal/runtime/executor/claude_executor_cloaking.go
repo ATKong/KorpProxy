@@ -247,7 +247,7 @@ const claudeCodeFableReportingOutcomes = `# Reporting outcomes
 Report what actually happened, not what you intended. When you say something is done, sent, saved, fixed, or verified, that claim must rest on a result you observed in this session — tool output, the file as it now reads, the page as it now loads — not on what the step should have produced. If you did not check, say you did not check. If any step failed, was skipped, or came back different from what you expected, say so in the first sentence of your report, before anything else, even when the rest of the work succeeded. Never quietly work around a failure in a way that makes it look resolved; a problem the user can see is recoverable, one your summary hides is not. When you stop before the task is complete, your first line says so plainly and names what is left. Do not describe partial work as done, and do not let a summary read as more certain than the evidence behind it.`
 
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.258", "cli", "")
+	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, "2.1.280", "cli", "")
 }
 
 // checkSystemInstructionsWithSigningMode keeps the top-level system in Claude
@@ -260,7 +260,7 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, cch
 }
 
 // isClaudeFable51Model reports whether the model is specifically Fable 5.1 / Mythos 5.1,
-// matching native Claude Code 2.1.258 family/major/minor checks (AFo = {major:5, minor:1}).
+// matching native Claude Code 2.1.280 family/major/minor checks (AFo = {major:5, minor:1}).
 func isClaudeFable51Model(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	for _, target := range []string{"fable-5-1", "fable-5.1", "mythos-5-1", "mythos-5.1"} {
@@ -1433,7 +1433,7 @@ func applyCloakingInternal(
 		promptID,
 	)
 
-	// In native Claude Code 2.1.258, claude-fable-5-1 requests carry:
+	// In native Claude Code 2.1.280, claude-fable-5-1 requests carry:
 	// "fallbacks": [{"model": "claude-opus-5"}]
 	model := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "model").String()))
 	if isClaudeFable51Model(model) && !isProbeOrHelper {

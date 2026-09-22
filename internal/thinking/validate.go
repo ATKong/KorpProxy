@@ -169,8 +169,17 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 	if config.Mode == ModeNone && toFormat == "claude" {
 		// Claude supports explicit disable via thinking.type="disabled".
 		// Keep Budget=0 so applier can omit budget_tokens.
+		//
+		// Models whose thinking is always on (no zero budget, no "none" level)
+		// reject thinking.type="disabled" with a 400, so a disable request maps
+		// to the lowest effort level instead. Anthropic documents effort as the
+		// replacement control for those models.
 		config.Budget = 0
 		config.Level = ""
+		if !support.ZeroAllowed && len(support.Levels) > 0 && !isLevelSupported(string(LevelNone), support.Levels) {
+			config.Mode = ModeLevel
+			config.Level = ThinkingLevel(support.Levels[0])
+		}
 	} else {
 		switch config.Mode {
 		case ModeBudget, ModeAuto, ModeNone:

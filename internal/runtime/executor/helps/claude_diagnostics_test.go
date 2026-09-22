@@ -196,7 +196,7 @@ func TestClaudeContinuityHelperPredicates(t *testing.T) {
 		t.Fatal("IsClaudeSubagentRequest(parent_session_id) = false, want true")
 	}
 
-	billingSystemBody := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=cli; cch=00000; cc_prev_req=req_01abc; cc_prompt_id=3c6489dc-badc-42b2-bd28-49f8ebabfedd;"}]}`)
+	billingSystemBody := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.1e2; cc_entrypoint=cli; cch=00000; cc_prev_req=req_01abc; cc_prompt_id=3c6489dc-badc-42b2-bd28-49f8ebabfedd;"}]}`)
 	prevReq, promptID := ExtractClaudeBillingTags(billingSystemBody)
 	if prevReq != "req_01abc" || promptID != "3c6489dc-badc-42b2-bd28-49f8ebabfedd" {
 		t.Fatalf("ExtractClaudeBillingTags = %q, %q; want req_01abc, 3c6489dc-badc-42b2-bd28-49f8ebabfedd", prevReq, promptID)
