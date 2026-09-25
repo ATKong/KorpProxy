@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -373,7 +375,7 @@ func (c *requestAfterAuthCapture) record(req coreexecutor.RequestAfterAuthInterc
 		return
 	}
 	headers := mergeRequestInterceptorHeaders(req.Headers, resp.Headers, resp.ClearHeaders)
-	body := cloneBytes(req.Body)
+	var body []byte
 	var originalRequest []byte
 	originalRequestReplaced := false
 	if len(resp.Body) > 0 {
@@ -400,11 +402,11 @@ func (c *requestAfterAuthCapture) apply(req coreexecutor.Request, opts coreexecu
 	if !c.set {
 		return req, opts
 	}
-	req.Payload = cloneBytes(c.body)
-	opts.Headers = cloneHeader(c.headers)
 	if c.originalRequestReplaced {
+		req.Payload = cloneBytes(c.body)
 		opts.OriginalRequest = cloneBytes(c.originalRequest)
 	}
+	opts.Headers = cloneHeader(c.headers)
 	return req, opts
 }
 
@@ -477,7 +479,7 @@ func (h *BaseAPIHandler) applyRequestInterceptorsBeforeAuth(ctx context.Context,
 		RequestedModel: requestedModel,
 		Stream:         opts.Stream,
 		Headers:        cloneHeader(opts.Headers),
-		Body:           cloneBytes(req.Payload),
+		Body:           req.Payload,
 		Metadata:       opts.Metadata,
 	}, skipPluginID)
 	opts.Headers = finalInterceptorHeaders(opts.Headers, resp.Headers)
@@ -559,7 +561,7 @@ func (h *BaseAPIHandler) applyRequestInterceptorsAfterAuth(ctx context.Context, 
 		RequestedModel: req.RequestedModel,
 		Stream:         req.Stream,
 		Headers:        cloneHeader(req.Headers),
-		Body:           cloneBytes(req.Body),
+		Body:           req.Body,
 		Metadata:       req.Metadata,
 	}, skipPluginID)
 	return coreexecutor.RequestAfterAuthInterceptResponse{
@@ -573,7 +575,7 @@ func (h *BaseAPIHandler) applyRequestInterceptorsAfterAuth(ctx context.Context, 
 	}
 }
 
-func (h *BaseAPIHandler) applyResponseInterceptors(ctx context.Context, requestID, handlerType, normalizedModel, requestedModel string, opts coreexecutor.Options, rawResponseHeaders, responseHeaders http.Header, originalRequest, requestBody, body []byte, statusCode int, skipPluginID string) ([]byte, http.Header) {
+func (h *BaseAPIHandler) applyResponseInterceptors(ctx context.Context, requestID, handlerType, normalizedModel, requestedModel string, opts coreexecutor.Options, rawResponseHeaders, responseHeaders http.Header, originalRequest, requestBody, body []byte, statusCode int, skipPluginID string, passthrough bool) ([]byte, http.Header) {
 	host := h.interceptorHost()
 	if host == nil {
 		return body, responseHeaders
@@ -592,9 +594,76 @@ func (h *BaseAPIHandler) applyResponseInterceptors(ctx context.Context, requestI
 		StatusCode:      statusCode,
 		Metadata:        opts.Metadata,
 	}, skipPluginID)
-	responseHeaders = downstreamHeadersAfterInterceptors(rawResponseHeaders, finalInterceptorHeaders(rawResponseHeaders, resp.Headers), PassthroughHeadersEnabled(h.Cfg))
+	responseHeaders = downstreamHeadersAfterInterceptors(rawResponseHeaders, finalInterceptorHeaders(rawResponseHeaders, resp.Headers), passthrough)
 	if len(resp.Body) > 0 {
 		body = cloneBytes(resp.Body)
 	}
 	return body, responseHeaders
+}
+
+// WriteModelListResponse serializes the model-list payload, applies plugin response interceptors
+// if a plugin host is configured, and writes the resulting headers and body to the Gin context.
+func (h *BaseAPIHandler) WriteModelListResponse(c *gin.Context, sourceFormat string, payload any) {
+	if c == nil {
+		return
+	}
+	var body []byte
+	switch v := payload.(type) {
+	case []byte:
+		body = cloneBytes(v)
+	default:
+		var errMarshal error
+		body, errMarshal = json.Marshal(payload)
+		if errMarshal != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMarshal.Error()})
+			return
+		}
+	}
+
+	rawResponseHeaders := http.Header{
+		"Content-Type": []string{"application/json; charset=utf-8"},
+	}
+
+	host := h.interceptorHost()
+	if host != nil {
+		ctx := context.Background()
+		var reqHeaders http.Header
+		if c.Request != nil {
+			reqHeaders = cloneHeader(c.Request.Header)
+			if reqCtx := c.Request.Context(); reqCtx != nil {
+				ctx = reqCtx
+			}
+		}
+		lifecycle := h.newRequestLifecycleTracker(ctx, sourceFormat, "", "", false, nil, "")
+		resp := interceptResponse(ctx, host, pluginapi.ResponseInterceptRequest{
+			RequestID:       lifecycle.requestID(),
+			SourceFormat:    sourceFormat,
+			Model:           "",
+			RequestedModel:  "",
+			Stream:          false,
+			RequestHeaders:  reqHeaders,
+			ResponseHeaders: cloneHeader(rawResponseHeaders),
+			OriginalRequest: nil,
+			RequestBody:     nil,
+			Body:            cloneBytes(body),
+			StatusCode:      http.StatusOK,
+			Metadata:        nil,
+		}, "")
+		if len(resp.Body) > 0 {
+			body = cloneBytes(resp.Body)
+		}
+		if resp.Headers != nil {
+			for key, values := range resp.Headers {
+				c.Writer.Header()[key] = append([]string(nil), values...)
+			}
+		}
+		lifecycle.complete(pluginapi.RequestCompletionSucceeded, http.StatusOK, nil)
+	}
+
+	if c.Writer.Header().Get("Content-Type") == "" {
+		c.Header("Content-Type", "application/json; charset=utf-8")
+	}
+	c.Set("API_RESPONSE", cloneBytes(body))
+	c.Status(http.StatusOK)
+	_, _ = c.Writer.Write(body)
 }
