@@ -68,6 +68,60 @@ func TestRegisterModelsForAuth_UsesPreMergedExcludedModelsAttribute(t *testing.T
 	}
 }
 
+func TestRegisterModelsForAuth_MetaOAuthAliasAndExcludedModels(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OAuthExcludedModels: map[string][]string{
+				"meta": {"muse-spark-1.1"},
+			},
+			OAuthModelAlias: map[string][]config.OAuthModelAlias{
+				"meta": {{Name: "muse-spark-1.3", Alias: "muse-latest"}},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-meta-oauth",
+		Provider: "meta",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+			"api_key":   "LLM|minted",
+		},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	models := registry.GetModelsForClient(auth.ID)
+	if len(models) == 0 {
+		t.Fatal("expected meta models to be registered")
+	}
+
+	seenLatest := false
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		modelID := strings.TrimSpace(model.ID)
+		switch {
+		case strings.EqualFold(modelID, "muse-spark-1.1"):
+			t.Fatalf("expected model %q to be excluded by oauth-excluded-models", modelID)
+		case strings.EqualFold(modelID, "muse-spark-1.3"):
+			t.Fatalf("expected model %q to be renamed by oauth-model-alias", modelID)
+		case strings.EqualFold(modelID, "muse-latest"):
+			seenLatest = true
+		}
+	}
+	if !seenLatest {
+		t.Fatal("expected oauth-model-alias to expose muse-latest")
+	}
+}
+
 func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
 	service := &Service{
 		cfg: &config.Config{
@@ -305,13 +359,51 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	if agentModel == nil {
 		t.Fatal("expected gemini-pro-agent to be registered")
 	}
-	if agentModel.SupportsWebSearch {
-		t.Fatal("gemini-pro-agent should not support web search")
+	if !agentModel.SupportsWebSearch {
+		t.Fatal("gemini-pro-agent should support web search")
 	}
 	if staticOnlyModel == nil {
 		t.Fatal("expected static-only Antigravity model to remain registered")
 	}
+	if staticOnlyModel.SupportsWebSearch {
+		t.Fatal("gpt-oss-120b-medium should not support web search")
+	}
 	if fetchedOnlyModel != nil {
 		t.Fatalf("fetched-only model should not be registered: %#v", fetchedOnlyModel)
+	}
+}
+
+func TestRegisterModelsForAuth_DevinSWE16SlowIncluded(t *testing.T) {
+	service := &Service{}
+	auth := &coreauth.Auth{
+		ID:       "auth-devin-test-swe16slow",
+		Provider: "devin",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+		},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(context.Background(), auth)
+
+	models := registry.GetModelsForClient(auth.ID)
+	var foundSlow *internalregistry.ModelInfo
+	for _, m := range models {
+		if m != nil && m.ID == "devin/swe-1-6-slow" {
+			foundSlow = m
+			break
+		}
+	}
+	if foundSlow == nil {
+		t.Fatal("expected devin/swe-1-6-slow to be registered for devin auth")
+	}
+	if foundSlow.DisplayName != "SWE-1.6 Slow" {
+		t.Errorf("DisplayName = %q, want 'SWE-1.6 Slow'", foundSlow.DisplayName)
 	}
 }

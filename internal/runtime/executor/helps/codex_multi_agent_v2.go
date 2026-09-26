@@ -42,6 +42,12 @@ func TranslateRequestWithCodexMultiAgentV2(ctx context.Context, headers http.Hea
 	return multiagentv2.TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, from, to, model, payload, stream)
 }
 
+// TranslateRequestEnvelopeWithCodexMultiAgentV2 normalizes official Codex
+// multi-agent input while preserving the complete request envelope.
+func TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, req sdktranslator.RequestEnvelope) sdktranslator.RequestEnvelope {
+	return multiagentv2.TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx, headers, cfg, from, to, req)
+}
+
 // TranslateRequestPairWithCodexMultiAgentV2 translates the untouched baseline
 // payload and the working payload that later stages mutate in place. Executors
 // normally assign the original payload to the request before translating, so both
@@ -51,12 +57,23 @@ func TranslateRequestWithCodexMultiAgentV2(ctx context.Context, headers http.Hea
 // because they may have request-scoped output or side effects. This removes a
 // full extra pass over payloads that can reach tens of megabytes.
 func TranslateRequestPairWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, originalPayload, requestPayload []byte, stream bool) (original, working []byte) {
-	original = TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, from, to, model, originalPayload, stream)
+	req := sdktranslator.RequestEnvelope{Format: from, Model: model, Stream: stream}
+	return TranslateRequestEnvelopePairWithCodexMultiAgentV2(ctx, headers, cfg, from, to, req, originalPayload, requestPayload)
+}
+
+// TranslateRequestEnvelopePairWithCodexMultiAgentV2 translates the baseline and
+// working payload while preserving request-scoped metadata in req.
+func TranslateRequestEnvelopePairWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, req sdktranslator.RequestEnvelope, originalPayload, requestPayload []byte) (original, working []byte) {
+	originalReq := req
+	originalReq.Body = originalPayload
+	original = TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx, headers, cfg, from, to, originalReq).Body
 	if sameByteSlice(originalPayload, requestPayload) && !sdktranslator.HasPluginHooks() {
 		// The caller mutates the working copy, so it must not share the baseline array.
 		return original, append([]byte(nil), original...)
 	}
-	return original, TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, from, to, model, requestPayload, stream)
+	workingReq := req
+	workingReq.Body = requestPayload
+	return original, TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx, headers, cfg, from, to, workingReq).Body
 }
 
 // sameByteSlice reports whether both slices describe the same bytes of the same
@@ -70,6 +87,34 @@ func sameByteSlice(a, b []byte) bool {
 		return true
 	}
 	return &a[0] == &b[0]
+}
+
+// TranslateRequestPairWithAPIKeyModelCompatibility avoids translating identical
+// inputs twice while retaining separate buffers and stateful plugin invocations.
+func TranslateRequestPairWithAPIKeyModelCompatibility(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, originalPayload, requestPayload []byte, stream, isCompat bool) (original, working []byte) {
+	original, working, _ = TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, headers, cfg, from, to, model, originalPayload, requestPayload, stream, isCompat)
+	return original, working
+}
+
+// TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent returns the
+// normalizer decision for the working payload, not for the baseline payload.
+func TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, originalPayload, requestPayload []byte, stream, isCompat bool) (original, working []byte, updatesChanged bool) {
+	original, _ = TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, headers, cfg, from, to, model, originalPayload, stream, isCompat)
+	if sameByteSlice(originalPayload, requestPayload) && !sdktranslator.HasPluginHooks() {
+		return original, append([]byte(nil), original...), false
+	}
+	working, updatesChanged = TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, headers, cfg, from, to, model, requestPayload, stream, isCompat)
+	return original, working, updatesChanged
+}
+
+// TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent returns the
+// plugin normalizer's request-scoped update decision for Responses targets.
+func TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, payload []byte, stream, isCompat bool) ([]byte, bool) {
+	if !isCompat || (to == sdktranslator.FormatCodex && from != sdktranslator.FormatClaude) {
+		translated := TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx, headers, cfg, from, to, sdktranslator.RequestEnvelope{Format: from, Model: model, Stream: stream, Body: payload})
+		return translated.Body, translated.ConfigurationUpdatesChanged
+	}
+	return TranslateRequestWithAPIKeyModelCompatibility(ctx, headers, cfg, from, to, model, payload, stream, isCompat), false
 }
 
 // TranslateRequestWithAPIKeyModelCompatibility applies compatibility-aware
@@ -103,8 +148,9 @@ func TranslateRequestWithAPIKeyModelCompatibility(ctx context.Context, headers h
 		return TranslateRequestWithCodexMultiAgentV2(ctx, headers, cfg, from, to, model, payload, stream)
 	}
 
-	summaryConfig := thinking.ExtractSummaryConfig(payload, from.String())
-	return thinking.ApplySummaryConfigForModel(translated, to.String(), model, summaryConfig)
+	summaryConfig := thinking.ExtractTranslatedSummaryConfig(payload, from.String(), to.String())
+	translated = thinking.ApplySummaryConfigForModel(translated, to.String(), model, summaryConfig)
+	return sdktranslator.NormalizeRequest(ctx, from, to, model, translated, stream)
 }
 
 // HasCodexMultiAgentV2NamespaceConflict reports whether the request defines
