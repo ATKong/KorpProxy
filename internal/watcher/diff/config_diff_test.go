@@ -204,6 +204,15 @@ func TestBuildConfigChangeDetails_CodexAlphaSearch(t *testing.T) {
 	expectContains(t, changes, "codex[0].alpha-search: false -> true")
 }
 
+func TestBuildConfigChangeDetails_CodexKey_DisableCodexCloaking(t *testing.T) {
+	disabled := true
+	oldCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "key", BaseURL: "https://codex.example.com"}}}
+	newCfg := &config.Config{CodexKey: []config.CodexKey{{APIKey: "key", BaseURL: "https://codex.example.com", DisableCodexCloaking: &disabled}}}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "codex[0].disable-codex-cloaking: inherit -> true")
+}
+
 func TestBuildConfigChangeDetails_CodexOrphanDelegationCompatibility(t *testing.T) {
 	oldCfg := &config.Config{Codex: config.CodexConfig{OrphanDelegationCompatibility: false}}
 	newCfg := &config.Config{Codex: config.CodexConfig{OrphanDelegationCompatibility: true}}
@@ -647,6 +656,22 @@ func TestBuildConfigChangeDetails_RemoteManagementSecretUpdated(t *testing.T) {
 
 	changes := BuildConfigChangeDetails(oldCfg, newCfg)
 	expectContains(t, changes, "remote-management.secret-key: updated")
+}
+
+func TestBuildConfigChangeDetails_RemoteManagementBaseURL(t *testing.T) {
+	oldCfg := &config.Config{
+		RemoteManagement: config.RemoteManagement{
+			BaseURL: "https://old.example.com",
+		},
+	}
+	newCfg := &config.Config{
+		RemoteManagement: config.RemoteManagement{
+			BaseURL: "https://new.example.com",
+		},
+	}
+
+	changes := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, changes, "remote-management.base-url: https://old.example.com -> https://new.example.com")
 }
 
 func TestBuildConfigChangeDetails_CountBranches(t *testing.T) {
