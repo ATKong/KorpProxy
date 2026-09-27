@@ -16,12 +16,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -154,6 +154,7 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 			continue
 		}
 		eventData := bytes.TrimSpace(line[len(dataTag):])
+		reporter.ObserveCodexResponseModel(eventData)
 		switch gjson.GetBytes(eventData, "type").String() {
 		case "response.output_item.done":
 			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
@@ -278,6 +279,7 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 				continue
 			}
 			eventData := bytes.TrimSpace(line[len(dataTag):])
+			reporter.ObserveCodexResponseModel(eventData)
 			switch gjson.GetBytes(eventData, "type").String() {
 			case "response.output_item.done":
 				collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)

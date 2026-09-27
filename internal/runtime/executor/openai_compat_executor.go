@@ -16,13 +16,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -116,10 +116,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	originalPayload := originalPayloadSource
 	isCompat := helps.APIKeyModelIsCompat(req)
-	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, opts.Stream, isCompat)
-	translated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, opts.Stream, isCompat)
+	originalTranslated, translated, updatesChanged := helps.TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, opts.Stream, isCompat)
 
-	translated, err = helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier())
+	translated, err = helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged)
 	if err != nil {
 		return resp, err
 	}
@@ -131,6 +130,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = helps.NormalizeOpenAIToolResultsTextOnly(translated)
 	}
 	if opts.Alt != "responses/compact" {
+		useMCT := helps.ShouldUseMaxCompletionTokensForModel(e.resolveCompatConfig(auth), baseModel, requestedModel)
+		translated = helps.NormalizeOpenAIMaxTokens(translated, useMCT)
 		translated, err = e.applyPromptCacheKey(ctx, auth, from, baseModel, req, opts, translated)
 		if err != nil {
 			return resp, err
@@ -203,6 +204,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+	reporter.ObserveResponseModel(body)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.EnsurePublished(ctx)
@@ -299,6 +301,7 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		return resp, err
 	}
 
+	reporter.ObserveResponseModel(body)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	reporter.EnsurePublished(ctx)
 	resp = cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone()}
@@ -331,10 +334,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	originalPayload := originalPayloadSource
 	isCompat := helps.APIKeyModelIsCompat(req)
-	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true, isCompat)
-	translated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, true, isCompat)
+	originalTranslated, translated, updatesChanged := helps.TranslateRequestPairWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true, isCompat)
 
-	translated, err = helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier())
+	translated, err = helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged)
 	if err != nil {
 		return nil, err
 	}
@@ -346,6 +348,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		translated = helps.NormalizeOpenAIToolResultsTextOnly(translated)
 	}
 	if opts.Alt != "responses/compact" {
+		useMCT := helps.ShouldUseMaxCompletionTokensForModel(e.resolveCompatConfig(auth), baseModel, requestedModel)
+		translated = helps.NormalizeOpenAIMaxTokens(translated, useMCT)
 		translated, err = e.applyPromptCacheKey(ctx, auth, from, baseModel, req, opts, translated)
 		if err != nil {
 			return nil, err
@@ -503,6 +507,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			reporter.ObserveResponseModel(line)
 			streamUsage.ObserveOpenAIStream(line)
 			trimmedLine := bytes.TrimSpace(line)
 			if len(trimmedLine) == 0 {
@@ -655,7 +660,9 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		observer := helps.NewStreamResponseModelObserver(reporter)
 		defer func() {
+			observer.Finish()
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("openai compat executor: close response body error: %v", errClose)
 			}
@@ -667,6 +674,7 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 			if n > 0 {
 				chunk := bytes.Clone(buffer[:n])
 				helps.AppendAPIResponseChunk(ctx, e.cfg, chunk)
+				observer.Feed(chunk)
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
 				case <-ctx.Done():
@@ -696,11 +704,11 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("openai")
 	isCompat := helps.APIKeyModelIsCompat(req)
-	translated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, false, isCompat)
+	translated, updatesChanged := helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, baseModel, req.Payload, false, isCompat)
 
 	modelForCounting := baseModel
 
-	translated, err := helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier())
+	translated, err := helps.ApplyRequestThinking(translated, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
