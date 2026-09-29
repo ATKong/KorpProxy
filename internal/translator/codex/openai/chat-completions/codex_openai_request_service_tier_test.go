@@ -6,7 +6,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestConvertOpenAIRequestToCodexServiceTier(t *testing.T) {
+func TestConvertOpenAIRequestToCodexServiceTierFlexDropped(t *testing.T) {
 	cases := []struct {
 		name  string
 		input string

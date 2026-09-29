@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 )
 
 type geminiKeyWithAuthIndex struct {
@@ -25,6 +25,11 @@ type codexKeyWithAuthIndex struct {
 
 type xaiKeyWithAuthIndex struct {
 	config.XAIKey
+	AuthIndex string `json:"auth-index,omitempty"`
+}
+
+type metaKeyWithAuthIndex struct {
+	config.MetaKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
@@ -245,6 +250,39 @@ func (h *Handler) xaiKeysWithAuthIndex() []xaiKeyWithAuthIndex {
 		}
 		out[i] = xaiKeyWithAuthIndex{
 			XAIKey:    entry,
+			AuthIndex: authIndex,
+		}
+	}
+	return out
+}
+
+func (h *Handler) metaKeysWithAuthIndex() []metaKeyWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+
+	idGen := synthesizer.NewStableIDGenerator()
+	out := make([]metaKeyWithAuthIndex, len(h.cfg.MetaKey))
+	for i := range h.cfg.MetaKey {
+		entry := h.cfg.MetaKey[i]
+		authIndex := ""
+		key := strings.TrimSpace(entry.APIKey)
+		base := strings.TrimSpace(entry.BaseURL)
+		proxyURL := strings.TrimSpace(entry.ProxyURL)
+		prefix := strings.TrimSpace(entry.Prefix)
+		if key != "" || base != "" {
+			id, _ := idGen.Next("meta:apikey", key, base, proxyURL, prefix, config.FormatSortedHeaders(entry.Headers))
+			authIndex = liveIndexByID[id]
+		}
+		out[i] = metaKeyWithAuthIndex{
+			MetaKey:   entry,
 			AuthIndex: authIndex,
 		}
 	}

@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagestats"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagestats"
 )
 
 // GetUsageStatus returns per-account usage and limiter status: the engine's own
