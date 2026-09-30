@@ -763,6 +763,16 @@ oauth:
   #     - name: "sample-model-latest"
   #       alias: "sample-latest"
 
+  # OAuth provider model settings (per channel)
+  # Allows overriding model-level capabilities (such as context window) for OAuth credentials.
+  # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai, meta.
+  # settings:
+  #   codex:
+  #     - name: "gpt-6-sol"
+  #       max-context-length: 524288 # overrides context window advertised to Codex clients
+  #     - name: "gpt-6-astra"
+  #       max-context-length: 1048576
+
   # OAuth provider excluded models
   # excluded-models:
   #   vertex:
