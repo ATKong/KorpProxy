@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -112,6 +112,9 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 				hasPendingEventLine := pendingEventLine != nil
 				for i, eventData := range eventDataList {
 					eventData = namespaceRestorer.restore(eventData)
+					if prepared.webSearchAlias != "" {
+						eventData = restoreXAIClientWebSearchName(eventData, prepared.webSearchAlias)
+					}
 					eventData = responseFilter.apply(eventData)
 					if len(eventData) == 0 {
 						if hasPendingEventLine && i == 0 {
@@ -119,6 +122,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						}
 						continue
 					}
+					reporter.ObserveResponseModel(eventData)
 					normalizedEventName := gjson.GetBytes(eventData, "type").String()
 					switch normalizedEventName {
 					case "response.output_item.done":
