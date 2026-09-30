@@ -7,10 +7,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -315,5 +315,193 @@ func TestCodexExecutorExecuteStream_EmptyDeltaDoesNotBypassZeroTokenFailure(t *t
 	}
 	if !sawError {
 		t.Fatalf("expected stream with empty delta to fail on zero-token response.incomplete, but it succeeded")
+	}
+}
+
+func TestCodexExecutor_NormalizesToolFieldsForCodexUserAgent(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "test",
+			"base_url": server.URL,
+		},
+	}
+
+	requestPayload := []byte(`{
+		"model": "gpt-5.5",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [
+			{
+				"type": "function",
+				"name": "exec_command",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"cmd": {"type": "string"},
+						"yield_time_ms": {"type": "number"},
+						"max_output_tokens": {"type": "number"},
+						"timeout_ms": {"type": "number"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "write_stdin",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"session_id": {"type": "number"},
+						"yield_time_ms": {"type": "number"},
+						"max_output_tokens": {"type": "number"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "sleep",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"duration_ms": {"type": "number"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "wait_agent",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"timeout_ms": {"type": "number"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "wait",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"yield_time_ms": {"type": "number"},
+						"max_tokens": {"type": "number"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "tool_search",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"limit": {"type": "number"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "test_sync_tool",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"sleep_before_ms": {"type": "number"},
+						"sleep_after_ms": {"type": "number"},
+						"participants": {"type": "number"},
+						"timeout_ms": {"type": "number"}
+					}
+				}
+			},
+			{
+				"type": "function",
+				"name": "unrelated_tool",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"unrelated_num": {"type": "number"}
+					}
+				}
+			}
+		]
+	}`)
+
+	// 1. With non-Codex User-Agent, tool types must remain unchanged (number).
+	_, errExecuteNonCodex := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: requestPayload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Headers:      http.Header{"User-Agent": []string{"curl/8.7.1"}},
+		Stream:       false,
+	})
+	if errExecuteNonCodex != nil {
+		t.Fatalf("Execute(non-codex) error = %v", errExecuteNonCodex)
+	}
+
+	toolMapNonCodex := make(map[string]gjson.Result)
+	for _, tool := range gjson.GetBytes(gotBody, "tools").Array() {
+		toolMapNonCodex[tool.Get("name").String()] = tool
+	}
+	if gotType := toolMapNonCodex["exec_command"].Get("parameters.properties.yield_time_ms.type").String(); gotType != "number" {
+		t.Fatalf("expected non-Codex UA to preserve number, got %q", gotType)
+	}
+
+	// 2. With Codex User-Agent, specified fields must be normalized to integer.
+	gotBody = nil
+	_, errExecuteCodex := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: requestPayload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Headers:      http.Header{"User-Agent": []string{"codex_cli_rs/0.1.0"}},
+		Stream:       false,
+	})
+	if errExecuteCodex != nil {
+		t.Fatalf("Execute(codex) error = %v", errExecuteCodex)
+	}
+
+	toolMap := make(map[string]gjson.Result)
+	for _, tool := range gjson.GetBytes(gotBody, "tools").Array() {
+		toolMap[tool.Get("name").String()] = tool
+	}
+
+	expectedFields := map[string][]string{
+		"exec_command":   {"yield_time_ms", "max_output_tokens", "timeout_ms"},
+		"write_stdin":    {"session_id", "yield_time_ms", "max_output_tokens"},
+		"sleep":          {"duration_ms"},
+		"wait_agent":     {"timeout_ms"},
+		"wait":           {"yield_time_ms", "max_tokens"},
+		"tool_search":    {"limit"},
+		"test_sync_tool": {"sleep_before_ms", "sleep_after_ms", "participants", "timeout_ms"},
+	}
+
+	for toolName, fields := range expectedFields {
+		tool, ok := toolMap[toolName]
+		if !ok {
+			t.Fatalf("expected tool %q in upstream payload", toolName)
+		}
+		for _, field := range fields {
+			gotType := tool.Get("parameters.properties." + field + ".type").String()
+			if gotType != "integer" {
+				t.Fatalf("tool %s property %s type = %q, want integer", toolName, field, gotType)
+			}
+		}
+	}
+
+	// Unrelated tool must retain number
+	unrelated := toolMap["unrelated_tool"]
+	if gotType := unrelated.Get("parameters.properties.unrelated_num.type").String(); gotType != "number" {
+		t.Fatalf("unrelated_tool property type = %q, want number", gotType)
 	}
 }
