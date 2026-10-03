@@ -300,6 +300,32 @@ func TestClaudeContinuityClearsStaleRequestID(t *testing.T) {
 	}
 }
 
+func TestClaudeContinuity_ExpiredEntryDoesNotInheritPromptID(t *testing.T) {
+	resetClaudeDiagnosticsForTest()
+	defer resetClaudeDiagnosticsForTest()
+
+	key, _, _, _, p1 := BeginClaudeContinuity("cred-expire", "sess-expire", true, "")
+	if p1 == "" {
+		t.Fatal("expected non-empty promptID")
+	}
+
+	// Expire entry manually
+	claudeDiagnosticsState.Lock()
+	entry := claudeDiagnosticsState.entries[key]
+	entry.expiresAt = time.Now().Add(-time.Second)
+	claudeDiagnosticsState.entries[key] = entry
+	claudeDiagnosticsState.Unlock()
+
+	// Tool continuation call (isNewPromptTurn = false) without explicit prompt ID on expired entry
+	_, _, _, _, p2 := BeginClaudeContinuity("cred-expire", "sess-expire", false, "")
+	if p2 == "" {
+		t.Fatal("new generation must generate non-empty prompt ID")
+	}
+	if p2 == p1 {
+		t.Fatalf("new generation inherited expired prompt ID: %s", p1)
+	}
+}
+
 func TestIsClaudeProbeRequest_MultiContentBlocksNotAProbe(t *testing.T) {
 	// A request with max_tokens: 1 and multiple content blocks where one happens to be "quota"
 	// but another is a regular prompt must NOT be treated as a probe.
@@ -413,5 +439,37 @@ func TestClaudeSubagentRequests1h(t *testing.T) {
 	headersWithBeta.Set("Anthropic-Beta", "claude-code-20250219,extended-cache-ttl-2025-04-11")
 	if !ClaudeSubagentRequests1h(headersWithBeta, payload) {
 		t.Fatal("ClaudeSubagentRequests1h() = false, want true when header has extended-cache-ttl beta")
+	}
+}
+
+func TestPinClaudeSessionDateAnchorsFirstRequestAndReanchorsAfterTTL(t *testing.T) {
+	resetClaudeDiagnosticsForTest()
+	defer resetClaudeDiagnosticsForTest()
+
+	key, _, _ := BeginClaudeDiagnostics("credential", "session")
+	if got := PinClaudeSessionDate(key, "2026-08-01"); got != "2026-08-01" {
+		t.Fatalf("first pin = %q, want 2026-08-01", got)
+	}
+	// Later requests of the same session keep the anchor even when the
+	// candidate date has flipped past local midnight.
+	if got := PinClaudeSessionDate(key, "2026-08-02"); got != "2026-08-01" {
+		t.Fatalf("second pin = %q, want anchored 2026-08-01", got)
+	}
+
+	// TTL expiry resets the entry, so the session re-anchors to the current date.
+	claudeDiagnosticsState.Lock()
+	entry := claudeDiagnosticsState.entries[key]
+	entry.expiresAt = time.Now().Add(-time.Second)
+	claudeDiagnosticsState.entries[key] = entry
+	claudeDiagnosticsState.Unlock()
+	BeginClaudeDiagnostics("credential", "session")
+	if got := PinClaudeSessionDate(key, "2026-08-02"); got != "2026-08-02" {
+		t.Fatalf("post-TTL pin = %q, want re-anchored 2026-08-02", got)
+	}
+
+	// Unknown keys (no continuity entry) fall back to the candidate date,
+	// preserving the pre-pinning per-request behaviour.
+	if got := PinClaudeSessionDate("unknown-key", "2026-08-03"); got != "2026-08-03" {
+		t.Fatalf("unknown key pin = %q, want candidate 2026-08-03", got)
 	}
 }
