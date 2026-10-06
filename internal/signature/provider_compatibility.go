@@ -20,6 +20,8 @@ const (
 	// handling is provenance-first - establish the target from the model or route,
 	// then use InspectGrokEncryptedContent as a replay-safety shape check.
 	SignatureProviderGrok SignatureProvider = "grok"
+	// SignatureProviderSWE represents Cognition's SWE model family emitting sealed.v1 envelopes.
+	SignatureProviderSWE SignatureProvider = "swe"
 )
 
 type SignatureBlockKind string
@@ -76,6 +78,8 @@ func SignatureProviderFromModelName(modelName string) SignatureProvider {
 		return SignatureProviderKimi
 	case strings.Contains(lower, "grok"):
 		return SignatureProviderGrok
+	case strings.Contains(lower, "swe-"):
+		return SignatureProviderSWE
 	default:
 		return SignatureProviderUnknown
 	}
@@ -88,6 +92,7 @@ func SignatureProviderFromModelName(modelName string) SignatureProvider {
 //
 //	'C' -> 0x08..0x0b : Claude CAIS (0x08)
 //	'E' -> 0x10..0x13 : Claude single-layer (0x12), Gemini protobuf_field_2 (0x12)
+//	'Q' -> 0x40..0x43 : Antigravity double-layer CAQS (0x43, inner 'C')
 //	'R' -> 0x44..0x47 : Claude double-layer R (0x45, inner 'E')
 //	'g' -> 0x80..0x83 : GPT Fernet reasoning (0x80)
 //
@@ -102,7 +107,7 @@ func SignatureProviderFromModelName(modelName string) SignatureProvider {
 // DetectSignatureProviderForBlock, otherwise its signatures would fall through
 // to the residual class. TestSelfDescribingSignatureFirstChars_CoversEveryKnownEnvelope
 // fails when a replay-safe envelope is missing from this set.
-const selfDescribingSignatureFirstChars = "CERg"
+const selfDescribingSignatureFirstChars = "CEQRg"
 
 // base64AlphabetSet builds a byte lookup table for the alphanumeric base64 core
 // plus the alphabet-specific characters in extra. Signature charset validation
@@ -132,7 +137,7 @@ func base64AlphabetSet(extra string) [256]bool {
 // classifier: a false result is conclusive, a true result only narrows the
 // candidate set. Opaque ciphertext that carries no envelope (xAI/Grok
 // encrypted_content) is uniformly distributed over the byte space, so this
-// rejects roughly 92% of it with one comparison and no allocation.
+// rejects most of it with one comparison and no allocation.
 func maybeSelfDescribingSignatureEnvelope(rawSignature string) bool {
 	if rawSignature == "" {
 		return false
@@ -159,6 +164,11 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	}
 
 	if prefixedProvider, unprefixed, ok := SplitSignatureProviderPrefix(sig); ok {
+		// Validators may strip cache prefixes themselves; never let a second
+		// prefix make detection disagree with the payload used for replay.
+		if strings.Contains(unprefixed, "#") {
+			return SignatureProviderUnknown
+		}
 		switch prefixedProvider {
 		case SignatureProviderGemini:
 			if IsGeminiThoughtSignatureBypass(unprefixed) {
@@ -175,6 +185,10 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 			if IsValidGPTReasoningSignature(unprefixed) {
 				return SignatureProviderGPT
 			}
+		case SignatureProviderSWE:
+			if strings.HasPrefix(unprefixed, "sealed.v1.") {
+				return SignatureProviderSWE
+			}
 		}
 		return SignatureProviderUnknown
 	}
@@ -187,10 +201,13 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	if IsGeminiThoughtSignatureBypass(sig) {
 		return SignatureProviderGeminiBypass
 	}
+	if strings.HasPrefix(sig, "sealed.v1.") {
+		return SignatureProviderSWE
+	}
 	// Probes run from the strongest marker to the weakest:
 	//   1. GPT carries the literal "gAAAA" prefix, which pins both the version
 	//      byte and the high timestamp bytes.
-	//   2. Claude CAIS carries marker 0x08 plus a literal "claude-" model text.
+	//   2. Claude CAIS/CAQS carries marker 0x08 with nested container/channel structure.
 	//   3. Claude single/double-layer carries marker 0x12 plus the same literal.
 	//   4. Gemini validates wire shape only and has no literal to anchor on, so
 	//      it is the weakest judge and goes last.
@@ -205,7 +222,7 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 	// The envelope pre-filter gates only the envelope probes. A blob that cannot
 	// be an envelope skips straight to the size probe below rather than returning
 	// early, because Kimi's uniformly distributed base64 starts with one of
-	// "CERg" about 6% of the time and would otherwise be dropped by whichever
+	// "CEQRg" about 8% of the time and would otherwise be dropped by whichever
 	// side of the gate it happened to land on.
 	if maybeSelfDescribingSignatureEnvelope(sig) {
 		if IsValidGPTReasoningSignature(sig) {
@@ -258,12 +275,25 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 		BlockKind:        blockKind,
 	}
 
-	if signatureProviderMatchesTarget(targetProvider, detected) {
-		decision.Compatible = true
-		decision.Action = SignatureActionPreserve
-		decision.NormalizedSignature = normalizeCompatibleSignatureForProvider(targetProvider, rawSignature, blockKind)
-		decision.Reason = claudeCompatibleSignatureReason(targetProvider, rawSignature, targetModel)
+	// Recognizing a Claude envelope does not authorize a Google transport
+	// wrapper on native Claude endpoints. Antigravity has its own replay gate.
+	if targetProvider == SignatureProviderClaude && detected == SignatureProviderClaude &&
+		strings.HasPrefix(SignaturePayloadWithoutProviderPrefix(rawSignature), "Q") {
+		decision.Action = SignatureActionDropBlock
+		decision.Reason = "Antigravity CAQS wrapper requires Antigravity replay"
 		return decision
+	}
+
+	if signatureProviderMatchesTarget(targetProvider, detected) {
+		// A matching family is not sufficient: replay also requires successful
+		// normalization. Otherwise sanitizers could preserve the original input.
+		if normalized := normalizeCompatibleSignatureForProvider(targetProvider, rawSignature, blockKind); normalized != "" {
+			decision.Compatible = true
+			decision.Action = SignatureActionPreserve
+			decision.NormalizedSignature = normalized
+			decision.Reason = claudeCompatibleSignatureReason(targetProvider, rawSignature, targetModel)
+			return decision
+		}
 	}
 
 	decision.Compatible = false
@@ -272,7 +302,7 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 		if blockKind == SignatureBlockKindGeminiFunctionCall || blockKind == SignatureBlockKindGeminiModelPart || blockKind == SignatureBlockKindUnknown {
 			decision.Action = SignatureActionReplaceWithGeminiBypass
 			decision.ReplacementSignature = GeminiSkipThoughtSignatureValidator
-			decision.Reason = "Gemini can bypass synthetic or incompatible model-part signatures with the documented sentinel"
+			decision.Reason = "missing or incompatible signature"
 			return decision
 		}
 		decision.Action = SignatureActionDropBlock
@@ -283,6 +313,9 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 	case SignatureProviderGPT:
 		decision.Action = SignatureActionDropBlock
 		decision.Reason = "GPT reasoning encrypted_content cannot be synthesized from another provider signature"
+	case SignatureProviderSWE:
+		decision.Action = SignatureActionDropBlock
+		decision.Reason = "SWE requires sealed.v1 signature from its own backend"
 	case SignatureProviderKimi:
 		// Kimi is the only target that can keep the reasoning text when the
 		// signature does not match. Its Messages endpoint never reads the field
@@ -329,6 +362,8 @@ func SignatureProviderFromCachePrefix(prefix string) SignatureProvider {
 		return SignatureProviderGemini
 	case "openai", "gpt", "codex":
 		return SignatureProviderGPT
+	case "swe", "sealed":
+		return SignatureProviderSWE
 	default:
 		return SignatureProviderUnknown
 	}
@@ -361,7 +396,7 @@ func CompatibleSignatureForProviderBlock(targetProvider SignatureProvider, rawSi
 	return decision.NormalizedSignature, true
 }
 
-// CompatibleAntigravityClaudeThinkingSignature returns the double-layer R-form
+// CompatibleAntigravityClaudeThinkingSignature returns the double-layer R or Q form
 // required by Antigravity Claude replay. It only accepts signatures that are
 // strictly identifiable as Claude, so Gemini E-prefixed envelopes cannot slip
 // through the looser Antigravity bypass normalization path.
@@ -392,7 +427,14 @@ func claudeCompatibleSignatureReason(targetProvider SignatureProvider, rawSignat
 	if err != nil {
 		return genericReason
 	}
-	reason := "valid Claude CAIS signature with embedded model " + info.ModelText + " is compatible with any Claude target"
+	var reason string
+	if info.ModelText != "" {
+		reason = "valid Claude CAIS signature with embedded model " + info.ModelText + " is compatible with any Claude target"
+	} else if info.EnvelopeVersion >= 4 {
+		reason = "valid Claude CAQS signature is compatible with any Claude target"
+	} else {
+		reason = "valid Claude CAIS signature is compatible with any Claude target"
+	}
 	if trimmedModel := strings.TrimSpace(targetModel); trimmedModel != "" {
 		reason += ", including target model " + trimmedModel
 	}
@@ -416,6 +458,8 @@ func signatureProviderMatchesTarget(target, detected SignatureProvider) bool {
 		return detected == SignatureProviderClaude
 	case SignatureProviderGPT:
 		return detected == SignatureProviderGPT
+	case SignatureProviderSWE:
+		return detected == SignatureProviderSWE
 	case SignatureProviderKimi:
 		return detected == SignatureProviderKimi
 	default:
@@ -449,6 +493,10 @@ func normalizeCompatibleSignatureForProvider(targetProvider SignatureProvider, r
 		if IsValidGPTReasoningSignature(payload) {
 			return payload
 		}
+	case SignatureProviderSWE:
+		if strings.HasPrefix(payload, "sealed.v1.") {
+			return payload
+		}
 	case SignatureProviderKimi:
 		if IsValidKimiThinkingSignature(payload) {
 			return payload
@@ -465,4 +513,18 @@ func isRecognizedGeminiProviderSignature(rawSignature string, blockKind Signatur
 		return true
 	}
 	return false
+}
+
+// IsRecognizedReasoningSignature reports whether rawSignature is a structurally valid
+// reasoning signature or encrypted_content payload from any known provider
+// (GPT, Claude, Gemini, Kimi, Grok, Devin).
+func IsRecognizedReasoningSignature(rawSignature string) bool {
+	sig := strings.TrimSpace(rawSignature)
+	if sig == "" {
+		return false
+	}
+	if DetectSignatureProvider(sig) != SignatureProviderUnknown {
+		return true
+	}
+	return IsValidGrokEncryptedContent(sig)
 }
