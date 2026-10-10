@@ -9,9 +9,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -148,4 +150,93 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 	default:
 	}
 	return false
+}
+
+// SupportsApplyPatch requires both selectable transports to support the tool.
+func (e *CodexAutoExecutor) SupportsApplyPatch() bool {
+	return e != nil && e.httpExec != nil && e.wsExec != nil && e.httpExec.SupportsApplyPatch() && e.wsExec.SupportsApplyPatch()
+}
+
+// InterruptExecutionSession forwards a response.interrupt control frame on the
+// current upstream socket. It does not dial, replay, or select another credential.
+func (e *CodexAutoExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
+	if e == nil || e.wsExec == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	return e.wsExec.InterruptExecutionSession(ctx, sessionID, payload)
+}
+
+// InterruptExecutionSession writes the original interrupt payload to the session
+// socket captured for this execution. Payload rules and response.create defaults
+// must not rewrite response_id, mode, or extension fields.
+func (e *CodexWebsocketsExecutor) InterruptExecutionSession(ctx context.Context, sessionID string, payload []byte) error {
+	if e == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	if ctx != nil {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return errCtx
+		}
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sess := store.sessions[sessionID]
+	store.mu.Unlock()
+	if sess == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	sess.connMu.Lock()
+	conn := sess.conn
+	authID := sess.authID
+	sess.connMu.Unlock()
+	if conn == nil {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	// Account checks may call back into the auth manager; do not hold session
+	// locks across them. Take the lifecycle snapshot only after they finish.
+	authEnabled := cliproxyexecutor.WebsocketAuthEnabled(ctx, authID)
+	sess.connMu.Lock()
+	if sess.conn != conn {
+		sess.connMu.Unlock()
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	sess.activeMu.Lock()
+	_, alreadyTerminal := sess.terminalResponseIDs[gjson.GetBytes(payload, "response_id").String()]
+	alreadyTerminal = alreadyTerminal && sess.responseStateConn == conn
+	active := sess.activeConn == conn && sess.activeCh != nil
+	var disconnectErr error
+	if sess.terminalConn == conn {
+		disconnectErr = sess.terminalErr
+	}
+	// Terminal state and the active channel must belong to one snapshot:
+	// completion can otherwise land between the checks and produce a stale 400.
+	sess.activeMu.Unlock()
+	sess.connMu.Unlock()
+	if disconnectErr != nil {
+		return disconnectErr
+	}
+	if alreadyTerminal {
+		log.WithField("outcome", "already_terminal").Debug("codex websockets: response.interrupt handled")
+		return nil
+	}
+	// A retained socket from an earlier turn is not the current upstream.
+	// HTTP turns must fall through to local cancellation instead.
+	if !active {
+		return cliproxyexecutor.ErrNoActiveUpstreamWebsocket
+	}
+	if !authEnabled {
+		return fmt.Errorf("websocket credential is no longer enabled")
+	}
+	if errWrite := writeCodexWebsocketMessage(sess, conn, payload); errWrite != nil {
+		return errWrite
+	}
+	log.WithField("outcome", "forwarded").Debug("codex websockets: response.interrupt handled")
+	return nil
 }
