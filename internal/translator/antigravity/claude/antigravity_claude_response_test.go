@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -904,7 +904,7 @@ func TestConvertAntigravityResponseToClaude_PreservesClaudeThoughtAndToolSignatu
 	replayRequest := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"assistant","content":[]},{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
 	replayRequest, _ = sjson.SetRawBytes(replayRequest, "messages.0.content", []byte(gjson.GetBytes(nonStream, "content").Raw))
 	replayRequest = StripEmptySignatureThinkingBlocks(replayRequest)
-	translated := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", replayRequest, false)
+	translated, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", replayRequest, false)
 	parts := gjson.GetBytes(translated, "request.contents.0.parts").Array()
 	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != upstreamSig1 || parts[1].Get("thoughtSignature").String() != upstreamSig2 {
 		t.Fatalf("Claude thought/tool signatures did not round-trip: %s", translated)
@@ -930,7 +930,7 @@ func TestConvertAntigravityResponseToClaudeNonStream_SignedThoughtBeforeUnsigned
 	replayRequest := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":[]}]}`)
 	replayRequest, _ = sjson.SetRawBytes(replayRequest, "messages.0.content", []byte(gjson.GetBytes(output, "content").Raw))
 	replayRequest = StripInvalidGeminiSignatureThinkingBlocks(replayRequest)
-	translated := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
+	translated, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
 	parts := gjson.GetBytes(translated, "request.contents.0.parts").Array()
 	if len(parts) != 2 || parts[0].Get("text").String() != "hidden" || !parts[0].Get("thought").Bool() || parts[0].Get("thoughtSignature").String() != signature || parts[1].Get("text").String() != "visible" || parts[1].Get("thoughtSignature").String() != "" {
 		t.Fatalf("signed thought target changed: output=%s translated=%s", output, translated)
@@ -984,7 +984,7 @@ func TestConvertAntigravityResponseToClaudeNonStream_PreservesDistinctThoughtAnd
 	replayRequest := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":[]},{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
 	replayRequest, _ = sjson.SetRawBytes(replayRequest, "messages.0.content", []byte(gjson.GetBytes(output, "content").Raw))
 	replayRequest = StripInvalidGeminiSignatureThinkingBlocks(replayRequest)
-	translated := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
+	translated, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
 	parts := gjson.GetBytes(translated, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("replayed parts = %d, want thought + text; translated=%s", len(parts), translated)
@@ -1061,7 +1061,7 @@ func TestConvertAntigravityResponseToClaudeNonStream_ThoughtBeforeSignedToolRoun
 	replayRequest := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":[]},{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
 	replayRequest, _ = sjson.SetRawBytes(replayRequest, "messages.0.content", []byte(gjson.GetBytes(output, "content").Raw))
 	replayRequest = StripInvalidGeminiSignatureThinkingBlocks(replayRequest)
-	translated := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
+	translated, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
 	if got := gjson.GetBytes(translated, "request.contents.0.parts.0.text").String(); got != "hidden analysis" {
 		t.Fatalf("replayed thought text = %q; translated=%s", got, translated)
 	}
@@ -1104,7 +1104,7 @@ func TestConvertAntigravityResponseToClaude_TrailingFunctionCarrierRoundTrip(t *
 	replayRequest := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":[]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"","content":"ok"}]}],"tools":[{"name":"run_command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]}`)
 	replayRequest, _ = sjson.SetRawBytes(replayRequest, "messages.0.content", []byte(gjson.GetBytes(claudeResponse, "content").Raw))
 	replayRequest, _ = sjson.SetBytes(replayRequest, "messages.1.content.0.tool_use_id", content[0].Get("id").String())
-	translated := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, true)
+	translated, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, true)
 	parts := gjson.GetBytes(translated, "request.contents.0.parts").Array()
 	if len(parts) != 1 || !parts[0].Get("functionCall").Exists() {
 		t.Fatalf("trailing carrier was not rebound to the function call: %s", translated)
@@ -1167,7 +1167,7 @@ func TestConvertAntigravityResponseToClaude_DirectionalTextCarriersRoundTrip(t *
 			replayRequest := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":[]},{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
 			replayRequest, _ = sjson.SetRawBytes(replayRequest, "messages.0.content", []byte(gjson.GetBytes(nonStream, "content").Raw))
 			replayRequest = StripInvalidGeminiSignatureThinkingBlocks(replayRequest)
-			translated := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
+			translated, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
 			parts := gjson.GetBytes(translated, "request.contents.0.parts").Array()
 			if len(parts) != 2 || parts[0].Get("text").String() != "A" || parts[1].Get("text").String() != "B" {
 				t.Fatalf("text boundaries changed: %s", translated)
@@ -1209,7 +1209,7 @@ func TestConvertAntigravityResponseToClaude_LeadingCarrierTargetsFollowingThough
 	if got := gjson.GetBytes(replayRequest, "messages.0.content.#").Int(); got != 2 {
 		t.Fatalf("prevalidation dropped unsigned target thought: %s", replayRequest)
 	}
-	translated := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
+	translated, _ := ConvertClaudeRequestToAntigravity("gemini-3.6-flash-high", replayRequest, false)
 	part := gjson.GetBytes(translated, "request.contents.0.parts.0")
 	if part.Get("text").String() != "reason" || !part.Get("thought").Bool() || part.Get("thoughtSignature").String() != signature {
 		t.Fatalf("leading thought carrier did not round-trip: %s", translated)
@@ -1435,9 +1435,133 @@ func TestConvertAntigravityResponseToClaude_EmitsNativeSignaturesWithoutProvider
 	replayRequest := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"assistant","content":[]},{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
 	replayRequest, _ = sjson.SetRawBytes(replayRequest, "messages.0.content", []byte(gjson.GetBytes(nonStream, "content").Raw))
 	replayRequest = StripEmptySignatureThinkingBlocks(replayRequest)
-	translated := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", replayRequest, false)
+	translated, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", replayRequest, false)
 	parts := gjson.GetBytes(translated, "request.contents.0.parts").Array()
 	if len(parts) != 2 || parts[0].Get("thoughtSignature").String() != upstreamSig1 || parts[1].Get("thoughtSignature").String() != upstreamSig2 {
 		t.Fatalf("Claude native thought/tool signatures did not round-trip in cache mode: %s", translated)
+	}
+}
+
+func TestConvertAntigravityResponseToClaudeStream_EmptyTextPartKeepsThinkingBlockOpen(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-3-flash-agent"}`)
+	thinkingChunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Thinking","thought":true}]}}],"responseId":"resp-1"}}`)
+	emptyTextChunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":""}]}}]}}`)
+	finishChunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"thoughtsTokenCount":20,"totalTokenCount":120}}}`)
+
+	var param any
+	ctx := context.Background()
+	output1 := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, thinkingChunk, &param), nil)
+	if !strings.Contains(string(output1), `"type":"content_block_start","index":0,"content_block":{"type":"thinking"`) {
+		t.Fatalf("expected thinking block start at index 0: %s", string(output1))
+	}
+
+	// Verify empty text chunk does not close thinking block or emit content_block_stop
+	output2 := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, emptyTextChunk, &param), nil)
+	if strings.Contains(string(output2), "content_block_stop") {
+		t.Fatalf("empty text chunk should not emit content_block_stop: %s", string(output2))
+	}
+
+	output3 := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, finishChunk, &param), nil)
+	output4 := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)
+
+	fullOutput := string(output1) + string(output2) + string(output3) + string(output4)
+
+	started := make(map[int64]bool)
+	stopped := make(map[int64]bool)
+	for _, line := range strings.Split(fullOutput, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(trimmed, "data: ")
+		eventType := gjson.Get(data, "type").String()
+		switch eventType {
+		case "content_block_start":
+			idx := gjson.Get(data, "index").Int()
+			started[idx] = true
+		case "content_block_delta":
+			idx := gjson.Get(data, "index").Int()
+			if !started[idx] {
+				t.Fatalf("event %s for index %d before content_block_start; full stream:\n%s", eventType, idx, fullOutput)
+			}
+			if stopped[idx] {
+				t.Fatalf("event %s for index %d after content_block_stop; full stream:\n%s", eventType, idx, fullOutput)
+			}
+		case "content_block_stop":
+			idx := gjson.Get(data, "index").Int()
+			if !started[idx] {
+				t.Fatalf("event %s for index %d before content_block_start; full stream:\n%s", eventType, idx, fullOutput)
+			}
+			if stopped[idx] {
+				t.Fatalf("duplicate content_block_stop for index %d; full stream:\n%s", idx, fullOutput)
+			}
+			stopped[idx] = true
+		}
+	}
+
+	if len(started) != 1 || !started[0] {
+		t.Fatalf("expected exactly 1 started block at index 0, got: %v", started)
+	}
+	if len(stopped) != 1 || !stopped[0] {
+		t.Fatalf("expected exactly 1 stopped block at index 0, got: %v", stopped)
+	}
+}
+
+func TestConvertAntigravityResponseToClaudeStream_EmptyTextPartFollowedByThinkingAndText(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-3-flash-agent"}`)
+	thinkingChunk1 := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Thinking 1... ","thought":true}]}}],"responseId":"resp-2"}}`)
+	emptyTextChunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":""}]}}]}}`)
+	thinkingChunk2 := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Thinking 2...","thought":true}]}}]}}`)
+	textChunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello world"}]}}]}}`)
+	finishChunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"thoughtsTokenCount":20,"totalTokenCount":120}}}`)
+
+	var param any
+	ctx := context.Background()
+	output := bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, thinkingChunk1, &param), nil)
+	output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, emptyTextChunk, &param), nil)...)
+	output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, thinkingChunk2, &param), nil)...)
+	output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, textChunk, &param), nil)...)
+	output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, finishChunk, &param), nil)...)
+	output = append(output, bytes.Join(ConvertAntigravityResponseToClaude(ctx, "gemini-3-flash-agent", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+
+	fullOutput := string(output)
+	started := make(map[int64]bool)
+	stopped := make(map[int64]bool)
+	for _, line := range strings.Split(fullOutput, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(trimmed, "data: ")
+		eventType := gjson.Get(data, "type").String()
+		switch eventType {
+		case "content_block_start":
+			idx := gjson.Get(data, "index").Int()
+			started[idx] = true
+		case "content_block_delta":
+			idx := gjson.Get(data, "index").Int()
+			if !started[idx] {
+				t.Fatalf("event %s for index %d before content_block_start; full stream:\n%s", eventType, idx, fullOutput)
+			}
+			if stopped[idx] {
+				t.Fatalf("event %s for index %d after content_block_stop; full stream:\n%s", eventType, idx, fullOutput)
+			}
+		case "content_block_stop":
+			idx := gjson.Get(data, "index").Int()
+			if !started[idx] {
+				t.Fatalf("event %s for index %d before content_block_start; full stream:\n%s", eventType, idx, fullOutput)
+			}
+			if stopped[idx] {
+				t.Fatalf("duplicate content_block_stop for index %d; full stream:\n%s", idx, fullOutput)
+			}
+			stopped[idx] = true
+		}
+	}
+
+	if len(started) != 2 || !started[0] || !started[1] {
+		t.Fatalf("expected exactly 2 started blocks (0=thinking, 1=text), got: %v", started)
+	}
+	if len(stopped) != 2 || !stopped[0] || !stopped[1] {
+		t.Fatalf("expected exactly 2 stopped blocks (0=thinking, 1=text), got: %v", stopped)
 	}
 }
