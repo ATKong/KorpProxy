@@ -14,8 +14,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -46,6 +46,7 @@ type PostgresStore struct {
 	authDir       string
 	cooldownStore *postgresCooldownStateStore
 	mu            sync.Mutex
+	persistAuthFn func(ctx context.Context, relID string, data []byte) error
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -224,7 +225,10 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
+	// Runtime updates must not recreate a disabled credential whose source file
+	// was deliberately removed. Login and migration callers explicitly mark the
+	// save when creating a missing disabled credential is intentional.
+	if auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx) {
 		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}
@@ -255,19 +259,20 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if errMarshal != nil {
 			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
 		}
+		contentsMatch := false
 		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				return path, nil
-			}
+			contentsMatch = jsonEqual(existing, raw)
 		} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
 			return "", fmt.Errorf("postgres store: read existing metadata: %w", errRead)
 		}
-		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
+		if !contentsMatch {
+			tmp := path + ".tmp"
+			if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+				return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
+			}
+			if errRename := os.Rename(tmp, path); errRename != nil {
+				return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
+			}
 		}
 	default:
 		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
@@ -548,6 +553,12 @@ func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string
 }
 
 func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte) error {
+	if s.persistAuthFn != nil {
+		return s.persistAuthFn(ctx, relID, data)
+	}
+	if s.db == nil {
+		return fmt.Errorf("postgres store: database not configured")
+	}
 	jsonPayload := json.RawMessage(data)
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, content, created_at, updated_at)
