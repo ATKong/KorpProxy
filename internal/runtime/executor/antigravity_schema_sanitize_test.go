@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	antigravitychat "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/antigravity/openai/chat-completions"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	antigravitychat "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/openai/chat-completions"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 )
 
@@ -275,6 +275,15 @@ func TestSanitizeAntigravityRequestSchemasProjectsUnionsAndPreservesEnumTypes(t 
 	payload := `{"request":{
 		"tools":[{"functionDeclarations":[{"name":"tool","parameters":{"type":"object","properties":{
 			"choice":{"anyOf":[{"type":"string"},{"type":"null"}]},
+			"item":{"anyOf":[
+				{"type":"string"},
+				{"type":"object","properties":{"image":{"type":"string"}},"required":["image"]},
+				{"type":"object","properties":{"audio":{"type":"string"}},"required":["audio"]}
+			]},
+			"variant":{"oneOf":[
+				{"type":"object","properties":{"image":{"type":"string"}},"required":["image"]},
+				{"type":"object","properties":{"audio":{"type":"string"}},"required":["audio"]}
+			]},
 			"level":{"type":"number","enum":[1,2]}
 		}}}]}],
 		"generationConfig":{"responseSchema":{"type":"object","properties":{
@@ -304,7 +313,22 @@ func TestSanitizeAntigravityRequestSchemasProjectsUnionsAndPreservesEnumTypes(t 
 
 	toolSchema := gjson.Get(got, "request.tools.0.functionDeclarations.0.parameters")
 	if toolSchema.Get("properties.choice.anyOf").Exists() {
-		t.Errorf("tool anyOf union was not flattened: %s", toolSchema.Raw)
+		t.Errorf("tool nullable single-branch anyOf union was not flattened: %s", toolSchema.Raw)
+	}
+	if gotBranches := len(toolSchema.Get("properties.item.anyOf").Array()); gotBranches != 3 {
+		t.Errorf("tool multi-branch anyOf count = %d, want 3: %s", gotBranches, toolSchema.Raw)
+	}
+	if !toolSchema.Get("properties.item.anyOf.2.properties.audio").Exists() {
+		t.Errorf("tool multi-branch anyOf lost audio branch: %s", toolSchema.Raw)
+	}
+	if toolSchema.Get("properties.variant.oneOf").Exists() {
+		t.Errorf("tool multi-branch oneOf should be converted to anyOf for parameters Schema carrier: %s", toolSchema.Raw)
+	}
+	if gotVariantBranches := len(toolSchema.Get("properties.variant.anyOf").Array()); gotVariantBranches != 2 {
+		t.Errorf("tool multi-branch variant.anyOf count = %d, want 2: %s", gotVariantBranches, toolSchema.Raw)
+	}
+	if !toolSchema.Get("properties.variant.anyOf.1.properties.audio").Exists() {
+		t.Errorf("tool multi-branch variant.anyOf lost audio branch: %s", toolSchema.Raw)
 	}
 	if gotType := toolSchema.Get("properties.level.type").String(); gotType != "number" {
 		t.Errorf("tool enum type = %q, want number: %s", gotType, toolSchema.Raw)
@@ -340,7 +364,7 @@ func TestSanitizeAntigravityToolSchemasKeepNativeTypeAndNullableOnBothPaths(t *t
 
 func TestAntigravityBuildRequestKeepsJSONObjectMimeOnly(t *testing.T) {
 	input := []byte(`{"model":"gemini-3.1-pro-low","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}`)
-	translated := antigravitychat.ConvertOpenAIRequestToAntigravity("gemini-3.1-pro-low", input, false)
+	translated, _ := antigravitychat.ConvertOpenAIRequestToAntigravity("gemini-3.1-pro-low", input, false)
 	body := buildRequestBodyFromRawPayload(t, "gemini-3.1-pro-low", translated)
 	encoded, errMarshal := json.Marshal(body)
 	if errMarshal != nil {
@@ -396,7 +420,7 @@ func TestAntigravityBuildRequestSanitizesSnakeCaseGenerationResponseSchemas(t *t
 	} {
 		t.Run(testCase.alias, func(t *testing.T) {
 			input := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"user","content":"hi"}],"generation_config":{"` + testCase.alias + `":{"type":"object","$id":"drop-me","properties":{"title":{"type":"string"}}}}}`)
-			translated := antigravitychat.ConvertOpenAIRequestToAntigravity("gemini-3.6-flash-high", input, false)
+			translated, _ := antigravitychat.ConvertOpenAIRequestToAntigravity("gemini-3.6-flash-high", input, false)
 			body := buildRequestBodyFromRawPayload(t, "gemini-3.6-flash-high", translated)
 			encoded, errMarshal := json.Marshal(body)
 			if errMarshal != nil {
@@ -610,6 +634,80 @@ func TestSanitizeAntigravityRequestSchemasStripsEncryptedMetadata(t *testing.T) 
 			if !schema.Get("properties.key.type").Exists() || schema.Get("properties.key.type").String() != "string" {
 				t.Errorf("declContainer=%s antigravity=%v: key property was corrupted: %s", declContainer, useAntigravitySchema, schema.Raw)
 			}
+		}
+	}
+}
+
+func TestSanitizeAntigravityRequestSchemasNormalizesTrueBooleanSubschemas(t *testing.T) {
+	// Issue #3551: RevenueCat MCP and other MCP tools declare boolean `true` subschemas in properties.
+	// Upstream Antigravity rejects boolean `true` in Schema objects with HTTP 400.
+	payload := `{"request":{
+		"tools":[{"functionDeclarations":[{
+			"name":"mcp__revenuecat_create_product_store_state_plan",
+			"parametersJsonSchema":{
+				"type":"object",
+				"properties":{
+					"screenshot_id":true,
+					"filename":true,
+					"file_size":true,
+					"source_file_checksum":true,
+					"disabled":false,
+					"metadata":{
+						"type":"object",
+						"properties":{
+							"nested_flag":true
+						}
+					},
+					"tags":{
+						"type":"array",
+						"items":true
+					},
+					"variants":{
+						"anyOf":[true,{"type":"string"}]
+					},
+					"large_int":9007199254740993
+				},
+				"additionalProperties":true
+			}
+		}]}]
+	}}`
+
+	for _, useAntigravitySchema := range []bool{false, true} {
+		got := sanitizeAntigravityRequestSchemas(payload, useAntigravitySchema)
+		decl := gjson.Get(got, "request.tools.0.functionDeclarations.0")
+		params := decl.Get("parameters")
+		if !params.Exists() {
+			t.Fatalf("parameters missing in sanitized declaration: %s", decl.Raw)
+		}
+
+		for _, prop := range []string{"screenshot_id", "filename", "file_size", "source_file_checksum"} {
+			val := params.Get("properties." + prop)
+			if !val.Exists() {
+				t.Errorf("useAntigravitySchema=%v: property %s missing: %s", useAntigravitySchema, prop, params.Raw)
+			}
+			if val.Type != gjson.JSON || val.Raw != "{}" {
+				t.Errorf("useAntigravitySchema=%v: property %s should be {}, got %s", useAntigravitySchema, prop, val.Raw)
+			}
+		}
+
+		// Check false is preserved
+		if val := params.Get("properties.disabled"); val.Type != gjson.False {
+			t.Errorf("useAntigravitySchema=%v: disabled should be false, got %s", useAntigravitySchema, val.Raw)
+		}
+
+		// Check nested property
+		if val := params.Get("properties.metadata.properties.nested_flag"); val.Type != gjson.JSON || val.Raw != "{}" {
+			t.Errorf("useAntigravitySchema=%v: nested_flag should be {}, got %s", useAntigravitySchema, val.Raw)
+		}
+
+		// Check items: true -> items: {}
+		if val := params.Get("properties.tags.items"); val.Type != gjson.JSON || val.Raw != "{}" {
+			t.Errorf("useAntigravitySchema=%v: tags.items should be {}, got %s", useAntigravitySchema, val.Raw)
+		}
+
+		// Check large int preserved without float conversion
+		if val := params.Get("properties.large_int"); val.Raw != "9007199254740993" {
+			t.Errorf("useAntigravitySchema=%v: large_int corrupted, got %s", useAntigravitySchema, val.Raw)
 		}
 	}
 }
