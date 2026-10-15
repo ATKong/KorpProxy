@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 var snapshotCoreAuthsFunc = snapshotCoreAuths
@@ -81,11 +81,16 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 }
 
 func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
-	if w == nil {
-		return false
+	ok, _ := w.dispatchPersistedAuthUpdateWithRevision(&update)
+	return ok
+}
+
+func (w *Watcher) dispatchPersistedAuthUpdateWithRevision(update *AuthUpdate) (bool, uint64) {
+	if w == nil || update == nil {
+		return false, 0
 	}
 	if update.Auth == nil || update.Auth.ID == "" {
-		return false
+		return false, 0
 	}
 	path := ""
 	if update.Auth.Attributes != nil {
@@ -96,7 +101,7 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 	}
 	normalized := w.normalizeAuthPath(path)
 	if normalized == "" {
-		return false
+		return false, 0
 	}
 	clone := update.Auth.Clone()
 	w.clientsMutex.Lock()
@@ -116,15 +121,18 @@ func (w *Watcher) dispatchPersistedAuthUpdate(update AuthUpdate) bool {
 	if update.ID == "" {
 		update.ID = clone.ID
 	}
-	update.Auth = clone.Clone()
-	updates := []AuthUpdate{update}
+	updateCopy := *update
+	updateCopy.Auth = clone.Clone()
+	updates := []AuthUpdate{updateCopy}
 	w.stampAuthUpdatesLocked(updates)
+	rev := updates[0].revision
+	update.revision = rev
 	w.clientsMutex.Unlock()
 	if w.getAuthQueue() == nil {
-		return false
+		return false, rev
 	}
 	w.dispatchAuthUpdates(updates)
-	return true
+	return true, rev
 }
 
 func (w *Watcher) refreshAuthState(force bool) {
@@ -196,6 +204,8 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: auth.Clone()})
 		}
 	}
+	// A missing ID in a full scan does not imply its source file was removed.
+	// Leave these deletes unmarked so content/config changes still remove auths.
 	for id := range w.currentAuths {
 		if _, ok := newState[id]; !ok {
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionDelete, ID: id})
@@ -352,6 +362,9 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	clone.NextRefreshAfter = time.Time{}
 	clone.Runtime = nil
 	clone.Quota.NextRecoverAt = time.Time{}
+	if clone.Metadata != nil {
+		delete(clone.Metadata, "antigravity_capability_hints")
+	}
 	return clone
 }
 
