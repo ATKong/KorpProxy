@@ -15,10 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/tidwall/gjson"
@@ -320,25 +320,20 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 					if hasThoughtSignature {
 						signatureTargetsVisibleText = appendPartSignature(thoughtSignatureResult.String(), geminiClaudeCarrierNext, geminiClaudeCarrierText)
 					}
-					finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason")
-					if partText != "" || !finishReasonResult.Exists() {
-						if params.ResponseType == 1 {
-							data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", partText)
-							appendEvent("content_block_delta", string(data))
-							params.HasContent = true
-						} else {
-							if params.ResponseType != 0 {
-								appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
-								params.ResponseIndex++
-							}
-							if partText != "" {
-								appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex))
-								data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", partText)
-								appendEvent("content_block_delta", string(data))
-								params.ResponseType = 1
-								params.HasContent = true
-							}
+					if params.ResponseType == 1 {
+						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", partText)
+						appendEvent("content_block_delta", string(data))
+						params.HasContent = true
+					} else if partText != "" {
+						if params.ResponseType != 0 {
+							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
+							params.ResponseIndex++
 						}
+						appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex))
+						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex)), "delta.text", partText)
+						appendEvent("content_block_delta", string(data))
+						params.ResponseType = 1
+						params.HasContent = true
 					}
 					if partText != "" {
 						params.HasSemanticContent = true
@@ -410,13 +405,19 @@ func ConvertAntigravityResponseToClaude(ctx context.Context, _ string, originalR
 
 	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
 		params.HasUsageMetadata = true
+		rawPromptTokenCount := usageResult.Get("promptTokenCount").Int()
 		params.CachedTokenCount = usageResult.Get("cachedContentTokenCount").Int()
-		params.PromptTokenCount = usageResult.Get("promptTokenCount").Int() - params.CachedTokenCount
+		params.PromptTokenCount = rawPromptTokenCount - params.CachedTokenCount
+		if params.PromptTokenCount < 0 {
+			params.PromptTokenCount = 0
+		}
 		params.CandidatesTokenCount = usageResult.Get("candidatesTokenCount").Int()
 		params.ThoughtsTokenCount = usageResult.Get("thoughtsTokenCount").Int()
 		params.TotalTokenCount = usageResult.Get("totalTokenCount").Int()
 		if params.CandidatesTokenCount == 0 && params.TotalTokenCount > 0 {
-			params.CandidatesTokenCount = params.TotalTokenCount - params.PromptTokenCount - params.ThoughtsTokenCount
+			// totalTokenCount includes the cached part of promptTokenCount, so the
+			// fallback must use the raw prompt count, not the cache-reduced one.
+			params.CandidatesTokenCount = params.TotalTokenCount - rawPromptTokenCount - params.ThoughtsTokenCount
 			if params.CandidatesTokenCount < 0 {
 				params.CandidatesTokenCount = 0
 			}
@@ -480,7 +481,9 @@ func appendFinalEvents(params *Params, output *[]byte, force bool) {
 	stopReason := resolveStopReason(params)
 	usageOutputTokens := params.CandidatesTokenCount + params.ThoughtsTokenCount
 	if usageOutputTokens == 0 && params.TotalTokenCount > 0 {
-		usageOutputTokens = params.TotalTokenCount - params.PromptTokenCount
+		// PromptTokenCount excludes cached tokens for input_tokens, while
+		// TotalTokenCount includes them; add the cache back for the fallback.
+		usageOutputTokens = params.TotalTokenCount - (params.PromptTokenCount + params.CachedTokenCount)
 		if usageOutputTokens < 0 {
 			usageOutputTokens = 0
 		}
