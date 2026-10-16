@@ -1,10 +1,12 @@
 package pluginhost
 
 import (
+	"reflect"
 	"sort"
 	"strings"
+	"sync"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 type capabilityRecord struct {
@@ -17,8 +19,10 @@ type capabilityRecord struct {
 }
 
 type Snapshot struct {
-	enabled bool
-	records []capabilityRecord
+	enabled                   bool
+	records                   []capabilityRecord
+	quotaSupportedProvidersMu sync.RWMutex
+	quotaSupportedProviders   map[string][]string
 }
 
 // RegisteredPluginInfo describes a plugin that is active in the current runtime snapshot.
@@ -28,6 +32,8 @@ type RegisteredPluginInfo struct {
 	Metadata      pluginapi.Metadata
 	SupportsOAuth bool
 	OAuthProvider string
+	SupportsQuota bool
+	QuotaProvider string
 	Menus         []RegisteredPluginMenu
 }
 
@@ -39,7 +45,9 @@ type RegisteredPluginMenu struct {
 }
 
 func emptySnapshot() *Snapshot {
-	return &Snapshot{}
+	return &Snapshot{
+		quotaSupportedProviders: make(map[string][]string),
+	}
 }
 
 func (h *Host) activeRecords() []capabilityRecord {
@@ -75,12 +83,21 @@ func (h *Host) RegisteredPlugins() []RegisteredPluginInfo {
 				oauthProvider = identifier
 			}
 		}
+		quotaProvider := record.plugin.Capabilities.QuotaProvider
+		quotaIdentifier := ""
+		if quotaProvider != nil && !h.isPluginFused(record.id) {
+			if identifier, okIdentifier := h.callQuotaIdentifier(record.id, quotaProvider); okIdentifier {
+				quotaIdentifier = identifier
+			}
+		}
 		out = append(out, RegisteredPluginInfo{
 			ID:            record.id,
 			Priority:      record.priority,
 			Metadata:      clonePluginMetadata(record.meta),
 			SupportsOAuth: authProvider != nil,
 			OAuthProvider: oauthProvider,
+			SupportsQuota: quotaProvider != nil,
+			QuotaProvider: quotaIdentifier,
 			Menus:         menusByPlugin[record.id],
 		})
 	}
@@ -155,6 +172,15 @@ func cloneConfigFields(fields []pluginapi.ConfigField) []pluginapi.ConfigField {
 	copy(out, fields)
 	for index := range out {
 		out[index].EnumValues = append([]string(nil), fields[index].EnumValues...)
+		out[index].Default = cloneConfigFieldValue(fields[index].Default)
 	}
 	return out
+}
+
+func cloneConfigFieldValue(value any) any {
+	if value == nil {
+		return nil
+	}
+	visited := make(map[metadataCloneVisit]reflect.Value)
+	return cloneInterceptorMetadataAny(reflect.ValueOf(value), visited)
 }
