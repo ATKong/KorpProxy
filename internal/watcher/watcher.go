@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	"gopkg.in/yaml.v3"
 
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -38,6 +38,7 @@ type Watcher struct {
 	authRescanMu      sync.Mutex
 	configReloadMu    sync.Mutex
 	configReloadTimer *time.Timer
+	configApplyMu     sync.Mutex // Serializes config file reloads so they apply in file order.
 	serverUpdateMu    sync.Mutex
 	serverUpdateTimer *time.Timer
 	serverUpdateLast  time.Time
@@ -78,10 +79,35 @@ const (
 
 // AuthUpdate describes an incremental change to auth configuration.
 type AuthUpdate struct {
-	Action   AuthUpdateAction
-	ID       string
-	Auth     *coreauth.Auth
-	revision uint64 // Watcher-local ordering, independent of runtime auth generations.
+	Action      AuthUpdateAction
+	ID          string
+	Auth        *coreauth.Auth
+	revision    uint64 // Watcher-local ordering, independent of runtime auth generations.
+	fileRemoval bool   // The source file was removed, not just an ID from its content.
+}
+
+// IsFileRemoval reports whether this delete was observed as a whole-file removal.
+func (u AuthUpdate) IsFileRemoval() bool {
+	return u.fileRemoval
+}
+
+// SetFileRemoval marks a delete as a whole-file removal rather than a per-ID diff.
+func (u *AuthUpdate) SetFileRemoval(fileRemoval bool) {
+	if u != nil {
+		u.fileRemoval = fileRemoval
+	}
+}
+
+// Revision returns the monotonic watcher revision assigned to this update.
+func (u AuthUpdate) Revision() uint64 {
+	return u.revision
+}
+
+// SetRevision updates the revision counter for this update.
+func (u *AuthUpdate) SetRevision(rev uint64) {
+	if u != nil {
+		u.revision = rev
+	}
 }
 
 const (
@@ -139,10 +165,11 @@ func (w *Watcher) Stop() error {
 
 // SetConfig updates the current configuration
 func (w *Watcher) SetConfig(cfg *config.Config) {
+	cloned := cfg.CloneForRuntime()
 	w.clientsMutex.Lock()
 	defer w.clientsMutex.Unlock()
-	w.config = cfg
-	w.oldConfigYaml, _ = yaml.Marshal(cfg)
+	w.config = cloned
+	w.oldConfigYaml, _ = yaml.Marshal(cloned)
 }
 
 // SetPluginAuthParser updates the plugin auth parser used for file auth synthesis.
@@ -168,6 +195,12 @@ func (w *Watcher) DispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 // Returns true if the update was enqueued; false if no queue is configured.
 func (w *Watcher) DispatchPersistedAuthUpdate(update AuthUpdate) bool {
 	return w.dispatchPersistedAuthUpdate(update)
+}
+
+// DispatchPersistedAuthUpdateWithRevision pushes already-persisted file auth updates through the watcher queue
+// and returns the stamped monotonic revision.
+func (w *Watcher) DispatchPersistedAuthUpdateWithRevision(update *AuthUpdate) (bool, uint64) {
+	return w.dispatchPersistedAuthUpdateWithRevision(update)
 }
 
 // SnapshotCoreAuths converts current clients snapshot into core auth entries.
