@@ -2,9 +2,13 @@ package config
 
 import (
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
 	"gopkg.in/yaml.v3"
 )
 
@@ -107,21 +111,76 @@ func defaultPluginInstanceConfigNode() *yaml.Node {
 	}
 }
 
+// ClaudeConfig configures provider-wide Claude request behavior.
+type ClaudeConfig struct {
+	// ModelLevelCooling scopes Claude quota cooldowns to the requested model
+	// rather than cooling down the entire credential across all sibling models.
+	ModelLevelCooling bool `yaml:"model-level-cooling" json:"model-level-cooling"`
+	// ToolSearch enables Codex client tool_search on Claude Responses routes:
+	// Anthropic native tool search where the credential supports it, a pre-tool_search
+	// translation elsewhere, and per-credential search advertising in the Codex
+	// catalog. Default false keeps the translation that predates tool_search support.
+	ToolSearch bool `yaml:"tool-search" json:"tool-search"`
+	// SessionDatePinDays retains the cloaked currentDate pin per session for
+	// this many days, independently of continuity expiry and credential
+	// switches. A nil value (unset) defaults to 7 days; an explicit 0 keeps
+	// the continuity-scoped pin (1h lifetime).
+	SessionDatePinDays *int `yaml:"session-date-pin-days" json:"session-date-pin-days"`
+}
+
+// DefaultClaudeSessionDatePinDays is the session date pin retention applied
+// when session-date-pin-days is not configured.
+const DefaultClaudeSessionDatePinDays = 7
+
+// SessionDatePinRetention returns the configured session date pin retention.
+// An unset value defaults to 7 days; an explicit zero keeps the legacy
+// continuity-scoped behavior. Days are clamped so the duration cannot
+// overflow.
+func (c ClaudeConfig) SessionDatePinRetention() time.Duration {
+	days := DefaultClaudeSessionDatePinDays
+	if c.SessionDatePinDays != nil {
+		days = *c.SessionDatePinDays
+	}
+	if days <= 0 {
+		return 0
+	}
+	maxDays := int((time.Duration(math.MaxInt64) / (24 * time.Hour)))
+	if days > maxDays {
+		days = maxDays
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
 // ClaudeHeaderDefaults configures the measured Claude Code software baseline.
 // Verified native requests preserve their entrypoint and software shape only when their
 // Claude Code, package, and runtime versions exactly match this baseline; unmeasured
 // versions use the configured values. Timeout remains a fallback. Stabilized profiles
 // also pin OS and Arch and never learn newer software versions automatically.
+// AnthropicBetaStrip and AnthropicBetaAppend are exact-name operator overrides applied
+// to the final Anthropic-Beta set; InjectDiagnostics and ClientRequestID tune the
+// first-party Claude Code CLI request shape.
 type ClaudeHeaderDefaults struct {
-	UserAgent              string `yaml:"user-agent" json:"user-agent"`
-	PackageVersion         string `yaml:"package-version" json:"package-version"`
-	RuntimeVersion         string `yaml:"runtime-version" json:"runtime-version"`
-	OS                     string `yaml:"os" json:"os"`
-	Arch                   string `yaml:"arch" json:"arch"`
-	Timeout                string `yaml:"timeout" json:"timeout"`
-	Timezone               string `yaml:"timezone" json:"timezone"`
-	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+	UserAgent              string   `yaml:"user-agent" json:"user-agent"`
+	PackageVersion         string   `yaml:"package-version" json:"package-version"`
+	RuntimeVersion         string   `yaml:"runtime-version" json:"runtime-version"`
+	OS                     string   `yaml:"os" json:"os"`
+	Arch                   string   `yaml:"arch" json:"arch"`
+	Timeout                string   `yaml:"timeout" json:"timeout"`
+	Timezone               string   `yaml:"timezone" json:"timezone"`
+	StabilizeDeviceProfile *bool    `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+	AnthropicBetaStrip     []string `yaml:"anthropic-beta-strip,omitempty" json:"anthropic-beta-strip,omitempty"`
+	AnthropicBetaAppend    []string `yaml:"anthropic-beta-append,omitempty" json:"anthropic-beta-append,omitempty"`
+	InjectDiagnostics      *bool    `yaml:"inject-diagnostics,omitempty" json:"inject-diagnostics,omitempty"`
+	ClientRequestID        string   `yaml:"client-request-id,omitempty" json:"client-request-id,omitempty"`
 }
+
+// Supported ClaudeHeaderDefaults.ClientRequestID values. An empty value means
+// ClaudeClientRequestIDOn.
+const (
+	ClaudeClientRequestIDOn          = "on"
+	ClaudeClientRequestIDOff         = "off"
+	ClaudeClientRequestIDPassthrough = "passthrough"
+)
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
 // model requests for OAuth/file-backed auth when the client omits them.
@@ -135,6 +194,12 @@ type CodexHeaderDefaults struct {
 type XAIConfig struct {
 	// InjectXSearch injects xAI's native x_search tool when the request does not declare it.
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
+}
+
+// DevinConfig configures provider-wide Devin request behavior.
+type DevinConfig struct {
+	// SensitiveWords is a list of words to obfuscate with zero-width characters in system prompts and messages.
+	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 }
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
@@ -163,19 +228,33 @@ type AntigravityConnectionPoolConfig struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
-	// StreamBootstrapBuffering holds back initial handshake events (response.created,
-	// response.in_progress and the websocket metadata frames) until the first generated event
-	// arrives. The upstream delivers server_is_overloaded rejections inside an HTTP 200 stream
-	// right after those handshake events instead of returning 503 on the wire, so buffering them
-	// keeps the downstream response headers uncommitted long enough to retry on another credential.
-	// Trade-off: the response headers are delayed until the upstream starts generating, which can
-	// trip client or reverse-proxy read timeouts. Default is false.
+	// StreamBootstrapBuffering holds back the frames that arrive before generation starts, none of
+	// which the client has seen anything from - the handshake (response.created, response.in_progress,
+	// the websocket metadata frames), keepalive heartbeats, and the *.added announcements of an item
+	// or part that is still empty - until the first generated event arrives. The upstream delivers
+	// server_is_overloaded rejections inside an HTTP 200 stream right after those frames instead of
+	// returning 503 on the wire, so buffering them keeps the downstream response headers uncommitted
+	// long enough to retry on another credential. Trade-off: the response headers are delayed until
+	// the upstream starts generating, which on a slow reasoning turn now means several heartbeat
+	// intervals rather than one, and can trip client or reverse-proxy read timeouts. The hold is
+	// bounded by a frame and a byte budget, not by wall-clock time, and neither budget is advanced
+	// by a websocket peer that sends only control frames or by an upstream that never terminates an
+	// SSE line. Only overload and rate-limit rejections fail over deliberately. A stream that ends
+	// while the bootstrap is still holding ends the attempt rather than reaching the client, and
+	// what follows is pre-existing but now far more likely, since the hold can span the whole
+	// reasoning phase instead of ending at the first keepalive: a clean end with no terminal event
+	// is request-scoped on SSE and stops there, while a websocket close or a transport error on
+	// either transport is not, so the request may be retried on another credential.
+	// Default is false.
 	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
-	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests.
-	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
+	// StreamBootstrapTimeout specifies an optional maximum duration to hold back uncommitted response
+	// headers during bootstrap buffering before releasing the stream to the client.
+	// Defaults to "0" (unlimited time, relying purely on the 48-frame and 1MB byte bounds).
+	// When set (e.g. "20s"), the stream is released once the time ceiling is reached, avoiding
+	// reverse-proxy timeouts (e.g. Nginx 60s proxy_read_timeout).
+	StreamBootstrapTimeout string `yaml:"stream-bootstrap-timeout,omitempty" json:"stream-bootstrap-timeout,omitempty"`
 	// OrphanDelegationCompatibility enables opt-in compatibility for orphan Codex delegation outputs.
 	OrphanDelegationCompatibility bool `yaml:"orphan-delegation-compatibility" json:"orphan-delegation-compatibility"`
 	// ModelLevelCooling scopes Codex usage_limit_reached quota cooldowns to the requested model
@@ -183,6 +262,56 @@ type CodexConfig struct {
 	ModelLevelCooling bool `yaml:"model-level-cooling" json:"model-level-cooling"`
 	// LiveMediaRelay terminates and relays Codex Live WebRTC media in this process.
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
+	// ResponseSteering enables full-duplex Codex WebSockets, bound to one
+	// upstream model/account/socket for their entire lifetime. Default is false.
+	ResponseSteering bool `yaml:"response-steering" json:"response-steering"`
+	// SignInWithChatGPTIdentifier configures the identifier (agent_name_hint and User-Agent prefix)
+	// for Codex Sign in with ChatGPT (SIWC) OAuth authorization and API requests.
+	// Defaults to "CLIProxyAPI".
+	SignInWithChatGPTIdentifier string `yaml:"signin-with-chatgpt-identifier,omitempty" json:"signin-with-chatgpt-identifier,omitempty"`
+}
+
+// DefaultSignInWithChatGPTIdentifier is the default identifier (agent_name_hint and User-Agent prefix)
+// used for Codex Sign in with ChatGPT (SIWC) OAuth authorization and API requests.
+const DefaultSignInWithChatGPTIdentifier = "CLIProxyAPI"
+
+// EffectiveSignInWithChatGPTIdentifier returns the configured Sign in with ChatGPT
+// identifier, or DefaultSignInWithChatGPTIdentifier when unset or blank.
+func (c CodexConfig) EffectiveSignInWithChatGPTIdentifier() string {
+	if v := strings.TrimSpace(c.SignInWithChatGPTIdentifier); v != "" {
+		return v
+	}
+	return DefaultSignInWithChatGPTIdentifier
+}
+
+// DefaultCodexStreamBootstrapTimeout is the default maximum duration to buffer bootstrap events.
+// By default, it is 0 (unlimited time, relying purely on the 48-frame and 1MB byte bounds).
+const DefaultCodexStreamBootstrapTimeout = 0
+
+const maxBootstrapTimeoutSeconds = int64(math.MaxInt64 / time.Second)
+
+// StreamBootstrapTimeoutDuration returns the maximum duration to buffer bootstrap events.
+// Defaults to 0 (unlimited time, relying purely on the 48-frame and 1MB byte bounds).
+// If explicitly set to a positive duration (e.g. "10s", "500ms", "15"), returns that duration.
+// If set to "0", "0s", "none", "unlimited", "disabled", "off", "never", or invalid strings, returns 0.
+func (c *CodexConfig) StreamBootstrapTimeoutDuration() time.Duration {
+	if c == nil {
+		return DefaultCodexStreamBootstrapTimeout
+	}
+	raw := strings.TrimSpace(c.StreamBootstrapTimeout)
+	if raw == "" || raw == "0" || strings.EqualFold(raw, "none") || strings.EqualFold(raw, "unlimited") || strings.EqualFold(raw, "disabled") || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "never") {
+		return 0
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+		return d
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 && int64(secs) <= maxBootstrapTimeoutSeconds {
+		d := time.Duration(secs) * time.Second
+		if d >= 0 {
+			return d
+		}
+	}
+	return DefaultCodexStreamBootstrapTimeout
 }
 
 // CodexLiveMediaRelayConfig configures the in-process Codex Live WebRTC gateway.
@@ -221,6 +350,36 @@ type PprofConfig struct {
 	Addr string `yaml:"addr" json:"addr"`
 }
 
+// DiscoveryInterfacesConfig specifies interface inclusion and exclusion rules.
+type DiscoveryInterfacesConfig struct {
+	Include []string `yaml:"include" json:"include"`
+	Exclude []string `yaml:"exclude" json:"exclude"`
+}
+
+// DiscoveryConfig controls local network mDNS / DNS-SD service advertising.
+type DiscoveryConfig struct {
+	// Enabled toggles mDNS service advertising on the local network (default: false).
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// ServiceName is the optional custom instance name. When empty, defaults to CPA-<ShortID>.
+	ServiceName string `yaml:"service-name" json:"service-name"`
+
+	// ServiceType is the DNS-SD service type (default: _ai-gateway._tcp).
+	ServiceType string `yaml:"service-type" json:"service-type"`
+
+	// Subtypes specifies DNS-SD API protocol subtypes to advertise (e.g. _responses, _messages, _generate-content).
+	Subtypes []string `yaml:"subtypes" json:"subtypes"`
+
+	// Interfaces specifies network interface filtering rules.
+	Interfaces DiscoveryInterfacesConfig `yaml:"interfaces" json:"interfaces"`
+
+	// AuthRequired indicates whether authentication is required for client calls (default: true).
+	AuthRequired *bool `yaml:"auth-required" json:"auth-required"`
+
+	// AdvertiseManagement explicitly controls whether management endpoints are exposed (default: false).
+	AdvertiseManagement bool `yaml:"advertise-management" json:"advertise-management"`
+}
+
 // RemoteManagement holds management API configuration under 'remote-management'.
 type RemoteManagement struct {
 	// AllowRemote toggles remote (non-localhost) access to management API.
@@ -235,6 +394,8 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+	// BaseURL specifies the base URL of the remote management API for TUI client mode (e.g. "https://proxy.example.com").
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -275,6 +436,16 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+
+	// SessionAffinityRebindOn controls which credential failures rebind an established session
+	// to the failover credential.
+	// Supported values:
+	//   - "any" (default): any credential-attributed failure unbinds and rebinds on failover.
+	//   - "quota": transient errors (408, 5xx, empty stream, buffer limit) fail over for that
+	//     request only while keeping the session bound to its original credential; quota and
+	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
+	// Ignored when SessionAffinity is false.
+	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -290,6 +461,53 @@ type OAuthModelAlias struct {
 	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
+}
+
+// OAuthModelSetting defines provider/channel model settings (such as context window overrides) for OAuth credentials.
+type OAuthModelSetting struct {
+	Name  string `yaml:"name" json:"name"`
+	Alias string `yaml:"alias,omitempty" json:"alias,omitempty"`
+
+	// MaxContextLength overrides the context window advertised to Codex clients.
+	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
+}
+
+// GetMaxContextLength returns the configured maximum context length override.
+func (s OAuthModelSetting) GetMaxContextLength() int { return s.MaxContextLength }
+
+// ResolveOAuthModelSetting finds the best matching OAuthModelSetting for a given model.
+// An exact Alias match on the model ID takes precedence over a general Name match.
+// Within the same match specificity, later entries in the slice override earlier ones.
+func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID, metadataModelID, modelName string) *OAuthModelSetting {
+	if len(settings) == 0 {
+		return nil
+	}
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	metaID := strings.ToLower(strings.TrimSpace(metadataModelID))
+	name := strings.ToLower(strings.TrimSpace(modelName))
+
+	var aliasMatch *OAuthModelSetting
+	var nameMatch *OAuthModelSetting
+
+	for i := range settings {
+		entry := &settings[i]
+		entryName := strings.ToLower(strings.TrimSpace(entry.Name))
+		if entryName == "" {
+			continue
+		}
+		entryAlias := strings.ToLower(strings.TrimSpace(entry.Alias))
+
+		if entryAlias != "" && id != "" && id == entryAlias {
+			aliasMatch = entry
+		} else if (entryAlias == "" || entryAlias == id) && (id == entryName || (metaID != "" && metaID == entryName) || (name != "" && name == entryName)) {
+			nameMatch = entry
+		}
+	}
+
+	if aliasMatch != nil {
+		return aliasMatch
+	}
+	return nameMatch
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
@@ -402,6 +620,11 @@ type ClaudeKey struct {
 
 	// RebuildMidSystemMessage moves Claude messages with role "system" into the top-level system field.
 	RebuildMidSystemMessage bool `yaml:"rebuild-mid-system-message,omitempty" json:"rebuild-mid-system-message,omitempty"`
+
+	// NativeToolSearch trusts a custom base URL with Anthropic native tool search
+	// (defer_loading tools and tool_reference results) for Codex tool_search.
+	// Official api.anthropic.com credentials use native tool search without it.
+	NativeToolSearch bool `yaml:"native-tool-search,omitempty" json:"native-tool-search,omitempty"`
 
 	// DisableCooling overrides the global cooling policy for this credential when set.
 	// True disables auth/model cooldowns; false explicitly enables them.
@@ -525,6 +748,10 @@ type CodexKey struct {
 	// True disables auth/model cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
+	// DisableCodexCloaking optionally overrides the global codex.disable-codex-cloaking for this credential.
+	// True disables cloaking; false explicitly enables cloaking; omitted inherits global codex.disable-codex-cloaking.
+	DisableCodexCloaking *bool `yaml:"disable-codex-cloaking,omitempty" json:"disable-codex-cloaking,omitempty"`
+
 	// RequestRetry optionally overrides the global request-retry for this credential.
 	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
@@ -559,11 +786,15 @@ type CodexModel struct {
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 
 	// IsCompat converts Codex MultiAgentV2 agent_message items into portable
-	// Responses message/user input when codex.optimize-multi-agent-v2 is also true.
+	// Responses message/user input when client.codex.optimize-multi-agent-v2 is also true.
 	// Use this for third-party Responses-compatible endpoints that do not accept
 	// native agent_message items or empty-signature thinking blocks. Default false
 	// keeps the native behavior unchanged.
 	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
+
+	// SupportConfigurationUpdate enables configuration_update for this API-key model.
+	// It defaults to false, independently of the built-in OAuth model catalog.
+	SupportConfigurationUpdate bool `yaml:"support-configuration-update,omitempty" json:"support-configuration-update,omitempty"`
 
 	// Thinking configures the thinking/reasoning capability for this model.
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
@@ -585,6 +816,12 @@ type XAIKey = CodexKey
 
 // XAIModel uses the Codex model mapping structure for xAI models.
 type XAIModel = CodexModel
+
+// MetaKey uses the Codex API key structure for native Meta Muse execution.
+type MetaKey = CodexKey
+
+// MetaModel uses the Codex model mapping structure for Meta Muse models.
+type MetaModel = CodexModel
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
@@ -762,6 +999,10 @@ type OpenAICompatibilityModel struct {
 	// Default false keeps the normal signature validation behavior.
 	IsCompat bool `yaml:"is-compat,omitempty" json:"is-compat,omitempty"`
 
+	// UseMaxCompletionTokens emits max_completion_tokens instead of legacy max_tokens for this model.
+	// Default false preserves max_tokens for older compatible upstreams.
+	UseMaxCompletionTokens bool `yaml:"use-max-completion-tokens,omitempty" json:"use-max-completion-tokens,omitempty"`
+
 	// Thinking configures the thinking/reasoning capability for this model.
 	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
@@ -771,9 +1012,10 @@ func (m OpenAICompatibilityModel) GetName() string { return m.Name }
 
 func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
 
-func (m OpenAICompatibilityModel) GetDisplayName() string   { return m.DisplayName }
-func (m OpenAICompatibilityModel) GetMaxContextLength() int { return m.MaxContextLength }
-func (m OpenAICompatibilityModel) GetForceMapping() bool    { return m.ForceMapping }
-func (m OpenAICompatibilityModel) GetIsCompat() bool        { return m.IsCompat }
+func (m OpenAICompatibilityModel) GetDisplayName() string          { return m.DisplayName }
+func (m OpenAICompatibilityModel) GetMaxContextLength() int        { return m.MaxContextLength }
+func (m OpenAICompatibilityModel) GetForceMapping() bool           { return m.ForceMapping }
+func (m OpenAICompatibilityModel) GetIsCompat() bool               { return m.IsCompat }
+func (m OpenAICompatibilityModel) GetUseMaxCompletionTokens() bool { return m.UseMaxCompletionTokens }
 
 func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
