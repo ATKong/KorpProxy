@@ -10,21 +10,26 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 type UsageReporter struct {
+	requestID           string
+	traceID             string
 	provider            string
+	baseURL             string
 	executorType        string
 	model               string
 	alias               string
@@ -34,6 +39,8 @@ type UsageReporter struct {
 	accessTokenHash     string
 	authType            string
 	apiKey              string
+	accessProvider      string
+	isNativeKey         bool
 	sessionID           string
 	parentSessionID     string
 	source              string
@@ -49,6 +56,18 @@ type UsageReporter struct {
 	ttftStart           time.Time
 	ttftSet             bool
 	once                sync.Once
+
+	responseModelMu sync.RWMutex
+	// responseModel holds the latest model name reported by the upstream response.
+	responseModel string
+	// responseModelFinal marks that a terminal event already reported the served
+	// model, so later frames skip parsing entirely.
+	responseModelFinal atomic.Bool
+
+	upstreamModelMu sync.RWMutex
+	// upstreamModel holds the canonical upstream model expected to be served when
+	// it differs from the requested model (e.g. local Kimi model mappings).
+	upstreamModel string
 }
 
 type usageExecutor interface {
@@ -67,6 +86,13 @@ func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model
 
 func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
 	apiKey := APIKeyFromContext(ctx)
+	accessProvider := AccessProviderFromContext(ctx)
+	isNativeKey := false
+	if nativeExplicit, ok := usage.IsNativeKeyFromContext(ctx); ok {
+		isNativeKey = nativeExplicit
+	} else if accessProvider != "" {
+		isNativeKey = usage.IsNativeAccessProvider(accessProvider)
+	}
 	alias := usage.RequestedModelAliasFromContext(ctx)
 	if alias == "" {
 		alias = model
@@ -81,12 +107,32 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 			parentSessionID = ""
 		}
 	}
+	baseURL := ""
+	if auth != nil {
+		if auth.Attributes != nil {
+			baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+		}
+		if baseURL == "" && auth.Metadata != nil {
+			if v, ok := auth.Metadata["base_url"].(string); ok {
+				baseURL = strings.TrimSpace(v)
+			}
+		}
+	}
+	traceID := usage.TraceIDFromContext(ctx)
+	if traceID == "" {
+		traceID = internallogging.GetRequestID(ctx)
+	}
 	reporter := &UsageReporter{
+		requestID:       uuid.NewString(),
+		traceID:         traceID,
 		provider:        provider,
+		baseURL:         baseURL,
 		model:           model,
 		alias:           strings.TrimSpace(alias),
 		requestedAt:     time.Now(),
 		apiKey:          apiKey,
+		accessProvider:  accessProvider,
+		isNativeKey:     isNativeKey,
 		sessionID:       sessionID,
 		parentSessionID: parentSessionID,
 		source:          resolveUsageSource(auth, apiKey),
@@ -160,6 +206,118 @@ func (r *UsageReporter) accessTokenFingerprint() string {
 	r.authMu.RLock()
 	defer r.authMu.RUnlock()
 	return r.accessTokenHash
+}
+
+// ObserveResponseModel stores the model reported by an upstream response or event and
+// ignores payloads without one; the substitution warning is emitted at publish time.
+func (r *UsageReporter) ObserveResponseModel(payload []byte) {
+	if r == nil || r.responseModelFinal.Load() {
+		return
+	}
+	provider := ""
+	if r != nil {
+		provider = r.provider
+	}
+	served, terminal := extractResponseModelEvent(payload, provider)
+	if served == "" {
+		if terminal {
+			r.responseModelFinal.Store(true)
+		}
+		return
+	}
+	r.responseModelMu.Lock()
+	r.responseModel = served
+	r.responseModelMu.Unlock()
+	if terminal {
+		r.responseModelFinal.Store(true)
+	}
+}
+
+// SetResponseModel sets the reported model directly if valid and not already marked final.
+func (r *UsageReporter) SetResponseModel(model string) {
+	if r == nil || r.responseModelFinal.Load() {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" || len(model) > maxResponseModelLength {
+		return
+	}
+	r.responseModelMu.Lock()
+	r.responseModel = model
+	r.responseModelMu.Unlock()
+}
+
+// SetUpstreamModel records the upstream model expected to be served when it differs
+// from the requested model (e.g. due to provider-specific mapping or canonicalization).
+// Model substitution detection compares the response against this upstream model,
+// while usage accounting preserves the client's requested model.
+func (r *UsageReporter) SetUpstreamModel(model string) {
+	if r == nil {
+		return
+	}
+	r.upstreamModelMu.Lock()
+	r.upstreamModel = strings.TrimSpace(model)
+	r.upstreamModelMu.Unlock()
+}
+
+// UpstreamModel returns the expected upstream model, or an empty string if not explicitly set.
+func (r *UsageReporter) UpstreamModel() string {
+	if r == nil {
+		return ""
+	}
+	r.upstreamModelMu.RLock()
+	defer r.upstreamModelMu.RUnlock()
+	return r.upstreamModel
+}
+
+// IsResponseModelFinal reports whether the response model was already finalized by a terminal event.
+func (r *UsageReporter) IsResponseModelFinal() bool {
+	return r != nil && r.responseModelFinal.Load()
+}
+
+// warnModelSubstitution warns about a silent upstream model swap, and labels the
+// credential by index only, never by account.
+func (r *UsageReporter) warnModelSubstitution(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	served := r.ResponseModel()
+	expectedModel := r.UpstreamModel()
+	if expectedModel == "" {
+		expectedModel = r.model
+	}
+	if served == "" || !IsModelSubstituted(expectedModel, served) {
+		return
+	}
+	if r.model != "" && !IsModelSubstituted(r.model, served) {
+		return
+	}
+	providerName := strings.TrimSpace(r.provider)
+	if providerName == "" {
+		providerName = "unknown"
+	}
+	LogWithRequestID(ctx).Warnf("%s executor: upstream served model %q for requested model %q (auth_index=%s)", providerName, served, r.model, r.authIndexForLog())
+}
+
+// authIndexForLog labels the credential without exposing its file name or account.
+func (r *UsageReporter) authIndexForLog() string {
+	if r == nil {
+		return "nil"
+	}
+	if authIndex := strings.TrimSpace(r.authIndex); authIndex != "" {
+		return authIndex
+	}
+	return "nil"
+}
+
+// ResponseModel returns the latest model reported by the upstream response.
+func (r *UsageReporter) ResponseModel() string {
+	if r == nil {
+		return ""
+	}
+	r.responseModelMu.RLock()
+	defer r.responseModelMu.RUnlock()
+	return r.responseModel
 }
 
 func ExecutorTypeName(executor any) string {
@@ -353,7 +511,9 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 	if !hasNonZeroTokenUsage(detail) {
 		return usage.Record{}, false
 	}
-	return r.buildRecordForModel(model, detail, false, usage.Failure{}), true
+	rec := r.buildRecordForModel(model, detail, false, usage.Failure{})
+	rec.RequestID = uuid.NewString()
+	return rec, true
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
@@ -379,7 +539,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	r.once.Do(func() {
-		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
+		r.publishAttemptRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
 
@@ -407,13 +567,52 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 		return
 	}
 	r.once.Do(func() {
-		r.publishRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
+		r.publishAttemptRecord(ctx, r.buildRecord(usage.Detail{}, false, usage.Failure{}))
 	})
+}
+
+// publishAttemptRecord emits the record for one upstream attempt and the
+// observability warnings that belong to the attempt rather than to a single event.
+func (r *UsageReporter) publishAttemptRecord(ctx context.Context, record usage.Record) {
+	r.publishRecord(ctx, record)
+	r.warnModelSubstitution(ctx)
 }
 
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
 	usage.PublishRecord(ctx, record)
+}
+
+// RequestID returns the execution instance request ID for this reporter.
+func (r *UsageReporter) RequestID() string {
+	if r == nil {
+		return ""
+	}
+	return r.requestID
+}
+
+// TraceID returns the parent inbound request ID for this reporter.
+func (r *UsageReporter) TraceID() string {
+	if r == nil {
+		return ""
+	}
+	return r.traceID
+}
+
+// IsNativeKey reports whether the client API key was authenticated by CPA's native config provider.
+func (r *UsageReporter) IsNativeKey() bool {
+	if r == nil {
+		return false
+	}
+	return r.isNativeKey
+}
+
+// AccessProvider identifies the client request authentication provider.
+func (r *UsageReporter) AccessProvider() string {
+	if r == nil {
+		return ""
+	}
+	return r.accessProvider
 }
 
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool, failures ...usage.Failure) usage.Record {
@@ -431,13 +630,24 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	if r == nil {
 		return usage.Record{Model: model, Detail: detail, Failed: failed, Fail: fail, Generate: usage.GenerateFlag(true)}
 	}
+	// Additional-model records describe a side model (image generation tool usage) that
+	// the upstream response model never refers to, so they must stay empty.
+	responseModel := ""
+	if model == r.model {
+		responseModel = r.ResponseModel()
+	}
 	return usage.Record{
+		RequestID:           r.requestID,
+		TraceID:             r.traceID,
 		Provider:            r.provider,
+		BaseURL:             r.baseURL,
 		ExecutorType:        r.executorType,
 		Model:               model,
 		Alias:               r.alias,
 		Source:              r.source,
 		APIKey:              r.apiKey,
+		IsNativeKey:         r.isNativeKey,
+		AccessProvider:      r.accessProvider,
 		SessionID:           r.sessionID,
 		ParentSessionID:     r.parentSessionID,
 		AuthID:              r.authID,
@@ -447,6 +657,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		ReasoningEffort:     r.reasoning,
 		ServiceTier:         r.serviceTier,
 		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
+		ResponseModel:       responseModel,
 		Generate:            usage.GenerateFlag(r.generate),
 		Stream:              r.stream,
 		RequestedAt:         r.requestedAt,
@@ -584,6 +795,31 @@ func APIKeyFromContext(ctx context.Context) string {
 	return ""
 }
 
+// AccessProviderFromContext extracts the client authentication provider identifier from the context.
+func AccessProviderFromContext(ctx context.Context) string {
+	if provider := usage.AccessProviderFromContext(ctx); provider != "" {
+		return provider
+	}
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	if v, exists := ginCtx.Get("accessProvider"); exists {
+		switch value := v.(type) {
+		case string:
+			return strings.TrimSpace(value)
+		case fmt.Stringer:
+			return strings.TrimSpace(value.String())
+		default:
+			return strings.TrimSpace(fmt.Sprintf("%v", value))
+		}
+	}
+	return ""
+}
+
 func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 	if auth != nil {
 		provider := strings.TrimSpace(auth.Provider)
@@ -632,8 +868,9 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 
 // StreamUsageBuffer keeps the latest usage detail observed in a stream.
 type StreamUsageBuffer struct {
-	detail usage.Detail
-	ok     bool
+	detail        usage.Detail
+	ok            bool
+	responseModel string
 }
 
 var (
@@ -673,6 +910,11 @@ func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
 	hasUsageCandidate := bytes.Contains(payload, openAIStreamUsageMarker)
 	needTier := b.detail.ResponseServiceTier == "" || hasUsageCandidate
 	hasTierCandidate := needTier && bytes.Contains(payload, openAIStreamServiceTierMarker)
+	if b.responseModel == "" {
+		if model, _ := extractGenericResponseModelEvent(payload); model != "" {
+			b.responseModel = model
+		}
+	}
 	if !hasUsageCandidate && !hasTierCandidate {
 		return
 	}
@@ -700,6 +942,13 @@ func (b *StreamUsageBuffer) ObserveClaudeStream(line []byte) {
 	if b == nil {
 		return
 	}
+	if b.responseModel == "" {
+		if payload := jsonPayload(line); len(payload) > 0 {
+			if model, _ := extractClaudeResponseModelEvent(payload); model != "" {
+				b.responseModel = model
+			}
+		}
+	}
 	if detail, ok := ParseClaudeStreamUsage(line); ok {
 		ObserveMergedStreamUsage(b, detail)
 	}
@@ -710,6 +959,9 @@ func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter
 	if b == nil || !b.ok || reporter == nil {
 		return false
 	}
+	if b.responseModel != "" && reporter.ResponseModel() == "" {
+		reporter.SetResponseModel(b.responseModel)
+	}
 	reporter.Publish(ctx, b.detail)
 	return true
 }
@@ -718,6 +970,9 @@ func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter
 func (b *StreamUsageBuffer) PublishFailure(ctx context.Context, reporter *UsageReporter, errs ...error) bool {
 	if b == nil || reporter == nil {
 		return false
+	}
+	if b.responseModel != "" && reporter.ResponseModel() == "" {
+		reporter.SetResponseModel(b.responseModel)
 	}
 	reporter.PublishFailureWithDetail(ctx, b.detail, errs...)
 	return true
@@ -729,6 +984,14 @@ func (b *StreamUsageBuffer) Detail() (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	return b.detail, true
+}
+
+// ResponseModel returns the latest model observed in the stream buffer.
+func (b *StreamUsageBuffer) ResponseModel() string {
+	if b == nil {
+		return ""
+	}
+	return b.responseModel
 }
 
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {
@@ -783,7 +1046,8 @@ func hasOpenAIStyleUsageBucketFields(usageNode gjson.Result) bool {
 		usageNode.Get("input_tokens_details.cache_write_tokens").Exists() ||
 		usageNode.Get("input_tokens_details.cache_creation_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
-		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
+		usageNode.Get("output_tokens_details.reasoning_tokens").Exists() ||
+		usageNode.Get("reasoning_tokens").Exists()
 }
 
 func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
@@ -821,6 +1085,10 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {
 		reasoning = usageNode.Get("output_tokens_details.reasoning_tokens")
+	}
+	if !reasoning.Exists() {
+		// Flat dialect (e.g. SGLang): usage.reasoning_tokens at top level.
+		reasoning = usageNode.Get("reasoning_tokens")
 	}
 	if reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
