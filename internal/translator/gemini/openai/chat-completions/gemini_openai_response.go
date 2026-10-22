@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -24,10 +24,11 @@ import (
 type convertGeminiResponseToOpenAIChatParams struct {
 	UnixTimestamp int64
 	// FunctionIndex tracks tool call indices per candidate index to support multiple candidates.
-	FunctionIndex        map[int]int
-	SawToolCall          map[int]bool
-	UpstreamFinishReason map[int]string
-	SanitizedNameMap     map[string]string
+	FunctionIndex            map[int]int
+	SawToolCall              map[int]bool
+	UpstreamFinishReason     map[int]string
+	SanitizedNameMap         map[string]string
+	SanitizedNameMapResolved bool
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -51,11 +52,12 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	// Initialize parameters if nil.
 	if *param == nil {
 		*param = &convertGeminiResponseToOpenAIChatParams{
-			UnixTimestamp:        0,
-			FunctionIndex:        make(map[int]int),
-			SawToolCall:          make(map[int]bool),
-			UpstreamFinishReason: make(map[int]string),
-			SanitizedNameMap:     util.SanitizedToolNameMap(originalRequestRawJSON),
+			UnixTimestamp:            0,
+			FunctionIndex:            make(map[int]int),
+			SawToolCall:              make(map[int]bool),
+			UpstreamFinishReason:     make(map[int]string),
+			SanitizedNameMap:         util.SanitizedToolNameMap(originalRequestRawJSON),
+			SanitizedNameMapResolved: true,
 		}
 	}
 
@@ -70,8 +72,11 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	if p.UpstreamFinishReason == nil {
 		p.UpstreamFinishReason = make(map[int]string)
 	}
-	if p.SanitizedNameMap == nil {
-		p.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
+	if !p.SanitizedNameMapResolved {
+		if p.SanitizedNameMap == nil {
+			p.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
+		}
+		p.SanitizedNameMapResolved = true
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
@@ -111,7 +116,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	// Usage is applied to the base template so it appears in the chunks.
 	if usageResult := gjson.GetBytes(rawJSON, "usageMetadata"); usageResult.Exists() {
 		cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
-		baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.completion_tokens", usageResult.Get("candidatesTokenCount").Int())
+		baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.completion_tokens", usageResult.Get("candidatesTokenCount").Int()+usageResult.Get("thoughtsTokenCount").Int())
 		if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
 			baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.total_tokens", totalTokenCountResult.Int())
 		}
@@ -171,6 +176,13 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 					thoughtSignatureResult := partResult.Get("thoughtSignature")
 					if !thoughtSignatureResult.Exists() {
 						thoughtSignatureResult = partResult.Get("thought_signature")
+					}
+
+					// Speech-to-text models (gemini-3.5-transcribe) deliver the
+					// transcript in an audioTranscription part instead of text.
+					audioTranscriptionResult := partResult.Get("audioTranscription")
+					if audioTranscriptionResult.Exists() && !partTextResult.Exists() {
+						partTextResult = audioTranscriptionResult.Get("text")
 					}
 
 					hasThoughtSignature := thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != ""
@@ -311,7 +323,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 	}
 
 	if usageResult := gjson.GetBytes(rawJSON, "usageMetadata"); usageResult.Exists() {
-		template, _ = sjson.SetBytes(template, "usage.completion_tokens", usageResult.Get("candidatesTokenCount").Int())
+		template, _ = sjson.SetBytes(template, "usage.completion_tokens", usageResult.Get("candidatesTokenCount").Int()+usageResult.Get("thoughtsTokenCount").Int())
 		if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.total_tokens", totalTokenCountResult.Int())
 		}
@@ -369,6 +381,13 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 						inlineDataResult = partResult.Get("inline_data")
 					}
 
+					// Speech-to-text models (gemini-3.5-transcribe) deliver the
+					// transcript in an audioTranscription part instead of text.
+					audioTranscriptionResult := partResult.Get("audioTranscription")
+					if audioTranscriptionResult.Exists() && !partTextResult.Exists() {
+						partTextResult = audioTranscriptionResult.Get("text")
+					}
+
 					if partTextResult.Exists() {
 						// Append text content, distinguishing between regular content and reasoning.
 						if partResult.Get("thought").Bool() {
@@ -409,11 +428,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 				}
 
 				if hasTextContent {
-					if !hasReasoningContent && len(partsResults) == 1 && len(toolCalls) == 0 && len(images) == 0 {
-						choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.content", partsResults[0].Get("text").String())
-					} else {
-						choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.content", textContent.String())
-					}
+					choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.content", textContent.String())
 				}
 				if hasReasoningContent {
 					choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.reasoning_content", reasoningContent.String())

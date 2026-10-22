@@ -14,15 +14,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 const (
+<<<<<<< HEAD
 	// Anthropic gates newer models (e.g. Fable 5.1) behind a minimum Claude
 	// Code version, so the baseline must stay at or above that floor.
 	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.258 (external, cli)"
+=======
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.280 (external, cli)"
+>>>>>>> v8.0.38
 	defaultClaudeFingerprintPackageVersion = "0.112.1"
 	defaultClaudeFingerprintRuntimeVersion = "v26.3.0"
 	defaultClaudeFingerprintOS             = "MacOS"
@@ -214,8 +218,59 @@ func shouldUpgradeClaudeDeviceProfile(candidate, current ClaudeDeviceProfile) bo
 	return candidate.version.Compare(current.version) > 0
 }
 
+// plausibleClaudeCLIVersion treats the baseline as a floor for patch releases.
+// Claude Code auto-updates in the background; allow newer patch versions in the
+// same major/minor line to preserve native passthrough and prompt caching.
 func plausibleClaudeCLIVersion(candidate, baseline claudeCLIVersion) bool {
-	return candidate.Compare(baseline) == 0
+	return candidate.major == baseline.major &&
+		candidate.minor == baseline.minor &&
+		candidate.patch >= baseline.patch
+}
+
+func parseClaudeSemver(raw string) (claudeCLIVersion, bool) {
+	parts := strings.Split(strings.TrimSpace(raw), ".")
+	if len(parts) != 3 {
+		return claudeCLIVersion{}, false
+	}
+	major, errMajor := strconv.Atoi(parts[0])
+	if errMajor != nil {
+		return claudeCLIVersion{}, false
+	}
+	minor, errMinor := strconv.Atoi(parts[1])
+	if errMinor != nil {
+		return claudeCLIVersion{}, false
+	}
+	patch, errPatch := strconv.Atoi(parts[2])
+	if errPatch != nil {
+		return claudeCLIVersion{}, false
+	}
+	return claudeCLIVersion{major: major, minor: minor, patch: patch}, true
+}
+
+func plausibleClaudePackageVersion(candidate, baseline string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if !claudePackageVersionPattern.MatchString(candidate) {
+		return false
+	}
+	candVer, okCand := parseClaudeSemver(candidate)
+	baseVer, okBase := parseClaudeSemver(baseline)
+	if !okCand || !okBase {
+		return candidate == strings.TrimSpace(baseline)
+	}
+	return candVer.Compare(baseVer) >= 0
+}
+
+func plausibleClaudeRuntimeVersion(candidate, baseline string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if !claudeRuntimeVersionPattern.MatchString(candidate) {
+		return false
+	}
+	candVer, okCand := parseClaudeSemver(strings.TrimPrefix(candidate, "v"))
+	baseVer, okBase := parseClaudeSemver(strings.TrimPrefix(strings.TrimSpace(baseline), "v"))
+	if !okCand || !okBase {
+		return candidate == strings.TrimSpace(baseline)
+	}
+	return candVer.Compare(baseVer) >= 0
 }
 
 func meetsClaudeDeviceProfileBaseline(candidate, baseline ClaudeDeviceProfile) bool {
@@ -225,7 +280,7 @@ func meetsClaudeDeviceProfileBaseline(candidate, baseline ClaudeDeviceProfile) b
 	if baseline.UserAgent == "" || !baseline.hasVersion {
 		return false
 	}
-	return plausibleClaudeCLIVersion(candidate.version, baseline.version) &&
+	return candidate.version.Compare(baseline.version) == 0 &&
 		candidate.PackageVersion == baseline.PackageVersion &&
 		candidate.RuntimeVersion == baseline.RuntimeVersion
 }
@@ -585,14 +640,14 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 	r.Header.Set("X-Stainless-Arch", profile.Arch)
 }
 
-// DefaultClaudeVersion returns the version string (e.g. "2.1.258") from the
+// DefaultClaudeVersion returns the version string (e.g. "2.1.280") from the
 // current baseline device profile. It extracts the version from the User-Agent.
 func DefaultClaudeVersion(cfg *config.Config) string {
 	profile := defaultClaudeDeviceProfile(cfg)
 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
 		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
 	}
-	return "2.1.258"
+	return "2.1.280"
 }
 
 func ApplyClaudeDefaultDeviceProfileHeaders(r *http.Request, cfg *config.Config) {
@@ -616,8 +671,20 @@ func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg
 	}
 
 	if confirmedClaudeCode {
-		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, func(value string) bool { return value == profile.RuntimeVersion })
-		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, func(value string) bool { return value == profile.PackageVersion })
+		validRuntime := func(value string) bool {
+			if cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion) != "" {
+				return value == profile.RuntimeVersion
+			}
+			return plausibleClaudeRuntimeVersion(value, profile.RuntimeVersion)
+		}
+		validPackage := func(value string) bool {
+			if cfg != nil && strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion) != "" {
+				return value == profile.PackageVersion
+			}
+			return plausibleClaudePackageVersion(value, profile.PackageVersion)
+		}
+		miscEnsure("X-Stainless-Runtime-Version", profile.RuntimeVersion, validRuntime)
+		miscEnsure("X-Stainless-Package-Version", profile.PackageVersion, validPackage)
 		miscEnsure("X-Stainless-Os", mapStainlessOS(), nil)
 		miscEnsure("X-Stainless-Arch", mapStainlessArch(), nil)
 		if clientUA := strings.TrimSpace(ginHeaders.Get("User-Agent")); plausibleClaudeCodeUserAgent(clientUA, cfg) {
