@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -30,14 +32,19 @@ var (
 	errOAuthSessionExists     = errors.New("oauth session already exists")
 )
 
+// ErrSIWCCallbackRequiresV8 prevents legacy callback sinks from accepting SIWC codes.
+var ErrSIWCCallbackRequiresV8 = fmt.Errorf("%w: SIWC callbacks require /v8/management/oauth/callback", errOAuthSessionNotPending)
+
 type oauthSession struct {
-	Provider  string
-	Status    string
-	Source    string
-	Metadata  map[string]any
-	Completed bool
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	Provider       string
+	Status         string
+	Source         string
+	Metadata       map[string]any
+	SIWC           *siwcBindSession
+	SIWCCommitting bool
+	Completed      bool
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
 }
 
 type oauthSessionStore struct {
@@ -64,7 +71,10 @@ func newOAuthSessionStore(ttl time.Duration) *oauthSessionStore {
 
 func (s *oauthSessionStore) purgeExpiredLocked(now time.Time) {
 	for state, session := range s.sessions {
-		if !session.ExpiresAt.IsZero() && now.After(session.ExpiresAt) {
+		if !session.SIWCCommitting && !session.ExpiresAt.IsZero() && now.After(session.ExpiresAt) {
+			if session.SIWC != nil {
+				session.SIWC.cancel()
+			}
 			delete(s.sessions, state)
 		}
 	}
@@ -140,6 +150,7 @@ func (s *oauthSessionStore) SetError(state, message string) {
 		return
 	}
 	session.Status = message
+	session.SIWCCommitting = false
 	session.ExpiresAt = now.Add(s.ttl)
 	s.sessions[state] = session
 }
@@ -161,6 +172,7 @@ func (s *oauthSessionStore) Complete(state string) {
 	}
 	session.Status = ""
 	session.Metadata = nil
+	session.SIWCCommitting = false
 	session.Completed = true
 	session.ExpiresAt = now.Add(s.completedTTL)
 	s.sessions[state] = session
@@ -180,7 +192,7 @@ func (s *oauthSessionStore) CompleteProvider(provider string, source string) int
 	s.purgeExpiredLocked(now)
 	removed := 0
 	for state, session := range s.sessions {
-		if !session.Completed && strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
+		if session.SIWC == nil && !session.Completed && strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
 			session.Status = ""
 			session.Metadata = nil
 			session.Completed = true
@@ -234,6 +246,12 @@ func (s *oauthSessionStore) Cancel(state string) bool {
 	if state == "" {
 		return false
 	}
+	// SIWC completion and cancellation share a per-session gate. A cancellation
+	// that wins this gate prevents persistence; after a committed bind it is a no-op.
+	if session, ok := s.Get(state); ok && session.SIWC != nil {
+		session.SIWC.mu.Lock()
+		defer session.SIWC.mu.Unlock()
+	}
 	now := time.Now()
 
 	s.mu.Lock()
@@ -243,6 +261,10 @@ func (s *oauthSessionStore) Cancel(state string) bool {
 	session, ok := s.sessions[state]
 	if !ok || session.Completed || session.Status != "" {
 		return false
+	}
+	if session.SIWC != nil {
+		session.SIWC.cancel()
+		session.SIWC.pkce = nil
 	}
 	delete(s.sessions, state)
 	return true
@@ -368,6 +390,10 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "antigravity", nil
 	case "xai", "x-ai", "x.ai", "grok":
 		return "xai", nil
+	case "devin", "cognition":
+		return "devin", nil
+	case "meta", "muse":
+		return "meta", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}
@@ -445,8 +471,27 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 	if err != nil {
 		return "", fmt.Errorf("marshal oauth callback payload: %w", err)
 	}
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
-		return "", fmt.Errorf("write oauth callback file: %w", err)
+	// Publish complete JSON atomically so background waiters cannot read a partial callback.
+	tmp, errCreate := os.CreateTemp(authDir, ".oauth-callback-*")
+	if errCreate != nil {
+		return "", fmt.Errorf("create oauth callback file: %w", errCreate)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if errRemove := os.Remove(tmpPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			log.Warn("failed to remove temporary OAuth callback file")
+		}
+	}()
+	_, errWrite := tmp.Write(data)
+	errClose := tmp.Close()
+	if errWrite != nil {
+		return "", fmt.Errorf("write oauth callback file: %w", errWrite)
+	}
+	if errClose != nil {
+		return "", fmt.Errorf("close oauth callback file: %w", errClose)
+	}
+	if errRename := os.Rename(tmpPath, filePath); errRename != nil {
+		return "", fmt.Errorf("publish oauth callback file: %w", errRename)
 	}
 	return filePath, nil
 }
@@ -455,6 +500,9 @@ func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, err
 	canonicalProvider, err := normalizeOAuthCallbackProviderForPendingSession(provider, state)
 	if err != nil {
 		return "", err
+	}
+	if session, ok := oauthSessions.Get(state); ok && session.SIWC != nil {
+		return "", ErrSIWCCallbackRequiresV8
 	}
 	if !IsOAuthSessionPending(state, canonicalProvider) {
 		return "", errOAuthSessionNotPending
