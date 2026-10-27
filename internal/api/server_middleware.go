@@ -5,12 +5,14 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/safemode"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -26,26 +28,75 @@ var corsExposedResponseHeaders = []string{
 	"X-SERVER-BUILD-DATE",
 	"Location",
 	"Retry-After",
+	// Cross-origin management clients must read the config version token to
+	// send it back as If-Match on writes.
+	"ETag",
 	"X-Request-Id",
 	"OpenAI-Request-Id",
 }
 
 var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")
 
+// corsAllowedRequestHeaders lists the request headers browser clients may
+// send to the API. The Fetch standard treats Authorization as a CORS
+// non-wildcard request-header name, so it must be named explicitly: a
+// wildcard does not cover it when a browser enforces that rule.
+var corsAllowedRequestHeaders = []string{
+	"Authorization",
+	"Content-Type",
+	"X-Api-Key",
+	"X-Goog-Api-Key",
+	"Anthropic-Version",
+	"Anthropic-Beta",
+}
+
 const (
 	exampleAPIKeyManagementPath = "/management.html"
 	exampleAPIKeyManagementURL  = "/management.html?safe-mode=configure"
 )
 
+func (s *Server) maxRequestBodyBytes() int64 {
+	if s == nil {
+		return 0
+	}
+	cfg := s.getConfig()
+	if cfg == nil || cfg.MaxRequestBodyBytes <= 0 {
+		return 0
+	}
+	return cfg.MaxRequestBodyBytes
+}
+
+func (s *Server) maxRequestBodyBytesMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		maxBytes := s.maxRequestBodyBytes()
+		if maxBytes <= 0 || c == nil || c.Request == nil {
+			c.Next()
+			return
+		}
+		c.Set(handlers.MaxRequestBodyBytesContextKey, maxBytes)
+		if c.Request.ContentLength > maxBytes {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{
+				"error": "http: request body too large",
+			})
+			return
+		}
+		if c.Request.Body != nil && c.Request.Body != http.NoBody {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		}
+		c.Next()
+	}
+}
+
 func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if s == nil || s.cfg == nil || !s.cfg.Home.Enabled {
+		cfg := s.getConfig()
+		if s == nil || cfg == nil || !cfg.Home.Enabled {
 			c.Next()
 			return
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v8/management/") || path == "/v8/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
 				c.Next()
 				return
 			}
@@ -93,7 +144,7 @@ func (s *Server) exampleAPIKeySafeModeMiddleware() gin.HandlerFunc {
 }
 
 func (s *Server) serveExampleAPIKeyWarningPage(c *gin.Context) {
-	cfg := s.cfg
+	cfg := s.getConfig()
 	var keys []string
 	if cfg != nil {
 		keys = safemode.ExampleAPIKeys(cfg.APIKeys)
@@ -133,7 +184,7 @@ func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "*")
+		c.Header("Access-Control-Allow-Headers", corsAllowHeadersValue(c.Request))
 		c.Header("Access-Control-Expose-Headers", corsExposedResponseHeadersJoined)
 
 		if c.Request.Method == "OPTIONS" {
@@ -143,6 +194,39 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// corsAllowHeadersValue builds the Access-Control-Allow-Headers value for a
+// request. It always names the known API request headers explicitly and, for
+// preflight requests, also echoes the headers the client asked about, so no
+// allowed header depends on the wildcard that strict non-wildcard rules
+// reject for Authorization. Echoing requested headers preserves the previous
+// wildcard behavior for arbitrary custom client headers without widening
+// the allowed origins or enabling credentials.
+func corsAllowHeadersValue(req *http.Request) string {
+	allowed := make([]string, 0, len(corsAllowedRequestHeaders))
+	seen := make(map[string]struct{}, len(corsAllowedRequestHeaders))
+	appendHeader := func(name string) {
+		name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		allowed = append(allowed, name)
+	}
+	for _, name := range corsAllowedRequestHeaders {
+		appendHeader(name)
+	}
+	if req != nil && req.Method == http.MethodOptions {
+		for _, name := range strings.Split(req.Header.Get("Access-Control-Request-Headers"), ",") {
+			appendHeader(name)
+		}
+	}
+	return strings.Join(allowed, ", ")
 }
 
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
@@ -171,6 +255,10 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
 				if len(result.Metadata) > 0 {
 					c.Set("accessMetadata", result.Metadata)
 				}
+				reqCtx := coreusage.WithAPIKey(c.Request.Context(), result.Principal)
+				reqCtx = coreusage.WithAccessProvider(reqCtx, result.Provider)
+				reqCtx = coreusage.WithIsNativeKey(reqCtx, coreusage.IsNativeAccessProvider(result.Provider))
+				c.Request = c.Request.WithContext(reqCtx)
 			}
 			c.Next()
 			return
@@ -183,7 +271,10 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
 		if realtimeError {
 			errorType := "authentication_error"
 			code := "invalid_api_key"
-			if statusCode >= http.StatusInternalServerError {
+			if statusCode == http.StatusRequestEntityTooLarge {
+				errorType = "invalid_request_error"
+				code = "request_body_too_large"
+			} else if statusCode >= http.StatusInternalServerError {
 				errorType = "server_error"
 				code = "authentication_service_error"
 			}
@@ -226,6 +317,10 @@ func realtimeAuthMiddleware(manager *sdkaccess.Manager, handler *codexlive.Handl
 		}
 		c.Set("userApiKey", principal)
 		c.Set("accessProvider", provider)
+		reqCtx := coreusage.WithAPIKey(c.Request.Context(), principal)
+		reqCtx = coreusage.WithAccessProvider(reqCtx, provider)
+		reqCtx = coreusage.WithIsNativeKey(reqCtx, coreusage.IsNativeAccessProvider(provider))
+		c.Request = c.Request.WithContext(reqCtx)
 		c.Set(codexlive.ClientSecretSessionContextKey, authorization.Session)
 		c.Set(codexlive.ClientSecretPrincipalContextKey, authorization.Principal)
 		c.Next()

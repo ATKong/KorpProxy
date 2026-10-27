@@ -6,15 +6,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/codex"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
@@ -43,6 +51,34 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	}
 	if detail.TokenBreakdown.Input.UncachedTokens != 6 || detail.TokenBreakdown.Output.NonReasoningTokens != 1 {
 		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+}
+
+func TestParseOpenAIUsageFlatReasoningDialect(t *testing.T) {
+	// SGLang-style usage: reasoning_tokens flat on the usage object.
+	data := []byte(`{"usage":{"prompt_tokens":241114,"total_tokens":242270,"completion_tokens":1156,"prompt_tokens_details":{"cached_tokens":240896},"reasoning_tokens":530}}`)
+	detail := ParseOpenAIUsage(data)
+
+	if detail.ReasoningTokens != 530 {
+		t.Fatalf("reasoning tokens = %d, want 530", detail.ReasoningTokens)
+	}
+	if detail.InputTokens != 241114 || detail.OutputTokens != 1156 || detail.TotalTokens != 242270 {
+		t.Fatalf("token counts = %+v", detail)
+	}
+	if detail.CachedTokens != 240896 || detail.CacheReadTokens != 240896 {
+		t.Fatalf("cached tokens = %d/%d", detail.CachedTokens, detail.CacheReadTokens)
+	}
+	if !detail.TokenBreakdown.Valid() {
+		t.Fatalf("token breakdown = %+v", detail.TokenBreakdown)
+	}
+
+	// Streaming variant must behave the same.
+	streamDetail, ok := ParseOpenAIStreamUsage([]byte(`data: {"id":"x","object":"chat.completion.chunk","usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16,"reasoning_tokens":4}}`))
+	if !ok {
+		t.Fatalf("ParseOpenAIStreamUsage reported no usage")
+	}
+	if streamDetail.ReasoningTokens != 4 {
+		t.Fatalf("stream reasoning tokens = %d, want 4", streamDetail.ReasoningTokens)
 	}
 }
 
@@ -392,6 +428,41 @@ func TestParseClaudeStreamUsage_MessageStart(t *testing.T) {
 	}
 	if detail.CachedTokens != 355598 {
 		t.Errorf("cached tokens = %d, want 355598", detail.CachedTokens)
+	}
+}
+
+func TestParseClaudeUsageReportsSpeedAsResponseServiceTier(t *testing.T) {
+	for _, tc := range []struct{ body, want string }{
+		{`{"usage":{"input_tokens":10,"output_tokens":5,"speed":"fast"}}`, "fast"},
+		{`{"usage":{"input_tokens":10,"output_tokens":5,"speed":"standard"}}`, "standard"},
+		{`{"usage":{"input_tokens":10,"output_tokens":5}}`, ""},
+	} {
+		if got := ParseClaudeUsage([]byte(tc.body)).ResponseServiceTier; got != tc.want {
+			t.Errorf("%s: ResponseServiceTier = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+}
+
+// The speed can arrive on message_start while message_delta carries only the
+// final output count; the merged stream usage must keep it.
+func TestStreamUsageBufferObserveClaudeStream_KeepsSpeedAcrossDelta(t *testing.T) {
+	for _, tc := range []struct{ start, delta, want string }{
+		{`"speed":"fast"`, ``, "fast"},
+		{``, `,"speed":"fast"`, "fast"},
+		{``, ``, ""},
+	} {
+		var buffer StreamUsageBuffer
+		start := `data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":20,"output_tokens":1`
+		if tc.start != "" {
+			start += "," + tc.start
+		}
+		buffer.ObserveClaudeStream([]byte(start + `}}}`))
+		buffer.ObserveClaudeStream([]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15` + tc.delta + `}}`))
+		detail, ok := buffer.Detail()
+		if !ok || detail.ResponseServiceTier != tc.want || detail.OutputTokens != 15 || detail.InputTokens != 20 {
+			t.Errorf("start %q delta %q: got tier %q in=%d out=%d ok=%v, want tier %q in=20 out=15",
+				tc.start, tc.delta, detail.ResponseServiceTier, detail.InputTokens, detail.OutputTokens, ok, tc.want)
+		}
 	}
 }
 
@@ -845,9 +916,117 @@ func TestUsageReporterSetTranslatedReasoningEffortPreservesClientServiceTier(t *
 
 	reporter.SetTranslatedReasoningEffort([]byte(`{"service_tier":"priority"}`), "openai")
 
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3, ResponseServiceTier: "default"}, false)
 	if record.ServiceTier != "auto" {
 		t.Fatalf("service tier = %q, want %q", record.ServiceTier, "auto")
+	}
+	if record.EffectiveServiceTier != "priority" {
+		t.Fatalf("effective service tier = %q, want %q", record.EffectiveServiceTier, "priority")
+	}
+	if record.ResponseServiceTier != "default" {
+		t.Fatalf("response service tier = %q, want %q", record.ResponseServiceTier, "default")
+	}
+}
+
+func TestUsageReporterExtractsEffectiveServiceTierFromOutboundShapes(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{name: "top level", payload: `{"service_tier":"priority"}`, want: "priority"},
+		{name: "antigravity request envelope", payload: `{"request":{"service_tier":"priority"}}`, want: "priority"},
+		{name: "interaction envelope", payload: `{"interaction":{"service_tier":"standard"}}`, want: "standard"},
+		{name: "missing", payload: `{"model":"gpt-5.4"}`, want: ""},
+		{name: "invalid json", payload: `{"service_tier":`, want: ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+			reporter.SetTranslatedRequestMetadata([]byte(tt.payload), "openai")
+			record := reporter.buildRecord(usage.Detail{TotalTokens: 1}, false)
+			if record.EffectiveServiceTier != tt.want {
+				t.Fatalf("effective service tier = %q, want %q", record.EffectiveServiceTier, tt.want)
+			}
+		})
+	}
+}
+
+func TestUsageReporterCapturesEffectiveServiceTierAfterPayloadOverride(t *testing.T) {
+	cfg := &config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{Name: "gpt-*", Protocol: "codex"}},
+				Params: map[string]any{"service_tier": "priority"},
+			}},
+		},
+	}
+	finalPayload := ApplyPayloadConfigWithRequest(
+		cfg,
+		"gpt-6-astra",
+		"codex",
+		"openai",
+		"",
+		[]byte(`{"model":"gpt-6-astra"}`),
+		nil,
+		"gpt-6-astra",
+		"/v1/chat/completions",
+		nil,
+	)
+
+	ctx := usage.WithServiceTier(context.Background(), "auto")
+	reporter := NewUsageReporter(ctx, "codex", "gpt-6-astra", nil)
+	reporter.SetTranslatedRequestMetadata(finalPayload, "codex")
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 1, ResponseServiceTier: "default"}, false)
+	if record.ServiceTier != "auto" || record.EffectiveServiceTier != "priority" || record.ResponseServiceTier != "default" {
+		t.Fatalf("tiers = requested:%q effective:%q response:%q", record.ServiceTier, record.EffectiveServiceTier, record.ResponseServiceTier)
+	}
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortCodexConfigurationUpdate(t *testing.T) {
+	ctx := context.Background()
+	reporter := NewUsageReporter(ctx, "codex", "gpt-6-astra", nil)
+
+	payload := []byte(`{"model":"gpt-6-astra","reasoning":{"effort":"xhigh"},"input":[{"type":"configuration_update","reasoning":{"effort":"low"}}]}`)
+	reporter.SetTranslatedReasoningEffort(payload, "codex")
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false)
+	if record.ReasoningEffort != "low" {
+		t.Fatalf("reasoning effort = %q, want %q", record.ReasoningEffort, "low")
+	}
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortConfigurationUpdateAfterCleanup(t *testing.T) {
+	const source = `{"reasoning":{"effort":"xhigh"},"input":[{"type":"configuration_update","reasoning":{"effort":"medium"}},{"type":"configuration_update","reasoning":{"effort":"low"}},{"role":"user","content":"ok"}]}`
+	for _, tc := range []struct {
+		name      string
+		supported bool
+		want      string
+	}{
+		{name: "supported target reports effective update", supported: true, want: "low"},
+		{name: "unsupported target reports cleaned suffix", want: "high"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := "opaque-route(high)"
+			requestEffort := thinking.ExtractReasoningEffort([]byte(source), "openai-response", model)
+			if requestEffort != "low" {
+				t.Fatalf("request effort = %q, want low", requestEffort)
+			}
+			info := &registry.ModelInfo{
+				ID: "opaque-route", Type: "codex", SupportConfigurationUpdate: tc.supported,
+				Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
+			}
+			body, err := thinking.ApplyThinkingWithModelInfoAndSummary([]byte(source), []byte(source), model, "openai-response", "codex", "codex", info, thinking.SummaryConfig{})
+			if err != nil {
+				t.Fatalf("ApplyThinkingWithModelInfoAndSummary() error = %v", err)
+			}
+			reporter := NewUsageReporter(usage.WithReasoningEffort(context.Background(), requestEffort), "codex", model, nil)
+			reporter.SetTranslatedReasoningEffort(body, "codex")
+			if got := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false).ReasoningEffort; got != tc.want {
+				t.Fatalf("final usage effort = %q, want %q; body=%s", got, tc.want, body)
+			}
+		})
 	}
 }
 
@@ -1092,5 +1271,233 @@ func TestUsageReporterPropagatesSessionHierarchy(t *testing.T) {
 	recordAlias2 := reporterAlias.buildRecord(usage.Detail{TotalTokens: 100}, false, usage.Failure{})
 	if recordAlias2.SessionID != "pck:key-999" || recordAlias2.ParentSessionID != "" {
 		t.Fatalf("SetSessionHierarchy cross prefix alias emitted as parent: (%q, %q), want (pck:key-999, empty)", recordAlias2.SessionID, recordAlias2.ParentSessionID)
+	}
+}
+
+func TestUsageReporterPropagatesBaseURL(t *testing.T) {
+	ctx := context.Background()
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-base-url-test",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "test-api-key",
+			"base_url": "https://custom.endpoint.example.com/v1",
+		},
+	}
+	reporter := NewUsageReporter(ctx, "codex", "gpt-5.6-luna", auth)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if record.BaseURL != "https://custom.endpoint.example.com/v1" {
+		t.Fatalf("record.BaseURL = %q, want %q", record.BaseURL, "https://custom.endpoint.example.com/v1")
+	}
+
+	authMeta := &cliproxyauth.Auth{
+		ID:       "auth-meta-base-url-test",
+		Provider: "openai",
+		Metadata: map[string]any{
+			"base_url": "https://meta.endpoint.example.com/v1",
+		},
+	}
+	reporterMeta := NewUsageReporter(ctx, "openai", "gpt-5.4", authMeta)
+	recordMeta := reporterMeta.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordMeta.BaseURL != "https://meta.endpoint.example.com/v1" {
+		t.Fatalf("recordMeta.BaseURL = %q, want %q", recordMeta.BaseURL, "https://meta.endpoint.example.com/v1")
+	}
+
+	// Attribute precedence over metadata
+	authBoth := &cliproxyauth.Auth{
+		ID:       "auth-both-test",
+		Provider: "openai",
+		Attributes: map[string]string{
+			"base_url": "https://attr.example.com",
+		},
+		Metadata: map[string]any{
+			"base_url": "https://meta.example.com",
+		},
+	}
+	reporterBoth := NewUsageReporter(ctx, "openai", "gpt-5.4", authBoth)
+	recordBoth := reporterBoth.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordBoth.BaseURL != "https://attr.example.com" {
+		t.Fatalf("recordBoth.BaseURL = %q, want %q", recordBoth.BaseURL, "https://attr.example.com")
+	}
+
+	// Blank attribute falls back to metadata
+	authBlankAttr := &cliproxyauth.Auth{
+		ID:       "auth-blank-test",
+		Provider: "openai",
+		Attributes: map[string]string{
+			"base_url": "   ",
+		},
+		Metadata: map[string]any{
+			"base_url": "https://meta.example.com",
+		},
+	}
+	reporterBlankAttr := NewUsageReporter(ctx, "openai", "gpt-5.4", authBlankAttr)
+	recordBlankAttr := reporterBlankAttr.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordBlankAttr.BaseURL != "https://meta.example.com" {
+		t.Fatalf("recordBlankAttr.BaseURL = %q, want %q", recordBlankAttr.BaseURL, "https://meta.example.com")
+	}
+
+	// Nil auth or unconfigured auth leaves BaseURL empty
+	reporterNilAuth := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	recordNilAuth := reporterNilAuth.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+	if recordNilAuth.BaseURL != "" {
+		t.Fatalf("recordNilAuth.BaseURL = %q, want empty", recordNilAuth.BaseURL)
+	}
+}
+
+func TestUsageReporter_AllocatesUniqueUUIDPerAttemptWithSharedTraceID(t *testing.T) {
+	ctx := logging.WithRequestID(context.Background(), "00000042")
+
+	// First execution attempt
+	reporter1 := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	record1 := reporter1.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+
+	// Second execution attempt (retry)
+	reporter2 := NewUsageReporter(ctx, "claude", "claude-3-7-sonnet", nil)
+	record2 := reporter2.buildRecord(usage.Detail{TotalTokens: 20}, false, usage.Failure{})
+
+	if record1.TraceID != "00000042" {
+		t.Fatalf("record1.TraceID = %q, want 00000042", record1.TraceID)
+	}
+	if record2.TraceID != "00000042" {
+		t.Fatalf("record2.TraceID = %q, want 00000042", record2.TraceID)
+	}
+
+	if record1.RequestID == "" {
+		t.Fatal("record1.RequestID should not be empty")
+	}
+	if record2.RequestID == "" {
+		t.Fatal("record2.RequestID should not be empty")
+	}
+
+	if record1.RequestID == record2.RequestID {
+		t.Fatalf("consecutive attempts must have distinct UUID RequestIDs: got %q and %q", record1.RequestID, record2.RequestID)
+	}
+
+	// Verify UUID format and version 4
+	u1, err1 := uuid.Parse(record1.RequestID)
+	if err1 != nil || u1.Version() != 4 {
+		t.Fatalf("record1.RequestID %q is not valid UUID v4: %v", record1.RequestID, err1)
+	}
+	u2, err2 := uuid.Parse(record2.RequestID)
+	if err2 != nil || u2.Version() != 4 {
+		t.Fatalf("record2.RequestID %q is not valid UUID v4: %v", record2.RequestID, err2)
+	}
+}
+
+func TestUsageReporter_ExplicitTraceIDPrecedenceOverLogRequestID(t *testing.T) {
+	ctx := logging.WithRequestID(context.Background(), "log-id-1")
+	ctx = usage.WithTraceID(ctx, "explicit-trace-1")
+
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+
+	if record.TraceID != "explicit-trace-1" {
+		t.Fatalf("record.TraceID = %q, want explicit-trace-1", record.TraceID)
+	}
+}
+
+func TestUsageReporter_DistinguishesNativeKey(t *testing.T) {
+	t.Run("native_key_via_gin", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(w)
+		ginCtx.Set("userApiKey", "sk-native-key")
+		ginCtx.Set("accessProvider", "config-inline")
+
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if !reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = false, want true")
+		}
+		if reporter.AccessProvider() != "config-inline" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "config-inline")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if !record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = false, want true")
+		}
+		if record.AccessProvider != "config-inline" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "config-inline")
+		}
+	})
+
+	t.Run("plugin_key_via_gin", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(w)
+		ginCtx.Set("userApiKey", "plugin-principal")
+		ginCtx.Set("accessProvider", "custom-auth-plugin")
+
+		ctx := context.WithValue(context.Background(), "gin", ginCtx)
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = true, want false")
+		}
+		if reporter.AccessProvider() != "custom-auth-plugin" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "custom-auth-plugin")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = true, want false")
+		}
+		if record.AccessProvider != "custom-auth-plugin" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "custom-auth-plugin")
+		}
+	})
+
+	t.Run("native_key_via_context", func(t *testing.T) {
+		ctx := usage.WithAccessProvider(context.Background(), "config-api-key")
+		reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+		if !reporter.IsNativeKey() {
+			t.Fatalf("reporter.IsNativeKey() = false, want true")
+		}
+		if reporter.AccessProvider() != "config-api-key" {
+			t.Fatalf("reporter.AccessProvider() = %q, want %q", reporter.AccessProvider(), "config-api-key")
+		}
+
+		record := reporter.buildRecord(usage.Detail{TotalTokens: 10}, false, usage.Failure{})
+		if !record.IsNativeKey {
+			t.Fatalf("record.IsNativeKey = false, want true")
+		}
+		if record.AccessProvider != "config-api-key" {
+			t.Fatalf("record.AccessProvider = %q, want %q", record.AccessProvider, "config-api-key")
+		}
+	})
+}
+
+func TestUsageReporterCapturesSelectionIDForDelayedPublish(t *testing.T) {
+	ctx := usage.WithSelectionID(context.Background(), "sel-delayed-123")
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+	if got := reporter.SelectionID(); got != "sel-delayed-123" {
+		t.Fatalf("reporter.SelectionID() = %q, want %q", got, "sel-delayed-123")
+	}
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 42}, false, usage.Failure{})
+	if record.SelectionID != "sel-delayed-123" {
+		t.Fatalf("record.SelectionID = %q, want %q", record.SelectionID, "sel-delayed-123")
+	}
+}
+
+type streamTruncatedTestError struct {
+	msg string
+}
+
+func (e *streamTruncatedTestError) Error() string           { return e.msg }
+func (e *streamTruncatedTestError) StatusCode() int         { return 502 }
+func (e *streamTruncatedTestError) IsStreamTruncated() bool { return true }
+
+func TestFailFromErrorsCarriesStreamTruncatedCode(t *testing.T) {
+	fail := failFromErrors(&streamTruncatedTestError{msg: "upstream stream closed before finishReason"})
+	if fail.Code != usage.FailureStreamTruncatedCode {
+		t.Fatalf("fail.Code = %q, want %q", fail.Code, usage.FailureStreamTruncatedCode)
+	}
+	if fail.StatusCode != 502 {
+		t.Fatalf("fail.StatusCode = %d, want 502", fail.StatusCode)
+	}
+
+	plain := failFromErrors(errors.New("upstream stream closed before finishReason"))
+	if plain.Code != "" {
+		t.Fatalf("plain error must not gain truncated classification, got code %q", plain.Code)
 	}
 }
