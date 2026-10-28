@@ -17,7 +17,12 @@ const (
 	// Version 6 preserves raw JSON bodies for plugin management responses.
 	// Plugins that still require HTML entity escaping on JSON response strings
 	// should keep schema_version < 6.
-	SchemaVersion uint32 = 6
+	// Version 7 lets request interceptors opt out of receiving the request body
+	// per phase via request_interceptor_omit_body_before/after capabilities; the
+	// host then omits RequestInterceptRequest.Body for that phase instead of
+	// cloning and Base64-encoding the full payload. Plugins that declare the
+	// flags on schema_version < 7 (or do not declare them) still receive it.
+	SchemaVersion uint32 = 7
 	// SchemaVersionStreamChunkOmitRequestBody is the first schema version that omits
 	// request bodies on payload stream-chunk interceptor calls.
 	SchemaVersionStreamChunkOmitRequestBody uint32 = 3
@@ -30,6 +35,9 @@ const (
 	// SchemaVersionRawManagementResponse is the first schema version where plugin
 	// management JSON responses are preserved without HTML-escaping strings.
 	SchemaVersionRawManagementResponse uint32 = 6
+	// SchemaVersionRequestInterceptorOmitBody is the first schema version where
+	// request interceptors may opt out of receiving the request body per phase.
+	SchemaVersionRequestInterceptorOmitBody uint32 = 7
 )
 
 const (
@@ -87,8 +95,15 @@ const (
 	MethodManagementRegister = "management.register"
 	MethodManagementHandle   = "management.handle"
 
+	MethodQuotaIdentifier = "quota.identifier"
+	MethodQuotaDescribe   = "quota.describe"
+	MethodQuotaFetch      = "quota.fetch"
+	MethodQuotaReset      = "quota.reset"
+
 	MethodHostHTTPDo             = "host.http.do"
 	MethodHostHTTPDoStream       = "host.http.do_stream"
+	MethodHostHTTPOperationOpen  = "host.http.operation_open"
+	MethodHostHTTPCancel         = "host.http.cancel"
 	MethodHostHTTPStreamRead     = "host.http.stream_read"
 	MethodHostHTTPStreamClose    = "host.http.stream_close"
 	MethodHostModelExecute       = "host.model.execute"
@@ -102,7 +117,10 @@ const (
 	MethodHostAuthGet            = "host.auth.get"
 	MethodHostAuthGetRuntime     = "host.auth.get_runtime"
 	MethodHostAuthSave           = "host.auth.save"
+	MethodHostAuthModels         = "host.auth.models"
 	MethodHostAffinityLookup     = "host.affinity.lookup"
+
+	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
 )
 
 type Envelope struct {
@@ -112,8 +130,53 @@ type Envelope struct {
 }
 
 type Error struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Retryable bool   `json:"retryable,omitempty"`
+	// HTTPStatus is the HTTP status code (e.g. 401, 403, 429) to surface to the client.
+	// When omitted or 0, CPA defaults to HTTP 500 (internal_server_error).
+	HTTPStatus int `json:"http_status,omitempty"`
+	// RetryAfterSeconds carries upstream retry guidance for cooldown and response headers.
+	// It is an optional hint. Schema-version agreement does not negotiate support for
+	// this field, and older hosts silently ignore it, so plugins must not depend on it
+	// for correctness. The same pair is accepted as error_detail on host.stream.emit
+	// and host.stream.close.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+}
+
+// Error implements the error interface for Error.
+func (e *Error) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
+// StatusCode returns the HTTP status code embedded in the Error, or 0 if unset.
+func (e *Error) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.HTTPStatus
+}
+
+// NewError creates an Error instance with an optional HTTP status code.
+func NewError(code, message string, httpStatus ...int) *Error {
+	status := 0
+	if len(httpStatus) > 0 {
+		status = httpStatus[0]
+	}
+	return &Error{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: status,
+	}
+}
+
+// NewErrorEnvelope serializes a failed RPC Envelope containing an Error with an optional HTTP status code.
+func NewErrorEnvelope(code, message string, httpStatus ...int) ([]byte, error) {
+	return json.Marshal(Envelope{
+		OK:    false,
+		Error: NewError(code, message, httpStatus...),
+	})
 }

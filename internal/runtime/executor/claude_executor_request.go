@@ -1,11 +1,7 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
-	"compress/zlib"
 	"context"
 	"fmt"
 	"io"
@@ -15,17 +11,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
-	"github.com/klauspost/compress/zstd"
-	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -40,6 +35,12 @@ const (
 	claudeCodeBeta                   = "claude-code-20250219"
 	claudeContext1MBeta              = "context-1m-2025-08-07"
 	claudeMidConvSystemBeta          = "mid-conversation-system-2026-04-07"
+	claudePerTurnControlBeta         = "per-turn-control-2026-07-01"
+	claudePerTurnTimingBeta          = "timing-2026-09-09"
+	claudeMidConvToolChangesBeta     = "mid-conversation-tool-changes-2026-07-01"
+	claudeInlineToolsBeta            = "inline-tools-2026-09-15"
+	claudeMidConvSystemClearAtBeta   = "mid-conversation-system-clear-at-2026-08-21"
+	claudeDangerousToolUseBeta       = "dangerous-tool-use-2026-09-03"
 	claudeAdvisorToolBeta            = "advisor-tool-2026-03-01"
 	claudeAdvancedToolUseBeta        = "advanced-tool-use-2025-11-20"
 	claudeEffortBeta                 = "effort-2025-11-24"
@@ -47,7 +48,10 @@ const (
 	claudeFallbackCreditBeta         = "fallback-credit-2026-06-01"
 	claudeStructuredOutputsBeta      = "structured-outputs-2025-12-15"
 	claudeThinkingDisplayUpdatesBeta = "thinking-display-updates-2026-08-18"
+	claudeThinkingBindingBeta        = "thinking-binding-controls-2026-08-01"
+	claudeThinkingResumptionBeta     = "thinking-resumption-2026-07-17"
 	claudeExtendedCacheTTLBeta       = "extended-cache-ttl-2025-04-11"
+	claudePromptCachingEvictBeta     = "prompt-caching-evict-2026-05-12"
 	claudeCacheDiagnosisBeta         = "cache-diagnosis-2026-04-07"
 	claudeRedactThinkingBeta         = "redact-thinking-2026-02-12"
 	claudeAFKModeBeta                = "afk-mode-2026-01-31"
@@ -77,13 +81,63 @@ var claudeCodeTrailingBetas = []string{
 	claudeStructuredOutputsBeta,
 }
 
+// claudeManagedBetaSet holds every beta the proxy itself assembles or gates.
+// Caller betas outside this set are unknown to the pinned Claude Code profile —
+// newer client releases ship betas past it — and are forwarded verbatim so
+// their features keep working (#5738).
+var claudeManagedBetaSet = func() map[string]bool {
+	managed := []string{
+		claudeTokenCountingBeta,
+		claudeFastModeBeta,
+		claudeOAuthBeta,
+		claudeCodeBeta,
+		claudeContext1MBeta,
+		claudeMidConvSystemBeta,
+		claudePerTurnControlBeta,
+		claudePerTurnTimingBeta,
+		claudeMidConvToolChangesBeta,
+		claudeInlineToolsBeta,
+		claudeMidConvSystemClearAtBeta,
+		claudeDangerousToolUseBeta,
+		claudeAdvisorToolBeta,
+		claudeAdvancedToolUseBeta,
+		claudeEffortBeta,
+		claudeServerSideFallbackBeta,
+		claudeFallbackCreditBeta,
+		claudeStructuredOutputsBeta,
+		claudeThinkingDisplayUpdatesBeta,
+		claudeThinkingBindingBeta,
+		claudeThinkingResumptionBeta,
+		claudeExtendedCacheTTLBeta,
+		claudePromptCachingEvictBeta,
+		claudeCacheDiagnosisBeta,
+		claudeRedactThinkingBeta,
+		claudeAFKModeBeta,
+	}
+	managed = append(managed, claudeCodeCLIConstantBetas...)
+	managed = append(managed, claudeCodeTrailingBetas...)
+	set := make(map[string]bool, len(managed))
+	for _, beta := range managed {
+		set[beta] = true
+	}
+	return set
+}()
+
+func isManagedClaudeBeta(beta string) bool {
+	return claudeManagedBetaSet[strings.TrimSpace(beta)]
+}
+
 // claudeCodeCLIBetas assembles the Anthropic-Beta baseline the way Claude Code
-// 2.1.258 does: the list is per-request, not a fixed string. requested holds the
+// 2.1.280 does: the list is per-request, not a fixed string. requested holds the
 // betas the caller asked for, which decide the capability flags below.
 //
 // Verified against api.anthropic.com with native 2.1.258 captures on interactive,
 // non-interactive, subagent, and multi-model paths (Sonnet, Opus, Fable, Haiku).
-// The full observed order is:
+// Claude Code 2.1.280 (measured 2026-09-23, binary 80abbfe) inserts
+// mid-conversation-tool-changes immediately after mid-conversation-system on the
+// same non-legacy models. The betas named in issue #6054 are feature-gated in
+// that binary, so they are emitted only for the model capability or body shape
+// that actually sends them, in the same relative order:
 //
 //	 1 claude-code-20250219
 //	 2 oauth-2025-04-20                  OAuth credentials only
@@ -94,22 +148,31 @@ var claudeCodeTrailingBetas = []string{
 //	 7 context-management-2025-06-27
 //	 8 prompt-caching-scope-2026-01-05
 //	 9 mid-conversation-system-2026-04-07  models accepting a role=system turn
-//	10 advisor-tool-2026-03-01             requests declaring advisor tools or requesting advisor beta
-//	11 advanced-tool-use-2025-11-20       requests using tool search or another advanced tool-use feature
-//	12 effort-2025-11-24                  effort-supporting models with active thinking
-//	13 server-side-fallback-2026-06-01    requests with fallbacks or requested
-//	14 fallback-credit-2026-06-01         OAuth credentials
-//	15 structured-outputs-2025-12-15      structured output requests
-//	16 thinking-display-updates-2026-08-18 requests with thinking.display=updates
-//	17 fast-mode-2026-02-01               speed:fast requests only
-//	18 afk-mode-2026-01-31                auto-mode sessions, forwarded when the caller sends it
-//	19 extended-cache-ttl-2025-04-11      OAuth credentials (omitted on subagent & probe)
-//	20 cache-diagnosis-2026-04-07         requests with diagnostics only
+//	10 per-turn-control-2026-07-01        opus-5-5 and fable-5-1, or requested
+//	11 timing-2026-09-09                  per-turn timing body, or requested
+//	12 mid-conversation-tool-changes-2026-07-01  same models as mid-conversation-system
+//	13 inline-tools-2026-09-15            inline tool_addition blocks, or requested
+//	14 advisor-tool-2026-03-01            requests declaring advisor tools or requesting advisor beta
+//	15 advanced-tool-use-2025-11-20       requests using tool search or another advanced tool-use feature
+//	16 mid-conversation-system-clear-at-2026-08-21  messages with clear_at, or requested
+//	17 dangerous-tool-use-2026-09-03      safeguards body, or requested
+//	18 effort-2025-11-24                  effort-supporting models with active thinking
+//	19 server-side-fallback-2026-06-01    requests with fallbacks or requested
+//	20 fallback-credit-2026-06-01         requests with fallback tokens, fallbacks, or requested
+//	21 structured-outputs-2025-12-15      structured output requests
+//	22 thinking-binding-controls-2026-08-01  thinking.block_binding, or requested
+//	23 thinking-display-updates-2026-08-18 requests with thinking.display=updates
+//	24 thinking-resumption-2026-07-17     requested only; the 2.1.280 flag defaults off
+//	25 fast-mode-2026-02-01               speed:fast requests only
+//	26 afk-mode-2026-01-31                auto-mode sessions, forwarded when the caller sends it
+//	27 extended-cache-ttl-2025-04-11      OAuth credentials (omitted on subagent & probe)
+//	28 prompt-caching-evict-2026-05-12    evict_on_complete, or requested
+//	29 cache-diagnosis-2026-04-07         requests with diagnostics only
 //
 // An empty body keeps the optimistic role=system default, matching the cloaking
 // policy for unknown and future model IDs.
 func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool) string {
-	betas := make([]string, 0, len(claudeCodeCLIConstantBetas)+len(claudeCodeTrailingBetas)+9)
+	betas := make([]string, 0, len(claudeCodeCLIConstantBetas)+len(claudeCodeTrailingBetas)+10)
 	betas = append(betas, claudeCodeBeta)
 	if oauthToken {
 		betas = append(betas, claudeOAuthBeta)
@@ -126,12 +189,39 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 	}
 	if !claudeUsesLegacySystemReminder(body) {
 		betas = append(betas, claudeMidConvSystemBeta)
+		if claudeIncludePerTurnControl(body, requested) {
+			betas = append(betas, claudePerTurnControlBeta)
+		}
+		if claudeIncludePerTurnTiming(body, requested) {
+			betas = append(betas, claudePerTurnTimingBeta)
+		}
+		if !isClaudeSonnet5Model(gjson.GetBytes(body, "model").String()) {
+			betas = append(betas, claudeMidConvToolChangesBeta)
+		}
+		if claudeIncludeInlineTools(body, requested) {
+			betas = append(betas, claudeInlineToolsBeta)
+		}
+	} else {
+		// Legacy models have no mid-conversation slot. A caller that still names
+		// these betas keeps them, in the same relative order, ahead of effort.
+		if claudeIncludePerTurnControl(body, requested) {
+			betas = append(betas, claudePerTurnControlBeta)
+		}
+		if claudeIncludePerTurnTiming(body, requested) {
+			betas = append(betas, claudePerTurnTimingBeta)
+		}
 	}
 	if requested[claudeAdvisorToolBeta] || claudeBodyHasAdvisorTool(body) {
 		betas = append(betas, claudeAdvisorToolBeta)
 	}
 	if requested[claudeAdvancedToolUseBeta] || claudeBodyUsesAdvancedToolUse(body) {
 		betas = append(betas, claudeAdvancedToolUseBeta)
+	}
+	if !claudeUsesLegacySystemReminder(body) && claudeIncludeMidConvClearAt(body, requested) {
+		betas = append(betas, claudeMidConvSystemClearAtBeta)
+	}
+	if requested[claudeDangerousToolUseBeta] || gjson.GetBytes(body, "safeguards").Exists() {
+		betas = append(betas, claudeDangerousToolUseBeta)
 	}
 	if claudeRequestSupportsEffort(body, requested) {
 		betas = append(betas, claudeEffortBeta)
@@ -140,7 +230,10 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 	if !isProbeOrHelper && (requested[claudeServerSideFallbackBeta] || gjson.GetBytes(body, "fallbacks").Exists()) {
 		betas = append(betas, claudeServerSideFallbackBeta)
 	}
-	if requested[claudeFallbackCreditBeta] || oauthToken {
+	shouldIncludeFallbackCredit := requested[claudeFallbackCreditBeta] ||
+		gjson.GetBytes(body, "fallback_credit_token").Exists() ||
+		(oauthToken && gjson.GetBytes(body, "fallbacks").Exists())
+	if shouldIncludeFallbackCredit {
 		betas = append(betas, claudeFallbackCreditBeta)
 	}
 	for _, beta := range claudeCodeTrailingBetas {
@@ -152,8 +245,15 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 		}
 	}
 	thinkingType := gjson.GetBytes(body, "thinking.type").String()
+	if requested[claudeThinkingBindingBeta] || gjson.GetBytes(body, "thinking.block_binding").Exists() ||
+		(claudeModelUsesProgressDisplay(gjson.GetBytes(body, "model").String()) && thinkingType == "adaptive") {
+		betas = append(betas, claudeThinkingBindingBeta)
+	}
 	if !isProbeOrHelper && thinkingType != "disabled" && (requested[claudeThinkingDisplayUpdatesBeta] || claudeThinkingDisplayUpdates(body)) {
 		betas = append(betas, claudeThinkingDisplayUpdatesBeta)
+	}
+	if requested[claudeThinkingResumptionBeta] {
+		betas = append(betas, claudeThinkingResumptionBeta)
 	}
 	if claudeRequestUsesFastMode(body, requested) {
 		betas = append(betas, claudeFastModeBeta)
@@ -169,6 +269,9 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 			betas = append(betas, claudeExtendedCacheTTLBeta)
 		}
 	}
+	if requested[claudePromptCachingEvictBeta] || bytes.Contains(body, []byte(`"evict_on_complete"`)) {
+		betas = append(betas, claudePromptCachingEvictBeta)
+	}
 	if diagnostics := gjson.GetBytes(body, "diagnostics"); diagnostics.IsObject() {
 		betas = append(betas, claudeCacheDiagnosisBeta)
 	}
@@ -177,6 +280,231 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 
 func isClaudeHaikuModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "haiku")
+}
+
+func claudeCanonicalModel(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if slash := strings.LastIndexByte(model, '/'); slash >= 0 {
+		model = model[slash+1:]
+	}
+	return model
+}
+
+// claudeModelHasPerTurnEffort reports models whose 2.1.280 catalog capability
+// per_turn_effort puts per-turn-control-2026-07-01 on every first-party request.
+func isClaudeOpus55Model(model string) bool {
+	model = claudeCanonicalModel(model)
+	return model == "claude-opus-5-5" || strings.HasPrefix(model, "claude-opus-5-5[")
+}
+
+func isClaudeSonnet55Model(model string) bool {
+	model = claudeCanonicalModel(model)
+	return model == "claude-sonnet-5-5" || strings.HasPrefix(model, "claude-sonnet-5-5-") || strings.HasPrefix(model, "claude-sonnet-5-5[")
+}
+
+func isClaudeSonnet5Model(model string) bool {
+	model = claudeCanonicalModel(model)
+	if isClaudeSonnet55Model(model) {
+		return false
+	}
+	return model == "claude-sonnet-5" || strings.HasPrefix(model, "claude-sonnet-5-") || strings.HasPrefix(model, "claude-sonnet-5[")
+}
+
+func isClaudeHaiku55Model(model string) bool {
+	model = claudeCanonicalModel(model)
+	return model == "claude-haiku-5-5" || strings.HasPrefix(model, "claude-haiku-5-5-") || strings.HasPrefix(model, "claude-haiku-5-5[") || model == "claude-haiku-5.5" || strings.HasPrefix(model, "claude-haiku-5.5-") || strings.HasPrefix(model, "claude-haiku-5.5[")
+}
+
+// isClaudeFable51OnlyModel reports Fable 5.1 specifically, excluding Mythos
+// 5.1, which shares the fable family checks elsewhere but does not run the
+// preserved-thinking prefix check.
+func isClaudeFable51OnlyModel(model string) bool {
+	m := claudeCanonicalModel(model)
+	for _, target := range []string{"fable-5-1", "fable-5.1"} {
+		idx := strings.Index(m, target)
+		if idx != -1 {
+			nextIdx := idx + len(target)
+			if nextIdx >= len(m) || m[nextIdx] < '0' || m[nextIdx] > '9' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isClaudePreservedThinkingModel reports the models whose signed thinking
+// blocks Anthropic binds to the creation-time conversation prefix (system,
+// tools, and every earlier message). Replaying those blocks under a reshaped
+// prefix fails binding validation unless the request opts into dropping them.
+// See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+func isClaudePreservedThinkingModel(model string) bool {
+	return isClaudeOpus55Model(model) || isClaudeSonnet55Model(model) || isClaudeHaiku55Model(model) || isClaudeFable51OnlyModel(model)
+}
+
+// claudeThinkingTypeAcceptsBlockBinding reports whether the body's thinking
+// mode may carry block_binding on this model. Haiku 5.5 and Sonnet 5.5 accept
+// it only with adaptive thinking (disabled/between_tools return 400); the
+// other preserved-thinking models also accept manual enabled thinking.
+func claudeThinkingTypeAcceptsBlockBinding(model, thinkingType string) bool {
+	switch strings.ToLower(strings.TrimSpace(thinkingType)) {
+	case "adaptive":
+		return true
+	case "enabled":
+		return !isClaudeHaiku55Model(model) && !isClaudeSonnet55Model(model)
+	default:
+		return false
+	}
+}
+
+// claudeBodyHasSignedThinkingBlock reports whether any assistant message
+// carries a replayed thinking block with a signature or a redacted_thinking
+// block, i.e. history Anthropic subjects to prefix binding validation.
+func claudeBodyHasSignedThinkingBlock(body []byte) bool {
+	found := false
+	gjson.GetBytes(body, "messages").ForEach(func(_, msg gjson.Result) bool {
+		msg.Get("content").ForEach(func(_, block gjson.Result) bool {
+			switch strings.TrimSpace(block.Get("type").String()) {
+			case "thinking":
+				found = strings.TrimSpace(block.Get("signature").String()) != ""
+			case "redacted_thinking":
+				found = strings.TrimSpace(block.Get("data").String()) != ""
+			}
+			return !found
+		})
+		return !found
+	})
+	return found
+}
+
+// applyClaudePreservedThinkingBinding makes relayed or reshaped histories
+// survivable on preserved-thinking models: when the request replays signed
+// thinking blocks, default thinking.block_binding.prefix_mismatch_behavior to
+// drop_block so a prefix mismatch (client reconnect resending history, a
+// changed tools list, reconstructed server-tool blocks) drops the bound
+// blocks instead of failing the whole request with a 400. On preserved-thinking
+// models, an omitted thinking field runs adaptive thinking and is equivalent to
+// {"type":"adaptive"}, so synthesize that adaptive thinking object unless
+// tool_choice forces tool use. A thinking object without a type and any
+// caller-supplied prefix_mismatch_behavior stay untouched. This must run before
+// user payload rules, which stay the final semantic barrier and may override or
+// filter the injected value.
+func applyClaudePreservedThinkingBinding(body []byte) []byte {
+	model := gjson.GetBytes(body, "model").String()
+	if len(body) == 0 || !isClaudePreservedThinkingModel(model) || claudeToolChoiceForcesToolUse(body) {
+		return body
+	}
+	thinking := gjson.GetBytes(body, "thinking")
+	if thinking.Exists() {
+		if !claudeThinkingTypeAcceptsBlockBinding(model, thinking.Get("type").String()) || thinking.Get("block_binding.prefix_mismatch_behavior").Exists() {
+			return body
+		}
+	}
+	if !claudeBodyHasSignedThinkingBlock(body) {
+		return body
+	}
+	if !thinking.Exists() {
+		body, _ = sjson.SetBytes(body, "thinking.type", "adaptive")
+	}
+	body, _ = sjson.SetBytes(body, "thinking.block_binding.prefix_mismatch_behavior", "drop_block")
+	return body
+}
+
+// claudeModelUsesProgressDisplay reports the 2.1.280 interactive CLI models that
+// send thinking.display=updates unless the caller already chose a display mode.
+func claudeModelUsesProgressDisplay(model string) bool {
+	return isClaudeOpus55Model(model) || isClaudeFable51Model(model) || isClaudeSonnet5Model(model) || isClaudeSonnet55Model(model)
+}
+
+// applyClaudeCloakThinkingDisplay fills the latest CLI display only when the
+// translated caller did not choose one. An explicit summarized or omitted value
+// from Responses, Chat, or Gemini stays untouched.
+func applyClaudeCloakThinkingDisplay(body []byte, callerOwned bool) []byte {
+	if callerOwned || len(body) == 0 || gjson.GetBytes(body, "thinking.display").Exists() {
+		return body
+	}
+	if !claudeModelUsesProgressDisplay(gjson.GetBytes(body, "model").String()) {
+		return body
+	}
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String())) {
+	case "adaptive", "enabled":
+	default:
+		return body
+	}
+	body, _ = sjson.SetBytes(body, "thinking.display", "updates")
+	return body
+}
+
+func claudeModelHasPerTurnEffort(model string) bool {
+	return isClaudeOpus55Model(model) || strings.HasPrefix(claudeCanonicalModel(model), "claude-fable-5-1")
+}
+
+// claudeModelHasPerTurnTiming reports models whose catalog lists per_turn_timing.
+// Claude Code still withholds timing-2026-09-09 unless CLAUDE_CODE_PER_TURN_TIMING
+// is set, so the beta follows the body or an explicit caller request.
+func claudeModelHasPerTurnTiming(model string) bool {
+	model = claudeCanonicalModel(model)
+	return claudeModelHasPerTurnEffort(model) || strings.HasPrefix(model, "claude-mythos-5-1")
+}
+
+func claudeIncludePerTurnControl(body []byte, requested map[string]bool) bool {
+	if requested[claudePerTurnControlBeta] {
+		return true
+	}
+	return claudeModelHasPerTurnEffort(gjson.GetBytes(body, "model").String())
+}
+
+func claudeIncludePerTurnTiming(body []byte, requested map[string]bool) bool {
+	if requested[claudePerTurnTimingBeta] {
+		return true
+	}
+	if !claudeModelHasPerTurnTiming(gjson.GetBytes(body, "model").String()) {
+		return false
+	}
+	if gjson.GetBytes(body, "output_config.timing").Exists() {
+		return true
+	}
+	found := false
+	gjson.GetBytes(body, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("output_config.timing").Exists() {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func claudeIncludeInlineTools(body []byte, requested map[string]bool) bool {
+	if requested[claudeInlineToolsBeta] {
+		return true
+	}
+	found := false
+	gjson.GetBytes(body, "messages").ForEach(func(_, msg gjson.Result) bool {
+		msg.Get("content").ForEach(func(_, block gjson.Result) bool {
+			if strings.EqualFold(strings.TrimSpace(block.Get("type").String()), "tool_addition") && block.Get("tool.definition").Exists() {
+				found = true
+				return false
+			}
+			return true
+		})
+		return !found
+	})
+	return found
+}
+
+func claudeIncludeMidConvClearAt(body []byte, requested map[string]bool) bool {
+	if requested[claudeMidConvSystemClearAtBeta] || claudeModelUsesProgressDisplay(gjson.GetBytes(body, "model").String()) {
+		return true
+	}
+	found := false
+	gjson.GetBytes(body, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("clear_at").Exists() {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func claudeRequestSupportsEffort(body []byte, requested map[string]bool) bool {
@@ -366,6 +694,23 @@ func withoutClaudeBeta(betas, removeBeta string) string {
 	return strings.Join(res, ",")
 }
 
+// withClaudeBetaAppended appends beta at the end unless it is already present.
+func withClaudeBetaAppended(betas, beta string) string {
+	beta = strings.TrimSpace(beta)
+	if beta == "" {
+		return betas
+	}
+	for _, existing := range strings.Split(betas, ",") {
+		if strings.TrimSpace(existing) == beta {
+			return betas
+		}
+	}
+	if strings.TrimSpace(betas) == "" {
+		return beta
+	}
+	return betas + "," + beta
+}
+
 func withClaudeExtendedCacheTTLBeta(betas string) string {
 	parts := make([]string, 0, 16)
 	seen := make(map[string]bool)
@@ -458,13 +803,17 @@ func (e claudeRateLimitError) IsRequestScoped() bool {
 // the whole Claude pool and cool down every credential, all of which remain
 // perfectly healthy for ordinary traffic. The refusal belongs to the request.
 func classifyClaudeUpstreamError(statusCode int, headers http.Header, body []byte) error {
+	return classifyClaudeUpstreamErrorWithCooling(statusCode, headers, body, false)
+}
+
+func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header, body []byte, modelLevelCooling bool) error {
 	var retryAfter *time.Duration
 	if statusCode == http.StatusTooManyRequests || (statusCode >= 400 && statusCode < 600) {
-		retryAfter = helps.ParseClaudeRateLimitReset(headers, time.Now())
+		retryAfter = helps.ParseClaudeRateLimitResetForError(headers, body, time.Now())
 	}
 	err := statusErr{code: statusCode, msg: string(body), retryAfter: retryAfter}
 	if statusCode == http.StatusTooManyRequests {
-		if helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
+		if !modelLevelCooling && helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
 			return claudeRateLimitError{statusErr: err, credentialScoped: true}
 		}
 		if claudeBodyIndicatesFastModeCredits(body) {
@@ -547,13 +896,17 @@ func extractAndRemoveBetas(body []byte) ([]string, []byte) {
 	return betas, body
 }
 
+func claudeToolChoiceForcesToolUse(body []byte) bool {
+	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
+	return toolChoiceType == "any" || toolChoiceType == "tool"
+}
+
 // disableThinkingIfToolChoiceForced checks if tool_choice forces tool use and disables thinking.
 // Anthropic API does not allow thinking when tool_choice is set to "any" or a specific tool.
 // See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#important-considerations
 func disableThinkingIfToolChoiceForced(body []byte) []byte {
-	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
 	// "auto" is allowed with thinking, but "any" or "tool" (specific tool) are not
-	if toolChoiceType == "any" || toolChoiceType == "tool" {
+	if claudeToolChoiceForcesToolUse(body) {
 		// Remove thinking configuration entirely to avoid API error
 		body, _ = sjson.DeleteBytes(body, "thinking")
 		// Adaptive thinking may also set output_config.effort; remove it to avoid
@@ -610,6 +963,7 @@ func normalizeClaudeSamplingForUpstream(body []byte, nativeOwned bool) []byte {
 	return body
 }
 
+<<<<<<< HEAD
 // claudeThinkingActive reports whether the outgoing body still asks Anthropic for
 // extended thinking.
 func claudeThinkingActive(body []byte) bool {
@@ -756,133 +1110,14 @@ func (p *peekableBody) Close() error {
 	return p.closer.Close()
 }
 
+=======
+>>>>>>> v8.0.46
 func claudeResponseContentEncoding(header http.Header) string {
 	return strings.Join(header.Values("Content-Encoding"), ",")
 }
 
 func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadCloser, error) {
-	if body == nil {
-		return nil, fmt.Errorf("response body is nil")
-	}
-	if contentEncoding == "" {
-		// No Content-Encoding header.  Attempt best-effort magic-byte detection to
-		// handle misbehaving upstreams that compress without setting the header.
-		// Only gzip (1f 8b) and zstd (28 b5 2f fd) have reliable magic sequences;
-		// br and deflate have none and are left as-is.
-		// The bufio wrapper preserves unread bytes so callers always see the full
-		// stream regardless of whether decompression was applied.
-		pb := &peekableBody{Reader: bufio.NewReader(body), closer: body}
-		magic, peekErr := pb.Peek(4)
-		if peekErr == nil || (peekErr == io.EOF && len(magic) >= 2) {
-			switch {
-			case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
-				gzipReader, gzErr := gzip.NewReader(pb)
-				if gzErr != nil {
-					_ = pb.Close()
-					return nil, fmt.Errorf("magic-byte gzip: failed to create reader: %w", gzErr)
-				}
-				return &compositeReadCloser{
-					Reader: gzipReader,
-					closers: []func() error{
-						gzipReader.Close,
-						pb.Close,
-					},
-				}, nil
-			case len(magic) >= 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
-				decoder, zdErr := zstd.NewReader(pb)
-				if zdErr != nil {
-					_ = pb.Close()
-					return nil, fmt.Errorf("magic-byte zstd: failed to create reader: %w", zdErr)
-				}
-				return &compositeReadCloser{
-					Reader: decoder,
-					closers: []func() error{
-						func() error { decoder.Close(); return nil },
-						pb.Close,
-					},
-				}, nil
-			}
-		}
-		return pb, nil
-	}
-	encodings := strings.Split(contentEncoding, ",")
-	reader := io.Reader(body)
-	decoderClosers := make([]func() error, 0, len(encodings))
-	cleanup := func() {
-		for i := len(decoderClosers) - 1; i >= 0; i-- {
-			_ = decoderClosers[i]()
-		}
-		_ = body.Close()
-	}
-	for index := len(encodings) - 1; index >= 0; index-- {
-		encoding := strings.TrimSpace(strings.ToLower(encodings[index]))
-		switch encoding {
-		case "", "identity":
-			continue
-		case "gzip":
-			gzipReader, errGzip := gzip.NewReader(reader)
-			if errGzip != nil {
-				cleanup()
-				return nil, fmt.Errorf("failed to create gzip reader: %w", errGzip)
-			}
-			reader = gzipReader
-			decoderClosers = append(decoderClosers, gzipReader.Close)
-		case "deflate":
-			deflateReader, errDeflate := newClaudeDeflateReader(reader)
-			if errDeflate != nil {
-				cleanup()
-				return nil, errDeflate
-			}
-			reader = deflateReader
-			decoderClosers = append(decoderClosers, deflateReader.Close)
-		case "br":
-			reader = brotli.NewReader(reader)
-		case "zstd":
-			decoder, errZstd := zstd.NewReader(reader)
-			if errZstd != nil {
-				cleanup()
-				return nil, fmt.Errorf("failed to create zstd reader: %w", errZstd)
-			}
-			reader = decoder
-			decoderClosers = append(decoderClosers, func() error {
-				decoder.Close()
-				return nil
-			})
-		default:
-			cleanup()
-			return nil, fmt.Errorf("unsupported content encoding %q", encoding)
-		}
-	}
-	if len(decoderClosers) == 0 && reader == body {
-		return body, nil
-	}
-	closers := make([]func() error, 0, len(decoderClosers)+1)
-	for index := len(decoderClosers) - 1; index >= 0; index-- {
-		closers = append(closers, decoderClosers[index])
-	}
-	closers = append(closers, body.Close)
-	return &compositeReadCloser{Reader: reader, closers: closers}, nil
-}
-
-func newClaudeDeflateReader(reader io.Reader) (io.ReadCloser, error) {
-	buffered := bufio.NewReader(reader)
-	header, errPeek := buffered.Peek(2)
-	if errPeek == nil && isZlibHeader(header) {
-		zlibReader, errZlib := zlib.NewReader(buffered)
-		if errZlib != nil {
-			return nil, fmt.Errorf("failed to create zlib deflate reader: %w", errZlib)
-		}
-		return zlibReader, nil
-	}
-	return flate.NewReader(buffered), nil
-}
-
-func isZlibHeader(header []byte) bool {
-	if len(header) < 2 {
-		return false
-	}
-	cmf, flg := header[0], header[1]
-	return cmf&0x0f == 8 && cmf>>4 <= 7 && (uint16(cmf)<<8|uint16(flg))%31 == 0
+	return helps.DecodeResponseBody(body, http.Header{"Content-Encoding": {contentEncoding}})
 }
 
 // claudeCredentialUsesOAuth classifies the selected upstream credential. It is the
@@ -899,7 +1134,7 @@ func claudeCredentialUsesOAuth(auth *cliproxyauth.Auth, apiKey string) bool {
 	return !hasAPIKeyAttr
 }
 
-func copyClaudeCallerFingerprintHeaders(dst, src http.Header) {
+func copyClaudeCallerFingerprintHeaders(dst, src http.Header, confirmedClaudeCode, uncloak bool) {
 	if dst == nil || src == nil {
 		return
 	}
@@ -914,6 +1149,24 @@ func copyClaudeCallerFingerprintHeaders(dst, src http.Header) {
 			lowerName != "x-client-app" &&
 			lowerName != "x-anthropic-additional-protection" {
 			continue
+		}
+		if !confirmedClaudeCode && (strings.HasPrefix(lowerName, "x-claude-code-") || strings.HasPrefix(lowerName, "x-claude-remote-")) {
+			continue
+		}
+		if uncloak {
+			if lowerName == "x-app" ||
+				lowerName == "x-client-request-id" ||
+				lowerName == "x-client-app" ||
+				lowerName == "x-anthropic-additional-protection" ||
+				lowerName == "anthropic-dangerous-direct-browser-access" ||
+				strings.HasPrefix(lowerName, "x-stainless-") ||
+				strings.HasPrefix(lowerName, "x-claude-code-") ||
+				strings.HasPrefix(lowerName, "x-claude-remote-") {
+				continue
+			}
+			if lowerName == "user-agent" && len(values) > 0 && helps.IsClaudeCodeUserAgent(values[0]) {
+				continue
+			}
 		}
 		dst.Del(name)
 		for _, value := range values {
@@ -973,6 +1226,11 @@ func applyClaudeHeadersWithNativeProfile(
 	useAPIKey := !credentialUsesBearer
 	fp := resolveClaudeFingerprintPolicy(cfg, auth, apiKey)
 	wirePolicy, _ := resolveClaudeWirePolicy(cfg, auth, apiKey, confirmedClaudeCode)
+	if wirePolicy.Uncloak {
+		confirmedClaudeCode = false
+		helperProfile = false
+		sessionIDs = nil
+	}
 	applyCLIFingerprint := fp.ProfileClaudeCodeCLI || wirePolicy.Cloak
 	preserveCallerFingerprint := !applyCLIFingerprint && !confirmedClaudeCode
 	useOAuthBetas := fp.UseOAuthBetas
@@ -998,16 +1256,16 @@ func applyClaudeHeadersWithNativeProfile(
 	}
 	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
 	var deviceProfile helps.ClaudeDeviceProfile
-	if stabilizeDeviceProfile && confirmedClaudeCode {
-		var errDeviceProfile error
-		deviceProfile, errDeviceProfile = helps.ResolveClaudeDeviceProfileRequired(r.Context(), auth, apiKey, incomingHeaders, cfg)
-		if errDeviceProfile != nil {
-			return errDeviceProfile
-		}
-	}
 
 	incomingBetas := strings.TrimSpace(strings.Join(helps.HeaderValuesCaseInsensitive(incomingHeaders, "Anthropic-Beta"), ","))
 	countTokens := r.URL != nil && strings.HasSuffix(r.URL.Path, "/count_tokens")
+	if !confirmedClaudeCode && !wirePolicy.Cloak && wirePolicy.ExplicitNever && !wirePolicy.Uncloak {
+		det := helps.DetectClaudeCodeRequest(incomingHeaders, body, countTokens, cfg)
+		if det.ConfirmedShape {
+			confirmedClaudeCode = true
+			helperProfile = helperProfile || (!det.BetasPresent && !countTokens)
+		}
+	}
 	requestedMap := claudeRequestedBetas(incomingBetas, extraBetas)
 	advisorNeeded := requestedMap[claudeAdvisorToolBeta] || claudeBodyHasAdvisorTool(body)
 
@@ -1026,19 +1284,27 @@ func applyClaudeHeadersWithNativeProfile(
 		if advisorNeeded {
 			baseBetas = withClaudeAdvisorToolBeta(baseBetas)
 		}
-		// Measured Haiku helper requests already carry the exact credential
-		// beta profile and intentionally omit extended-cache-ttl.
+		// Measured Haiku helper requests already carry their own cache-ttl beta
+		// choice (omitting extended-cache-ttl on 2.1.220/2.1.280 probes/title
+		// helpers), while helpers arriving via ANTHROPIC_BASE_URL still need
+		// oauth-2025-04-20 when CPA authenticates upstream with OAuth.
 		// Native Claude Code subagents and probes also omit extended-cache-ttl.
-		if useOAuthBetas && !helperProfile {
+		if useOAuthBetas {
 			if countTokens {
 				baseBetas = withClaudeCountTokensOAuthBeta(baseBetas)
 			} else {
 				isSubagent := helps.IsClaudeSubagentRequest(incomingHeaders, body)
 				isProbe := helps.IsClaudeProbeOrHelperRequest(body)
 				subagent1h := isSubagent && helps.ClaudeSubagentRequests1h(incomingHeaders, body)
-				includeExtendedCacheTTL := (!isSubagent || subagent1h) && !isProbe
+				includeExtendedCacheTTL := !helperProfile && (!isSubagent || subagent1h) && !isProbe
 				baseBetas = withClaudeOAuthCredentialBetas(baseBetas, includeExtendedCacheTTL)
 			}
+		}
+	} else if preserveCallerFingerprint && useOAuthBetas {
+		if countTokens {
+			baseBetas = withClaudeCountTokensOAuthBeta(baseBetas)
+		} else {
+			baseBetas = withClaudeOAuthCredentialBetas(baseBetas, false)
 		}
 	}
 	if preserveCallerFingerprint && advisorNeeded {
@@ -1075,11 +1341,23 @@ func applyClaudeHeadersWithNativeProfile(
 			appendBeta(beta)
 		}
 	} else {
-		// On direct Anthropic an unconfirmed CLI-profile caller's own betas are
-		// dropped: appending them to the measured baseline produces a shape real
-		// Claude Code never sends. Custom gateways keep caller extensions.
-		if !confirmedClaudeCode && incomingBetas != "" && !isAnthropicBase {
+		// On direct Anthropic an unconfirmed CLI-profile caller's managed betas
+		// are dropped: appending them to the measured baseline produces a shape
+		// real Claude Code never sends. Caller betas the proxy does not manage
+		// are newer-client features the pinned profile predates; dropping them
+		// fails those requests outright, so they are forwarded (#5738).
+		// per-turn-control-2026-07-01 is assembled for models that send it.
+		// Custom
+		// gateways keep all caller extensions.
+		if !confirmedClaudeCode && incomingBetas != "" {
 			for _, beta := range strings.Split(incomingBetas, ",") {
+				beta = strings.TrimSpace(beta)
+				if beta == "" {
+					continue
+				}
+				if isManagedClaudeBeta(beta) && isAnthropicBase {
+					continue
+				}
 				appendBeta(beta)
 			}
 		}
@@ -1090,12 +1368,27 @@ func applyClaudeHeadersWithNativeProfile(
 		}
 	}
 	applyBetaHeader := func() {
-		// Enforce strict native Claude Code 2.1.258 model & turn beta gating:
+		if wirePolicy.Uncloak {
+			baseBetas = withoutClaudeBeta(baseBetas, claudeCodeBeta)
+			baseBetas = withoutClaudeBeta(baseBetas, claudeOAuthBeta)
+			baseBetas = withoutClaudeBeta(baseBetas, claudeRedactThinkingBeta)
+			baseBetas = withoutClaudeBeta(baseBetas, claudeAFKModeBeta)
+			if !gjson.GetBytes(body, "diagnostics").Exists() {
+				baseBetas = withoutClaudeBeta(baseBetas, claudeCacheDiagnosisBeta)
+			}
+			if !gjson.GetBytes(body, "fallback_credit_token").Exists() {
+				baseBetas = withoutClaudeBeta(baseBetas, claudeFallbackCreditBeta)
+			}
+			if !helps.ClaudePayloadHas1hTTL(body) {
+				baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
+			}
+		}
+		// Enforce strict native Claude Code 2.1.280 model & turn beta gating:
 		if !claudeRequestSupportsEffort(body, nil) {
 			baseBetas = withoutClaudeBeta(baseBetas, claudeEffortBeta)
 		}
 		reqProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(body)
-		if reqProbeOrHelper {
+		if reqProbeOrHelper && !helperProfile {
 			baseBetas = withoutClaudeBeta(baseBetas, claudeServerSideFallbackBeta)
 			baseBetas = withoutClaudeBeta(baseBetas, claudeThinkingDisplayUpdatesBeta)
 			baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
@@ -1111,15 +1404,31 @@ func applyClaudeHeadersWithNativeProfile(
 			baseBetas = withClaudeExtendedCacheTTLBeta(baseBetas)
 		}
 		reqModel := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "model").String()))
-		if isClaudeHaikuModel(reqModel) && !gjson.GetBytes(body, "fallbacks").Exists() {
+		if isClaudeHaikuModel(reqModel) && !gjson.GetBytes(body, "fallbacks").Exists() && !helperProfile {
 			baseBetas = withoutClaudeBeta(baseBetas, claudeServerSideFallbackBeta)
 		}
+		// A body carrying thinking.block_binding is rejected upstream unless
+		// the binding-controls beta travels with it, in every fingerprint
+		// mode (cloaked, caller-owned, and confirmed passthrough alike).
+		if gjson.GetBytes(body, "thinking.block_binding").Exists() {
+			baseBetas = withClaudeBetaAppended(baseBetas, claudeThinkingBindingBeta)
+		}
+		// Operator overrides get the last word over the derived and caller betas:
+		// strip filters without re-sorting, append adds missing names at the end.
+		// They only shape the emitted value, so re-applying the header stays stable.
+		emittedBetas := baseBetas
+		for _, beta := range hd.AnthropicBetaStrip {
+			emittedBetas = withoutClaudeBeta(emittedBetas, beta)
+		}
+		for _, beta := range hd.AnthropicBetaAppend {
+			emittedBetas = withClaudeBetaAppended(emittedBetas, beta)
+		}
 
-		if strings.TrimSpace(baseBetas) == "" {
+		if strings.TrimSpace(emittedBetas) == "" {
 			r.Header.Del("Anthropic-Beta")
 			return
 		}
-		r.Header.Set("Anthropic-Beta", baseBetas)
+		r.Header.Set("Anthropic-Beta", emittedBetas)
 	}
 	applyBetaHeader()
 
@@ -1130,7 +1439,10 @@ func applyClaudeHeadersWithNativeProfile(
 			defaultAccept = "text/event-stream"
 			defaultAcceptEncoding = "identity"
 		}
-		copyClaudeCallerFingerprintHeaders(r.Header, incomingHeaders)
+		copyClaudeCallerFingerprintHeaders(r.Header, incomingHeaders, confirmedClaudeCode, wirePolicy.Uncloak)
+		if hd.ClientRequestID == config.ClaudeClientRequestIDOff {
+			r.Header.Del("X-Client-Request-Id")
+		}
 		misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Version", "2023-06-01")
 		misc.EnsureHeader(r.Header, incomingHeaders, "Accept", defaultAccept)
 		misc.EnsureHeader(r.Header, incomingHeaders, "Accept-Encoding", defaultAcceptEncoding)
@@ -1138,8 +1450,22 @@ func applyClaudeHeadersWithNativeProfile(
 		// sent none must not fall through to Go's transport default
 		// ("Go-http-client/1.1"), which upstreams read as a bot signature. Identify
 		// as CPA instead: honest about the hop, and not a fabricated client.
-		misc.EnsureHeader(r.Header, incomingHeaders, "User-Agent", "CLIProxyAPI/"+buildinfo.Version)
+		uaSourceHeaders := incomingHeaders
+		if wirePolicy.Uncloak && helps.IsClaudeCodeUserAgent(helps.HeaderValueCaseInsensitive(incomingHeaders, "User-Agent")) {
+			uaSourceHeaders = nil
+		}
+		misc.EnsureHeader(r.Header, uaSourceHeaders, "User-Agent", "CLIProxyAPI/"+buildinfo.Version)
 		applyBetaHeader()
+		sessionID := ""
+		for _, candidate := range sessionIDs {
+			if candidate = strings.TrimSpace(candidate); candidate != "" {
+				sessionID = candidate
+				break
+			}
+		}
+		if sessionID != "" {
+			r.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		}
 		var attrs map[string]string
 		if auth != nil {
 			attrs = auth.Attributes
@@ -1181,7 +1507,7 @@ func applyClaudeHeadersWithNativeProfile(
 	identityHeader("Anthropic-Version", "2023-06-01")
 	identityHeader("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	identityHeader("X-App", "cli")
-	// Values below match Claude Code 2.1.258 / @anthropic-ai/sdk 0.112.1.
+	// Values below match Claude Code 2.1.280 / @anthropic-ai/sdk 0.112.1.
 	identityHeader("X-Stainless-Retry-Count", "0")
 	identityHeader("X-Stainless-Runtime", "node")
 	identityHeader("X-Stainless-Lang", "js")
@@ -1232,6 +1558,21 @@ func applyClaudeHeadersWithNativeProfile(
 			r.Header.Set(hdr, val)
 		}
 	}
+	// Gateway hints are caller-owned software state. Preserve them only for a
+	// confirmed native client; an unconfirmed caller must not spoof its class.
+	if confirmedClaudeCode {
+		for _, hdr := range []string{
+			"X-Claude-Code-Request-Class",
+			"X-Claude-Code-Agent-Type",
+			"X-Claude-Code-Prev-Tool-Durations",
+			"X-Claude-Code-Compaction",
+			"X-Claude-Code-Context-Compacted",
+		} {
+			if val := helps.HeaderValueCaseInsensitive(incomingHeaders, hdr); val != "" {
+				r.Header.Set(hdr, val)
+			}
+		}
+	}
 	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
 	// identityHeader prefers the incoming value for a confirmed client, so a confirmed
 	// helper keeps its own native request ID and this fresh UUID only covers a caller
@@ -1239,8 +1580,15 @@ func applyClaudeHeadersWithNativeProfile(
 	// request ID they already sent: 2.1.258 attaches the header just for a first-party
 	// base URL, so a helper that arrived without one keeps it absent upstream rather
 	// than gaining a synthesized ID the real client would not have sent.
-	if isAnthropicBase || (helperProfile && helps.HeaderValueCaseInsensitive(incomingHeaders, "x-client-request-id") != "") {
-		identityHeader("x-client-request-id", uuid.New().String())
+	// header-defaults.client-request-id=passthrough forwards only the caller's own
+	// value and never synthesizes one; off never sends the header.
+	incomingClientRequestID := helps.HeaderValueCaseInsensitive(incomingHeaders, "x-client-request-id")
+	if hd.ClientRequestID != config.ClaudeClientRequestIDOff && (isAnthropicBase || (helperProfile && incomingClientRequestID != "")) {
+		if hd.ClientRequestID != config.ClaudeClientRequestIDPassthrough {
+			identityHeader("x-client-request-id", uuid.New().String())
+		} else if incomingClientRequestID != "" {
+			r.Header.Set("x-client-request-id", incomingClientRequestID)
+		}
 	}
 	r.Header.Set("Connection", "keep-alive")
 	// Regular Claude Code requests negotiate transport identically for streaming
@@ -1268,8 +1616,15 @@ func applyClaudeHeadersWithNativeProfile(
 	// Confirmed Claude Code requests may contribute their real software profile.
 	// Unconfirmed clients always receive the CLI baseline instead of being
 	// allowed to populate or reuse another client's software profile.
-	if stabilizeDeviceProfile {
+	if wirePolicy.ExplicitNever && confirmedClaudeCode {
+		helps.ApplyClaudeLegacyDeviceHeaders(r, incomingHeaders, cfg, true, true)
+	} else if stabilizeDeviceProfile {
 		if confirmedClaudeCode {
+			var errDeviceProfile error
+			deviceProfile, errDeviceProfile = helps.ResolveClaudeDeviceProfileRequired(r.Context(), auth, apiKey, incomingHeaders, cfg)
+			if errDeviceProfile != nil {
+				return errDeviceProfile
+			}
 			helps.ApplyClaudeDeviceProfileHeaders(r, deviceProfile)
 		} else {
 			helps.ApplyClaudeDefaultDeviceProfileHeaders(r, cfg)
@@ -1289,7 +1644,7 @@ func applyClaudeHeadersWithNativeProfile(
 	// overridden Accept-Encoding contradicts the negotiated transport. Both were
 	// reachable because this ran after the whole header set was assembled.
 	if isAnthropicBase {
-		r.Header.Set("Anthropic-Beta", baseBetas)
+		applyBetaHeader()
 		applyTransportNegotiation()
 	} else if stream {
 		// Elsewhere only streaming is protected, so an Accept override cannot
@@ -1479,15 +1834,27 @@ type claudeMCPAliasOptions struct {
 	secret string
 }
 
-func resolveClaudeMCPAliasOptions(ctx context.Context) claudeMCPAliasOptions {
+func resolveClaudeMCPAliasOptions(ctx context.Context, metadataSets ...map[string]any) claudeMCPAliasOptions {
 	// Alias identity belongs to the downstream caller, not to the selected
 	// upstream credential. This keeps names stable across OAuth refresh and auth
 	// failover while giving one caller a shared virtual MCP server component.
-	secret := strings.TrimSpace(helps.APIKeyFromContext(ctx))
+	secret := callerScopeFromMetadataSets(metadataSets...)
+	if secret == "" {
+		secret = session.CallerScope(helps.APIKeyFromContext(ctx))
+	}
 	if secret == "" {
 		secret = "cpa-claude-mcp-default-caller"
 	}
 	return claudeMCPAliasOptions{secret: secret}
+}
+
+func callerScopeFromMetadataSets(metadataSets ...map[string]any) string {
+	for _, metadata := range metadataSets {
+		if scope := metadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey); scope != "" {
+			return scope
+		}
+	}
+	return ""
 }
 
 // prepareClaudeOAuthToolNamesForUpstream applies one request-local MCP symbol
@@ -1509,7 +1876,8 @@ func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, reverseMap map[strin
 // typed Anthropic tools remain unchanged.
 //
 // It operates on tools[].name, tool_choice.name, and all declared
-// tool_use/tool_reference references in messages.
+// tool_use/tool_reference references in messages, including mid-conversation
+// tool_addition/tool_removal blocks.
 //
 // The returned map is keyed on the upstream name and maps to the client-supplied
 // original name. Callers MUST pass this map to the reverse
@@ -1766,6 +2134,18 @@ func remapOAuthToolNamesWithBatchedEdits(body []byte, mcpAliases claudeMCPAliasO
 							return true
 						})
 					}
+				case "tool_addition", "tool_removal":
+					if namePath := claudeToolChangeNamePath(part); namePath != "" {
+						nameResult := part.Get(namePath)
+						changeToolName := nameResult.String()
+						if newName, renamed := rewriteName(changeToolName); renamed {
+							if !appendStringEdit(nameResult, newName) {
+								validOffsets = false
+								return false
+							}
+							recordRename(changeToolName, newName)
+						}
+					}
 				}
 				return validOffsets
 			})
@@ -2009,6 +2389,15 @@ func remapOAuthToolNamesWithOptionsLegacy(body []byte, mcpAliases claudeMCPAlias
 							return true
 						})
 					}
+				case "tool_addition", "tool_removal":
+					if namePath := claudeToolChangeNamePath(part); namePath != "" {
+						changeToolName := part.Get(namePath).String()
+						if newName, renamed := rewriteName(changeToolName); renamed {
+							changePath := fmt.Sprintf("messages.%d.content.%d.%s", msgIndex.Int(), contentIndex.Int(), namePath)
+							body, _ = sjson.SetBytes(body, changePath, newName)
+							recordRename(changeToolName, newName)
+						}
+					}
 				}
 				return true
 			})
@@ -2017,6 +2406,27 @@ func remapOAuthToolNamesWithOptionsLegacy(body []byte, mcpAliases claudeMCPAlias
 	}
 
 	return body, reverseMap
+}
+
+// claudeToolChangeNamePath returns the path, relative to a mid-conversation
+// tool_addition or tool_removal block, of the tool name that must carry the
+// same MCP alias as tools[]. A tool_reference names a tool declared in tools[];
+// upstream rejects a reference to an undeclared name. A tool_addition can
+// instead carry a tool_definition (inline-tools-2026-09-15) whose definition is
+// a tools[] entry; redefining a declared custom tool replaces it only under the
+// same upstream name. Server tool definitions and MCP connector references keep
+// their names, matching the tools[] rewrite.
+func claudeToolChangeNamePath(part gjson.Result) string {
+	switch part.Get("tool.type").String() {
+	case "tool_reference":
+		return "tool.name"
+	case "tool_definition":
+		if part.Get("type").String() != "tool_addition" || helps.IsClaudeServerToolType(part.Get("tool.definition.type").String()) {
+			return ""
+		}
+		return "tool.definition.name"
+	}
+	return ""
 }
 
 type claudeMCPAliasParts struct {
@@ -2032,9 +2442,10 @@ type claudeMCPAliasEntry struct {
 }
 
 type claudeMCPAliasResolver struct {
-	exact   map[string]string
-	aliases []claudeMCPAliasEntry
-	servers map[string]struct{}
+	exact        map[string]string
+	aliases      []claudeMCPAliasEntry
+	servers      map[string]struct{}
+	passthroughs []string
 }
 
 type claudeMCPAliasRestoreError struct {
@@ -2051,14 +2462,17 @@ func (claudeMCPAliasRestoreError) IsRequestScoped() bool {
 
 func newClaudeMCPAliasResolver(reverseMap map[string]string) claudeMCPAliasResolver {
 	resolver := claudeMCPAliasResolver{
-		exact:   reverseMap,
-		aliases: make([]claudeMCPAliasEntry, 0, len(reverseMap)),
-		servers: make(map[string]struct{}),
+		exact:        reverseMap,
+		aliases:      make([]claudeMCPAliasEntry, 0, len(reverseMap)),
+		servers:      make(map[string]struct{}),
+		passthroughs: make([]string, 0),
 	}
 	for alias, original := range reverseMap {
 		if alias == original {
-			// Caller-owned MCP tool recorded for exact passthrough only. It must not
-			// register a virtual server or take part in fuzzy alias recovery.
+			// Caller-owned MCP tool recorded for exact passthrough and fallback hybrid
+			// recovery. It must not register a virtual server or take part in fuzzy
+			// client-tool alias recovery.
+			resolver.passthroughs = append(resolver.passthroughs, original)
 			continue
 		}
 		parts, ok := parseClaudeMCPAlias(alias)
@@ -2073,6 +2487,20 @@ func newClaudeMCPAliasResolver(reverseMap map[string]string) claudeMCPAliasResol
 		resolver.servers[parts.server] = struct{}{}
 	}
 	return resolver
+}
+
+// restorePassthroughWrapped maps a tail that is exactly a declared caller-owned MCP
+// tool name (mcp__server__tool) back to that tool.
+func (resolver claudeMCPAliasResolver) restorePassthroughWrapped(tail string) (string, bool) {
+	if tail == "" {
+		return "", false
+	}
+	for _, original := range resolver.passthroughs {
+		if original == tail {
+			return original, true
+		}
+	}
+	return "", false
 }
 
 func parseClaudeMCPAlias(name string) (claudeMCPAliasParts, bool) {
@@ -2220,7 +2648,54 @@ func (resolver claudeMCPAliasResolver) resolve(name string) (string, bool, error
 		return "", false, claudeMCPAliasRestoreError{fmt.Errorf("cannot restore Claude OAuth MCP tool alias %q: semantic suffix matches multiple declared tools", name)}
 	}
 
-	return "", false, claudeMCPAliasRestoreError{fmt.Errorf("cannot restore Claude OAuth MCP tool alias %q: no unique request-local match", name)}
+	if len(resolver.passthroughs) > 0 {
+		// Recovery 0: The model kept the caller's full tool name, mcp__ prefix included,
+		// under the virtual server (e.g. "mcp__<virtual>__mcp__<server>__<tool>").
+		// Recoveries 1 and 2 below only cover the <server>__<tool> and <tool> tails.
+		if original, ok := resolver.restorePassthroughWrapped(suffix); ok {
+			log.Debugf("claude oauth mcp alias: recovered %q as caller-owned tool %q", name, original)
+			return original, true, nil
+		}
+
+		// Recovery 1: The model prepended the virtual server to the full caller MCP tool name
+		// (e.g. "mcp__<virtual>__<real_server>__<tool>"). After stripping the virtual server prefix,
+		// re-prefixing suffix with "mcp__" produces the original caller tool name.
+		reprefixed := "mcp__" + suffix
+		if original, exact := resolver.exact[reprefixed]; exact && original == reprefixed {
+			log.Debugf("claude oauth mcp alias: recovered hybrid passthrough tool name %q as %q via exact prefix", name, original)
+			return original, true, nil
+		}
+
+		// Recovery 2: The model replaced the caller's server with the virtual server
+		// (e.g. "mcp__<virtual>__<tool>"). Match suffix against the tool component of
+		// declared passthrough tools. This runs strictly after client-tool alias recovery
+		// so that a client tool (e.g. "Bash") is never eclipsed by a passthrough tool
+		// with the same suffix (e.g. "mcp__shell__Bash").
+		matchedPassthrough := ""
+		passthroughMatches := 0
+		for _, pt := range resolver.passthroughs {
+			toolPart := pt
+			if rest, ok := strings.CutPrefix(pt, "mcp__"); ok {
+				if _, tool, ok := strings.Cut(rest, "__"); ok {
+					toolPart = tool
+				}
+			}
+			if toolPart == suffix {
+				matchedPassthrough = pt
+				passthroughMatches++
+			}
+		}
+		if passthroughMatches == 1 {
+			log.Debugf("claude oauth mcp alias: recovered hybrid passthrough tool name %q as %q via unique tool suffix", name, matchedPassthrough)
+			return matchedPassthrough, true, nil
+		}
+		if passthroughMatches > 1 {
+			return "", false, claudeMCPAliasRestoreError{fmt.Errorf("cannot restore Claude OAuth MCP tool alias %q: passthrough tool suffix matches multiple declared tools", name)}
+		}
+	}
+
+	log.Warnf("claude oauth mcp alias: cannot restore tool name %q: no unique request-local match; forwarding it unchanged", name)
+	return "", false, nil
 }
 
 // reverseRemapOAuthToolNames reverses the tool name mapping for non-stream responses
