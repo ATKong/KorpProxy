@@ -9,10 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -479,9 +477,15 @@ func unwrapXAIDispatcherArguments(rawArgs string, namespaceName string, refs map
 	}
 
 	if namespaceName != "" {
-		qualified := qualifyXAINamespaceToolName(namespaceName, childName)
-		if ref, exists := refs[qualified]; exists && ref.isDispatcher {
-			return "", nil, false
+		if dispRef, exists := refs[namespaceName]; exists && dispRef.isDispatcher && len(dispRef.children) > 0 {
+			if _, isChild := dispRef.children[childName]; !isChild {
+				return "", nil, false
+			}
+		} else {
+			qualified := qualifyXAINamespaceToolName(namespaceName, childName)
+			if ref, exists := refs[qualified]; exists && ref.isDispatcher {
+				return "", nil, false
+			}
 		}
 	} else {
 		isChildOfDispatcher := false
@@ -520,6 +524,70 @@ func unwrapXAIDispatcherArguments(rawArgs string, namespaceName string, refs map
 func restoreXAINamespaceToolCalls(data []byte, refs map[string]xaiNamespaceToolRef) []byte {
 	restorer := newXAINamespaceRestorer(refs)
 	return restorer.restore(data)
+}
+
+// restoreXAIClientWebSearchName rewrites the given alias
+// back to the original client tool name "web_search" across event items and
+// completed outputs. Only unnamespaced tool calls are restored so namespaced
+// tools (e.g. acme.clientfn_web_search) are preserved untouched.
+func restoreXAIClientWebSearchName(data []byte, alias string) []byte {
+	if alias == "" || !bytes.Contains(data, []byte(alias)) {
+		return data
+	}
+	if !gjson.ValidBytes(data) {
+		return data
+	}
+
+	// Check item (e.g. response.output_item.added / response.output_item.done)
+	if strings.TrimSpace(gjson.GetBytes(data, "item.namespace").String()) == "" {
+		if strings.TrimSpace(gjson.GetBytes(data, "item.name").String()) == alias {
+			data, _ = sjson.SetBytes(data, "item.name", xaiWebSearchToolType)
+		}
+		if strings.TrimSpace(gjson.GetBytes(data, "item.function.name").String()) == alias {
+			data, _ = sjson.SetBytes(data, "item.function.name", xaiWebSearchToolType)
+		}
+	}
+
+	// Check response.output array (e.g. response.completed / response.incomplete)
+	respOutput := gjson.GetBytes(data, "response.output")
+	if respOutput.IsArray() {
+		for idx, item := range respOutput.Array() {
+			if strings.TrimSpace(item.Get("namespace").String()) != "" {
+				continue
+			}
+			if strings.TrimSpace(item.Get("name").String()) == alias {
+				data, _ = sjson.SetBytes(data, fmt.Sprintf("response.output.%d.name", idx), xaiWebSearchToolType)
+			}
+			if strings.TrimSpace(item.Get("function.name").String()) == alias {
+				data, _ = sjson.SetBytes(data, fmt.Sprintf("response.output.%d.function.name", idx), xaiWebSearchToolType)
+			}
+		}
+	}
+
+	// Check top-level output array (non-stream responses translated)
+	topOutput := gjson.GetBytes(data, "output")
+	if topOutput.IsArray() {
+		for idx, item := range topOutput.Array() {
+			if strings.TrimSpace(item.Get("namespace").String()) != "" {
+				continue
+			}
+			if strings.TrimSpace(item.Get("name").String()) == alias {
+				data, _ = sjson.SetBytes(data, fmt.Sprintf("output.%d.name", idx), xaiWebSearchToolType)
+			}
+			if strings.TrimSpace(item.Get("function.name").String()) == alias {
+				data, _ = sjson.SetBytes(data, fmt.Sprintf("output.%d.function.name", idx), xaiWebSearchToolType)
+			}
+		}
+	}
+
+	// Check top-level name
+	if strings.TrimSpace(gjson.GetBytes(data, "namespace").String()) == "" {
+		if strings.TrimSpace(gjson.GetBytes(data, "name").String()) == alias {
+			data, _ = sjson.SetBytes(data, "name", xaiWebSearchToolType)
+		}
+	}
+
+	return data
 }
 
 // normalizeXAIObjectRootUnionBranchTypes makes untyped root union branches
@@ -616,6 +684,14 @@ func xaiFunctionParametersNeedSimplification(tool gjson.Result, namespaceName st
 }
 
 func sanitizeXAIInputEncryptedContent(body []byte) []byte {
+	return sanitizeXAIInputEncryptedContentWithOptions(body, false)
+}
+
+func sanitizeXAIInputEncryptedContentForBaseURL(body []byte, baseURL string) []byte {
+	return sanitizeXAIInputEncryptedContentWithOptions(body, isOpenRouterUpstreamURL(baseURL))
+}
+
+func sanitizeXAIInputEncryptedContentWithOptions(body []byte, allowRouterSuffix bool) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() || !input.IsArray() {
 		return body
@@ -637,10 +713,14 @@ func sanitizeXAIInputEncryptedContent(body []byte) []byte {
 			continue
 		}
 		reason := ""
+		rewrittenSig := ""
 		switch encryptedContent.Type {
 		case gjson.String:
-			if _, err := signature.InspectGrokEncryptedContent(encryptedContent.String()); err != nil {
+			rawSig := encryptedContent.String()
+			if info, err := signature.InspectGrokEncryptedContent(rawSig); err != nil {
 				reason = err.Error()
+			} else if info.RouterSuffix != "" && !allowRouterSuffix {
+				rewrittenSig = stripRouterSuffix(rawSig, info.RouterSuffix)
 			}
 		case gjson.Null:
 			reason = "encrypted_content is null"
@@ -648,6 +728,13 @@ func sanitizeXAIInputEncryptedContent(body []byte) []byte {
 			reason = fmt.Sprintf("encrypted_content must be a string, got %s", encryptedContent.Type.String())
 		}
 		if reason == "" {
+			if rewrittenSig != "" {
+				if next, errSet := sjson.SetBytes([]byte(item.Raw), "encrypted_content", rewrittenSig); errSet == nil {
+					items = append(items, json.RawMessage(next))
+					changed = true
+					continue
+				}
+			}
 			items = append(items, json.RawMessage(item.Raw))
 			continue
 		}
@@ -796,24 +883,6 @@ func appendXAIReasoningSummary(previous json.RawMessage, currentSummary []gjson.
 		updated = updatedItem
 	}
 	return updated, true
-}
-
-// xaiSupportsReasoningEffort reports whether the model accepts Responses API
-// reasoning.effort. Capability comes from model registry thinking metadata
-// (static models.json and dynamic registrations), not a hard-coded name allowlist.
-func xaiSupportsReasoningEffort(model string) bool {
-	name := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	if idx := strings.LastIndex(name, "/"); idx >= 0 {
-		name = name[idx+1:]
-	}
-	if name == "" {
-		return false
-	}
-	info := registry.LookupModelInfo(name, "xai")
-	if info == nil || info.Thinking == nil {
-		return false
-	}
-	return len(info.Thinking.Levels) > 0
 }
 
 func xaiNormalizeReasoningSummaryEventLine(line []byte, eventName string) []byte {
