@@ -9,9 +9,9 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -48,6 +48,9 @@ func newTestSymbolLookup(plugin *testPlugin) *testSymbolLookup {
 }
 
 func (l *testSymbolLookup) Call(ctx context.Context, method string, request []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	switch method {
 	case pluginabi.MethodPluginRegister:
 		return l.callLifecycle(request, false)
@@ -94,6 +97,26 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 			return nil, errIntercept
 		}
 		return marshalRPCResult(resp)
+	case pluginabi.MethodRequestPatchBodyBefore:
+		patcher := requestRecordBodyPatcher(capabilityRecord{plugin: l.active}, true)
+		if patcher == nil {
+			return nil, fmt.Errorf("missing request body patcher before")
+		}
+		resp, errPatch := patcher.PatchRequestBody(ctx, request)
+		if errPatch != nil {
+			return nil, errPatch
+		}
+		return marshalRPCResult(resp)
+	case pluginabi.MethodRequestPatchBodyAfter:
+		patcher := requestRecordBodyPatcher(capabilityRecord{plugin: l.active}, false)
+		if patcher == nil {
+			return nil, fmt.Errorf("missing request body patcher after")
+		}
+		resp, errPatch := patcher.PatchRequestBody(ctx, request)
+		if errPatch != nil {
+			return nil, errPatch
+		}
+		return marshalRPCResult(resp)
 	case pluginabi.MethodRequestComplete:
 		if l.active.Capabilities.RequestLifecyclePlugin == nil {
 			return nil, fmt.Errorf("missing request lifecycle plugin")
@@ -137,6 +160,24 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 			return nil, fmt.Errorf("missing auth provider")
 		}
 		return marshalRPCResult(rpcIdentifierResponse{Identifier: l.active.Capabilities.AuthProvider.Identifier()})
+	case pluginabi.MethodFrontendAuthIdentifier:
+		if l.active.Capabilities.FrontendAuthProvider == nil {
+			return nil, fmt.Errorf("missing frontend auth provider")
+		}
+		return marshalRPCResult(rpcIdentifierResponse{Identifier: l.active.Capabilities.FrontendAuthProvider.Identifier()})
+	case pluginabi.MethodFrontendAuthAuthenticate:
+		if l.active.Capabilities.FrontendAuthProvider == nil {
+			return nil, fmt.Errorf("missing frontend auth provider")
+		}
+		var req pluginapi.FrontendAuthRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errAuth := l.active.Capabilities.FrontendAuthProvider.Authenticate(ctx, req)
+		if errAuth != nil {
+			return nil, errAuth
+		}
+		return marshalRPCResult(resp)
 	case pluginabi.MethodSchedulerPick:
 		if l.active.Capabilities.Scheduler == nil {
 			return nil, fmt.Errorf("missing scheduler")
@@ -173,6 +214,50 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 		}
 		l.active.Capabilities.UsagePlugin.HandleUsage(ctx, record)
 		return marshalRPCResult(rpcEmptyResponse{})
+	case pluginabi.MethodQuotaIdentifier:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		return marshalRPCResult(rpcIdentifierResponse{Identifier: l.active.Capabilities.QuotaProvider.Identifier()})
+	case pluginabi.MethodQuotaDescribe:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		var req pluginapi.QuotaDescribeRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errDescribe := l.active.Capabilities.QuotaProvider.DescribeQuota(ctx, req)
+		if errDescribe != nil {
+			return nil, errDescribe
+		}
+		return marshalRPCResult(resp)
+	case pluginabi.MethodQuotaFetch:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		var req rpcQuotaFetchRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errFetch := l.active.Capabilities.QuotaProvider.FetchQuota(ctx, req.QuotaFetchRequest)
+		if errFetch != nil {
+			return nil, errFetch
+		}
+		return marshalRPCResult(resp)
+	case pluginabi.MethodQuotaReset:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		var req rpcQuotaResetRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errReset := l.active.Capabilities.QuotaProvider.ResetQuota(ctx, req.QuotaResetRequest)
+		if errReset != nil {
+			return nil, errReset
+		}
+		return marshalRPCResult(resp)
 	default:
 		return nil, fmt.Errorf("missing test method %s", method)
 	}
