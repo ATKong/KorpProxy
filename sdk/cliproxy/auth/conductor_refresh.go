@@ -123,6 +123,7 @@ func (m *Manager) codexAutoRefreshUnavailable(a *Auth, now time.Time) bool {
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		return false
 	}
+	// Intentionally ignore refreshToken: the local Codex executor only reads refresh_token.
 	if authMetadataString(a, "refresh_token") != "" {
 		return false
 	}
