@@ -750,7 +750,14 @@ func (a *executorAdapter) translateExecutorResponse(ctx context.Context, prepare
 }
 
 func (a *executorAdapter) translateExecutorStreamChunks(ctx context.Context, prepared preparedExecutorCall, in <-chan pluginapi.ExecutorStreamChunk) <-chan pluginapi.ExecutorStreamChunk {
-	if prepared.requestedFormat == "" || (prepared.outputFormat == prepared.requestedFormat && prepared.requestedFormat != sdktranslator.FormatOpenAIResponse) {
+	// Same-format streams still go through stream translation: the registered
+	// same-format translators normalize SSE framing (for example stripping the
+	// "data:" prefix and dropping "[DONE]" for chat-completions), matching what
+	// the built-in executors produce. Returning the channel unchanged here let
+	// framed plugin chunks reach handlers that add their own "data:" prefix,
+	// emitting a doubled "data: data:" prefix. Formats without a same-format
+	// translator fall back to the unchanged payload in TranslateStream.
+	if prepared.requestedFormat == "" {
 		return in
 	}
 	if in == nil {
@@ -789,13 +796,6 @@ func (a *executorAdapter) translateExecutorStreamChunks(ctx context.Context, pre
 }
 
 func (a *executorAdapter) translateExecutorStreamPayload(ctx context.Context, prepared preparedExecutorCall, payload []byte, param *any) [][]byte {
-	if prepared.requestedFormat != "" && prepared.outputFormat == prepared.requestedFormat {
-		out := payload
-		if prepared.requestedFormat == sdktranslator.FormatOpenAIResponse {
-			out = helps.EnsureResponsesUsageDetails(out)
-		}
-		return [][]byte{out}
-	}
 	originalRequest := prepared.opts.OriginalRequest
 	if len(originalRequest) == 0 {
 		originalRequest = prepared.req.Payload
