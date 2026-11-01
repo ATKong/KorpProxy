@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 )
 
@@ -237,5 +237,18 @@ func TestConvertAntigravityResponseToGeminiNonStream_DefaultsMissingFinishReason
 	out := ConvertAntigravityResponseToGeminiNonStream(context.Background(), "", nil, nil, input, nil)
 	if fr := gjson.GetBytes(out, "candidates.0.finishReason").String(); fr != "STOP" {
 		t.Fatalf("ConvertAntigravityResponseToGeminiNonStream finishReason = %q, want STOP", fr)
+	}
+}
+
+func TestAntigravityGeminiResponseAllowsWhitespace(t *testing.T) {
+	body := `{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`
+	for _, separator := range []string{"", " ", "\n\t"} {
+		t.Run(fmt.Sprintf("separator=%q", separator), func(t *testing.T) {
+			raw := []byte(`{"response":` + separator + body + `}`)
+			out := ConvertAntigravityResponseToGeminiNonStream(context.Background(), "", nil, nil, raw, nil)
+			if !gjson.ValidBytes(out) || string(out) != body {
+				t.Fatalf("incorrect response slice: %s", out)
+			}
+		})
 	}
 }
