@@ -111,7 +111,7 @@ func NewDirectTransport() *http.Transport {
 // proxy.Direct would leave keepalive at the OS default of hours, which lets a
 // silently dead peer pin an otherwise reusable connection.
 func socksForwardDialer() *net.Dialer {
-	return &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return &net.Dialer{KeepAlive: 30 * time.Second}
 }
 
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.

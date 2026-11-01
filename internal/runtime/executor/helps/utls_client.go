@@ -389,6 +389,7 @@ func newClaudeCodeRoundTripperForDialerAndRoots(dialer proxy.Dialer, roots *x509
 			if err != nil {
 				return nil, fmt.Errorf("claude tls: dial upstream: %w", err)
 			}
+			conn = stampProxyKeepAlive(conn)
 
 			host, _, errSplit := net.SplitHostPort(addr)
 			if errSplit != nil {
