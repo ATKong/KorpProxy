@@ -3,7 +3,7 @@ package executor
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 func TestDropTrailingClaudeAssistantPrefill_ThinkingActive(t *testing.T) {
@@ -19,7 +19,7 @@ func TestDropTrailingClaudeAssistantPrefill_ThinkingActive(t *testing.T) {
 	if !discardedText {
 		t.Fatalf("dropped prefill carried text, so discardedText should be true")
 	}
-	messages := gjson.GetBytes(out, "messages").Array()
+	messages := ojson.GetBytes(out, "messages").Array()
 	if len(messages) != 1 {
 		t.Fatalf("messages length = %d, want 1; body=%s", len(messages), out)
 	}
@@ -38,7 +38,7 @@ func TestDropTrailingClaudeAssistantPrefill_KeepsPrefillWithoutThinking(t *testi
 	if dropped {
 		t.Fatalf("a real prefill must survive on an upstream that accepts it; body=%s", out)
 	}
-	if len(gjson.GetBytes(out, "messages").Array()) != 2 {
+	if len(ojson.GetBytes(out, "messages").Array()) != 2 {
 		t.Fatalf("messages should be untouched; body=%s", out)
 	}
 }
@@ -56,7 +56,7 @@ func TestDropTrailingClaudeAssistantPrefill_AnthropicDropsRealPrefillWithoutThin
 	if !discardedText {
 		t.Fatalf("dropped prefill carried text, so discardedText should be true")
 	}
-	messages := gjson.GetBytes(out, "messages").Array()
+	messages := ojson.GetBytes(out, "messages").Array()
 	if len(messages) != 1 || messages[0].Get("role").String() != "user" {
 		t.Fatalf("conversation should end on the user turn; body=%s", out)
 	}
@@ -75,8 +75,8 @@ func TestDropTrailingClaudeAssistantPrefill_EmptyPrefillWithoutThinking(t *testi
 	if discardedText {
 		t.Fatalf("a blank prefill discards no text")
 	}
-	if len(gjson.GetBytes(out, "messages").Array()) != 1 {
-		t.Fatalf("messages length = %d, want 1; body=%s", len(gjson.GetBytes(out, "messages").Array()), out)
+	if len(ojson.GetBytes(out, "messages").Array()) != 1 {
+		t.Fatalf("messages length = %d, want 1; body=%s", len(ojson.GetBytes(out, "messages").Array()), out)
 	}
 }
 
@@ -96,8 +96,8 @@ func TestDropTrailingClaudeAssistantPrefill_DropsThinkingAndTextTurnOnAnthropic(
 	if !discardedText {
 		t.Fatalf("dropped turn carried text, so discardedText should be true")
 	}
-	if len(gjson.GetBytes(out, "messages").Array()) != 1 {
-		t.Fatalf("messages length = %d, want 1; body=%s", len(gjson.GetBytes(out, "messages").Array()), out)
+	if len(ojson.GetBytes(out, "messages").Array()) != 1 {
+		t.Fatalf("messages length = %d, want 1; body=%s", len(ojson.GetBytes(out, "messages").Array()), out)
 	}
 }
 
@@ -168,7 +168,7 @@ func TestDropTrailingClaudeAssistantPrefill_DropsConsecutivePrefills(t *testing.
 	if !discardedText {
 		t.Fatalf("dropped prefills carried text, so discardedText should be true")
 	}
-	messages := gjson.GetBytes(out, "messages").Array()
+	messages := ojson.GetBytes(out, "messages").Array()
 	if len(messages) != 1 || messages[0].Get("role").String() != "user" {
 		t.Fatalf("conversation should end on the user turn; body=%s", out)
 	}

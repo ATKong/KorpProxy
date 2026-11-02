@@ -30,18 +30,18 @@ func ClaudeRetryAfter(status int, h http.Header, now time.Time) *time.Duration {
 
 	if raw := strings.TrimSpace(h.Get("Retry-After")); raw != "" {
 		if secs, err := strconv.ParseFloat(raw, 64); err == nil && secs > 0 {
-			return durationPtr(time.Duration(secs * float64(time.Second)))
+			return positiveDurationPtr(time.Duration(secs * float64(time.Second)))
 		}
 		if when, err := http.ParseTime(raw); err == nil {
 			if d := when.Sub(now); d > 0 {
-				return durationPtr(d)
+				return positiveDurationPtr(d)
 			}
 		}
 	}
 
 	if raw := strings.TrimSpace(h.Get("Retry-After-Ms")); raw != "" {
 		if ms, err := strconv.ParseFloat(raw, 64); err == nil && ms > 0 {
-			return durationPtr(time.Duration(ms * float64(time.Millisecond)))
+			return positiveDurationPtr(time.Duration(ms * float64(time.Millisecond)))
 		}
 	}
 
@@ -73,13 +73,13 @@ func ClaudeRetryAfter(status int, h http.Header, now time.Time) *time.Duration {
 		}
 	}
 	if !soonest.IsZero() {
-		return durationPtr(soonest.Sub(now))
+		return positiveDurationPtr(soonest.Sub(now))
 	}
 
 	return nil
 }
 
-func durationPtr(d time.Duration) *time.Duration {
+func positiveDurationPtr(d time.Duration) *time.Duration {
 	if d <= 0 {
 		return nil
 	}

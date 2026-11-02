@@ -3,13 +3,13 @@ package executor
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 func assertNoThinking(t *testing.T, out []byte) {
 	t.Helper()
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
-		msg.Get("content").ForEach(func(_, blk gjson.Result) bool {
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
+		msg.Get("content").ForEach(func(_, blk ojson.Result) bool {
 			if tpe := blk.Get("type").String(); tpe == "thinking" || tpe == "redacted_thinking" {
 				t.Errorf("thinking block survived: %s", blk.Raw)
 			}
@@ -40,14 +40,14 @@ func TestStripReplayedThinkingBlocks_RemovesThinkingPreservesRest(t *testing.T) 
 
 	assertNoThinking(t, out)
 
-	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "hello" {
+	if got := ojson.GetBytes(out, "messages.0.content.0.text").String(); got != "hello" {
 		t.Errorf("user msg[0] altered: %q", got)
 	}
-	if got := gjson.GetBytes(out, "messages.2.content.0.tool_use_id").String(); got != "tool_1" {
+	if got := ojson.GetBytes(out, "messages.2.content.0.tool_use_id").String(); got != "tool_1" {
 		t.Errorf("tool_result msg[2] altered: %q", got)
 	}
 
-	m1 := gjson.GetBytes(out, "messages.1.content").Array()
+	m1 := ojson.GetBytes(out, "messages.1.content").Array()
 	if len(m1) != 2 {
 		t.Fatalf("msg[1] expected 2 blocks after strip, got %d", len(m1))
 	}
@@ -58,7 +58,7 @@ func TestStripReplayedThinkingBlocks_RemovesThinkingPreservesRest(t *testing.T) 
 		t.Errorf("msg[1] tool_use block not preserved: %s", m1[1].Raw)
 	}
 
-	m3 := gjson.GetBytes(out, "messages.3.content").Array()
+	m3 := ojson.GetBytes(out, "messages.3.content").Array()
 	if len(m3) != 1 {
 		t.Fatalf("msg[3] expected 1 block after strip, got %d", len(m3))
 	}
@@ -77,7 +77,7 @@ func TestStripReplayedThinkingBlocks_AllThinkingBecomesEmptyText(t *testing.T) {
 
 	out := stripReplayedThinkingBlocks(body)
 
-	c := gjson.GetBytes(out, "messages.1.content").Array()
+	c := ojson.GetBytes(out, "messages.1.content").Array()
 	if len(c) != 1 {
 		t.Fatalf("expected 1 placeholder block, got %d", len(c))
 	}
@@ -112,9 +112,9 @@ func TestCheckSystemInstructions_StripsThinkingWhenCloaking(t *testing.T) {
 		`{"type":"text","text":"prior answer"}]},` +
 		`{"role":"user","content":[{"type":"text","text":"continue"}]}]}`)
 
-	out := checkSystemInstructionsWithSigningMode(stripReplayedThinkingBlocks(body), false, true, "2.1.258", "cli", "")
+	out := checkSystemInstructionsWithSigningMode(stripReplayedThinkingBlocks(body), false, true, "2.1.280", "cli", "")
 
-	if got := gjson.GetBytes(out, "system.1.text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
+	if got := ojson.GetBytes(out, "system.1.text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Errorf("system not cloaked, got system.1.text=%q", got)
 	}
 	assertNoThinking(t, out)

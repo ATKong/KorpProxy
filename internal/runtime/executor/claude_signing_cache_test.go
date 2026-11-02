@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 var (
@@ -32,7 +32,7 @@ func TestSigningKeepsCacheablePrefixStable(t *testing.T) {
 				{"role": "user", "content": "` + lastUser + `"}
 			]
 		}`)
-		payload = checkSystemInstructionsWithSigningMode(payload, false, true, "2.1.258", "cli", "")
+		payload = checkSystemInstructionsWithSigningMode(payload, false, true, "2.1.280", "cli", "")
 		payload = ensureCacheControl(payload)
 		signed, err := signAnthropicMessagesBody(payload)
 		if err != nil {
@@ -44,8 +44,8 @@ func TestSigningKeepsCacheablePrefixStable(t *testing.T) {
 	a := build("second question")
 	b := build("a different second question")
 
-	headerA := gjson.GetBytes(a, "system.0.text").String()
-	headerB := gjson.GetBytes(b, "system.0.text").String()
+	headerA := ojson.GetBytes(a, "system.0.text").String()
+	headerB := ojson.GetBytes(b, "system.0.text").String()
 	if !cchValuePattern.MatchString(headerA) || !cchValuePattern.MatchString(headerB) {
 		t.Fatalf("billing header not signed: %q / %q", headerA, headerB)
 	}
@@ -57,8 +57,8 @@ func TestSigningKeepsCacheablePrefixStable(t *testing.T) {
 		t.Fatalf("billing header differs beyond cch/build fingerprint: %q vs %q", headerA, headerB)
 	}
 
-	sysA := gjson.GetBytes(a, "system").Array()
-	sysB := gjson.GetBytes(b, "system").Array()
+	sysA := ojson.GetBytes(a, "system").Array()
+	sysB := ojson.GetBytes(b, "system").Array()
 	if len(sysA) != len(sysB) || len(sysA) < 2 {
 		t.Fatalf("system block count mismatch: %d vs %d", len(sysA), len(sysB))
 	}
@@ -67,7 +67,7 @@ func TestSigningKeepsCacheablePrefixStable(t *testing.T) {
 			t.Fatalf("system[%d] differs between turns:\n%s\n%s", i, sysA[i].Raw, sysB[i].Raw)
 		}
 	}
-	if gjson.GetBytes(a, "tools").Raw != gjson.GetBytes(b, "tools").Raw {
+	if ojson.GetBytes(a, "tools").Raw != ojson.GetBytes(b, "tools").Raw {
 		t.Fatal("tools differ between turns")
 	}
 
@@ -75,7 +75,7 @@ func TestSigningKeepsCacheablePrefixStable(t *testing.T) {
 	positions := func(p []byte) []string {
 		var out []string
 		for _, section := range []string{"tools", "system"} {
-			gjson.GetBytes(p, section).ForEach(func(idx, item gjson.Result) bool {
+			ojson.GetBytes(p, section).ForEach(func(idx, item ojson.Result) bool {
 				if item.Get("cache_control").Exists() {
 					out = append(out, section+"."+idx.String())
 				}
@@ -93,7 +93,7 @@ func TestSigningKeepsCacheablePrefixStable(t *testing.T) {
 			t.Fatalf("breakpoint positions differ: %v vs %v", posA, posB)
 		}
 	}
-	if gjson.GetBytes(a, "system.0.cache_control").Exists() {
+	if ojson.GetBytes(a, "system.0.cache_control").Exists() {
 		t.Fatal("billing header block must not carry cache_control")
 	}
 	if n := countCacheControls(a); n > 4 {

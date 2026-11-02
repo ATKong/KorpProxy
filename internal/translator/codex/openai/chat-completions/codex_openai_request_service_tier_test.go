@@ -3,10 +3,10 @@ package chat_completions
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
-func TestConvertOpenAIRequestToCodexServiceTier(t *testing.T) {
+func TestConvertOpenAIRequestToCodexServiceTierFlexDropped(t *testing.T) {
 	cases := []struct {
 		name  string
 		input string
@@ -18,8 +18,8 @@ func TestConvertOpenAIRequestToCodexServiceTier(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := ConvertOpenAIRequestToCodex("gpt-5.5", []byte(tc.input), true)
-			got := gjson.GetBytes(out, "service_tier")
+			out, _ := ConvertOpenAIRequestToCodex("gpt-5.5", []byte(tc.input), true)
+			got := ojson.GetBytes(out, "service_tier")
 			if tc.want == "" {
 				if got.Exists() {
 					t.Fatalf("service_tier present, want absent; output=%s", out)
@@ -35,12 +35,12 @@ func TestConvertOpenAIRequestToCodexServiceTier(t *testing.T) {
 
 func TestConvertOpenAIRequestToCodexFastSuffix(t *testing.T) {
 	input := []byte(`{"model":"gpt-5.5-fast","messages":[]}`)
-	out := ConvertOpenAIRequestToCodex("gpt-5.5-fast", input, true)
+	out, _ := ConvertOpenAIRequestToCodex("gpt-5.5-fast", input, true)
 
-	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+	if got := ojson.GetBytes(out, "service_tier").String(); got != "priority" {
 		t.Fatalf("service_tier = %q, want %q; output=%s", got, "priority", out)
 	}
-	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.5" {
+	if got := ojson.GetBytes(out, "model").String(); got != "gpt-5.5" {
 		t.Fatalf("model = %q, want %q (suffix should be stripped); output=%s", got, "gpt-5.5", out)
 	}
 }
