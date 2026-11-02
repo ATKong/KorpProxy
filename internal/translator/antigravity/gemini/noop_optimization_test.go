@@ -38,6 +38,16 @@ func TestRemoveEmptyGeminiFunctionToolsDeletesEmptyArray(t *testing.T) {
 	}
 }
 
+func TestRemoveEmptyGeminiSystemInstructionPartsReusesNormalizedPayload(t *testing.T) {
+	input := []byte(`{"request":{"systemInstruction":{"parts":[{"text":"be concise"}]}}}`)
+
+	output := removeEmptyGeminiSystemInstructionParts(input)
+
+	if &output[0] != &input[0] {
+		t.Fatal("non-empty systemInstruction parts caused a payload copy")
+	}
+}
+
 func TestRewriteGeminiFunctionNamesNormalizesNonStringNames(t *testing.T) {
 	input := []byte(`{"request":{"contents":[{"role":"model","parts":[{"functionCall":{"name":true,"args":{}}}]}],"toolConfig":{"functionCallingConfig":{"allowedFunctionNames":[true]}}}}`)
 
@@ -90,7 +100,7 @@ func TestConvertGeminiRequestToAntigravityBoundsLargePayloadCopies(t *testing.T)
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	output := ConvertGeminiRequestToAntigravity("gemini-3-flash", input, false)
+	output, _ := ConvertGeminiRequestToAntigravity("gemini-3-flash", input, false)
 	runtime.ReadMemStats(&after)
 
 	if got := gjson.GetBytes(output, "request.contents.0.parts.0.inlineData.data").String(); len(got) != inlineDataSize {

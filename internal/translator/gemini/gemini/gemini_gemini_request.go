@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -21,12 +21,12 @@ import (
 //     The first message defaults to "user", then alternates user/model when needed.
 //
 // It keeps the payload otherwise unchanged.
-func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte {
+func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 	// Fast path: if no contents field, only attach safety settings
 	contents := util.GetGJSONBytesNoCopy(rawJSON, "contents")
 	if !contents.Exists() {
-		return common.AttachDefaultSafetySettings(rawJSON, "safetySettings")
+		return common.AttachDefaultSafetySettings(rawJSON, "safetySettings"), nil
 	}
 
 	toolsResult := gjson.GetBytes(rawJSON, "tools")
@@ -49,9 +49,15 @@ func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte 
 				declarations.ForEach(func(_, declarationResult gjson.Result) bool {
 					declaration := []byte(declarationResult.Raw)
 					if parameters := declarationResult.Get("parameters"); parameters.Exists() {
-						declaration, _ = sjson.SetRawBytes(declaration, "parametersJsonSchema", []byte(parameters.Raw))
+						normalizedParams := util.NormalizeJSONSchemaNumericConstraints(parameters.Raw)
+						declaration, _ = sjson.SetRawBytes(declaration, "parametersJsonSchema", []byte(normalizedParams))
 						declaration, _ = sjson.DeleteBytes(declaration, "parameters")
 						declarationsChanged = true
+					} else if parametersJSONSchema := declarationResult.Get("parametersJsonSchema"); parametersJSONSchema.Exists() {
+						if normalizedParams := util.NormalizeJSONSchemaNumericConstraints(parametersJSONSchema.Raw); normalizedParams != parametersJSONSchema.Raw {
+							declaration, _ = sjson.SetRawBytes(declaration, "parametersJsonSchema", []byte(normalizedParams))
+							declarationsChanged = true
+						}
 					}
 					declarationItems = append(declarationItems, declaration)
 					return true
@@ -128,9 +134,14 @@ func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte 
 
 	out = signature.SanitizeGeminiRequestThoughtSignatures(out, "contents")
 
-	if gjson.GetBytes(rawJSON, "generationConfig.responseSchema").Exists() {
-		strJson, _ := util.RenameKey(string(out), "generationConfig.responseSchema", "generationConfig.responseJsonSchema")
-		out = []byte(strJson)
+	if responseSchema := gjson.GetBytes(out, "generationConfig.responseSchema"); responseSchema.Exists() {
+		normalizedSchema := util.NormalizeJSONSchemaNumericConstraints(responseSchema.Raw)
+		out, _ = sjson.SetRawBytes(out, "generationConfig.responseJsonSchema", []byte(normalizedSchema))
+		out, _ = sjson.DeleteBytes(out, "generationConfig.responseSchema")
+	} else if responseJSONSchema := gjson.GetBytes(out, "generationConfig.responseJsonSchema"); responseJSONSchema.Exists() {
+		if normalizedSchema := util.NormalizeJSONSchemaNumericConstraints(responseJSONSchema.Raw); normalizedSchema != responseJSONSchema.Raw {
+			out, _ = sjson.SetRawBytes(out, "generationConfig.responseJsonSchema", []byte(normalizedSchema))
+		}
 	}
 
 	// Backfill empty functionResponse.name from the preceding functionCall.name.
@@ -138,7 +149,7 @@ func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte 
 	out = backfillEmptyFunctionResponseNames(out)
 
 	out = common.AttachDefaultSafetySettings(out, "safetySettings")
-	return out
+	return out, nil
 }
 
 // backfillEmptyFunctionResponseNames walks the contents array and for each
