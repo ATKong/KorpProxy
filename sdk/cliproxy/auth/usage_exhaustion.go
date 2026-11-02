@@ -55,6 +55,8 @@ func (m *Manager) MarkUsageExhausted(authID string, reset time.Time) {
 	}
 
 	var snapshot *Auth
+	releaseMutation := m.lockAuthMutation(authID)
+	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[authID]; ok && auth != nil {
 		changed := false
@@ -91,13 +93,14 @@ func (m *Manager) MarkUsageExhausted(authID string, reset time.Time) {
 			// to survive a MarkResult racing in between.
 			auth.Generation++
 			auth.UpdatedAt = now
-			if errPersist := m.persist(context.Background(), auth); errPersist != nil {
+			if errPersist := m.persistLocked(context.Background(), auth); errPersist != nil {
 				log.Warnf("usage-rotation: persist account %s failed: %v", authID, errPersist)
 			}
 			snapshot = auth.Clone()
 		}
 	}
 	m.mu.Unlock()
+	releaseMutation()
 
 	if snapshot == nil {
 		return

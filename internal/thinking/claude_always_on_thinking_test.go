@@ -3,10 +3,10 @@ package thinking_test
 import (
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/claude"
-	"github.com/tidwall/gjson"
 )
 
 // Opus 5.5 rejects thinking.type=disabled with a 400. Callers that ask to turn
@@ -30,13 +30,13 @@ func TestClaudeAlwaysOnThinkingDisableMapsToLowestEffort(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ApplyThinking returned error: %v", err)
 			}
-			if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+			if got := ojson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
 				t.Fatalf("thinking.type = %q, want adaptive: %s", got, out)
 			}
-			if got := gjson.GetBytes(out, "output_config.effort").String(); got != "low" {
+			if got := ojson.GetBytes(out, "output_config.effort").String(); got != "low" {
 				t.Fatalf("output_config.effort = %q, want low: %s", got, out)
 			}
-			if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+			if ojson.GetBytes(out, "thinking.budget_tokens").Exists() {
 				t.Fatalf("budget_tokens must not be sent for adaptive thinking: %s", out)
 			}
 		})
@@ -55,7 +55,7 @@ func TestClaudeDisableableThinkingStaysDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyThinking returned error: %v", err)
 	}
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+	if got := ojson.GetBytes(out, "thinking.type").String(); got != "disabled" {
 		t.Fatalf("thinking.type = %q, want disabled: %s", got, out)
 	}
 }

@@ -2,18 +2,21 @@ package auth
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"golang.org/x/sync/semaphore"
 )
 
 func newUsageExhaustionManager(authID, model string) *Manager {
 	registry.GetGlobalRegistry().RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: model, Type: "claude"}})
 	m := &Manager{
-		auths:     map[string]*Auth{authID: {ID: authID, Provider: "claude"}},
-		executors: map[string]ProviderExecutor{"claude": schedulerTestExecutor{}},
-		hook:      NoopHook{},
+		auths:        map[string]*Auth{authID: {ID: authID, Provider: "claude"}},
+		executors:    map[string]ProviderExecutor{"claude": schedulerTestExecutor{}},
+		hook:         NoopHook{},
+		authLoadGate: semaphore.NewWeighted(math.MaxInt64),
 	}
 	m.scheduler = newAuthScheduler(&RoundRobinSelector{})
 	m.scheduler.upsertAuth(m.auths[authID].Clone())
