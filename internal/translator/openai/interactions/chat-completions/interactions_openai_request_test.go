@@ -7,7 +7,7 @@ import (
 )
 
 func TestConvertInteractionsRequestToOpenAIPreservesExpressibleFields(t *testing.T) {
-	out := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","tool_choice":{"type":"function","function":{"name":"lookup"}},"response_modalities":["text","image"],"service_tier":"priority","input":"hi"}`), false)
+	out, _ := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","tool_choice":{"type":"function","function":{"name":"lookup"}},"response_modalities":["text","image"],"service_tier":"priority","input":"hi"}`), false)
 	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "function" {
 		t.Fatalf("tool_choice.type = %q, want function. Output: %s", got, string(out))
 	}
@@ -27,7 +27,7 @@ func TestConvertInteractionsRequestToOpenAIPreservesExpressibleFields(t *testing
 
 func TestConvertOpenAIRequestToInteractionsMapsMessagesToolsAndStream(t *testing.T) {
 	raw := []byte(`{"model":"gemini-3.1-flash-lite","stream":true,"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"今天北京的天气怎么样？"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}],"tool_choice":"auto","max_completion_tokens":128}`)
-	out := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
+	out, _ := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
 	if got := gjson.GetBytes(out, "model").String(); got != "gemini-3.1-flash-lite" {
 		t.Fatalf("model = %q, want gemini-3.1-flash-lite. Output: %s", got, string(out))
 	}
@@ -62,12 +62,15 @@ func TestConvertOpenAIRequestToInteractionsMapsMessagesToolsAndStream(t *testing
 
 func TestConvertOpenAIRequestToInteractionsMapsToolCallsAndResults(t *testing.T) {
 	raw := []byte(`{"model":"gemini-3.1-flash-lite","messages":[{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}]}`)
-	out := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
+	out, _ := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
 	if got := gjson.GetBytes(out, "input.0.type").String(); got != "function_call" {
 		t.Fatalf("input.0.type = %q, want function_call. Output: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "input.0.call_id").String(); got != "call_1" {
-		t.Fatalf("call_id = %q, want call_1. Output: %s", got, string(out))
+	if got := gjson.GetBytes(out, "input.0.id").String(); got != "call_1" {
+		t.Fatalf("id = %q, want call_1. Output: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "input.0.call_id").Exists() {
+		t.Fatalf("function_call should not have call_id parameter. Output: %s", string(out))
 	}
 	if got := gjson.GetBytes(out, "input.0.arguments.q").String(); got != "x" {
 		t.Fatalf("arguments.q = %q, want x. Output: %s", got, string(out))
@@ -75,13 +78,56 @@ func TestConvertOpenAIRequestToInteractionsMapsToolCallsAndResults(t *testing.T)
 	if got := gjson.GetBytes(out, "input.1.type").String(); got != "function_result" {
 		t.Fatalf("input.1.type = %q, want function_result. Output: %s", got, string(out))
 	}
+	if got := gjson.GetBytes(out, "input.1.name").String(); got != "lookup" {
+		t.Fatalf("name = %q, want lookup. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "input.1.call_id").String(); got != "call_1" {
+		t.Fatalf("call_id = %q, want call_1. Output: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "input.1.id").Exists() {
+		t.Fatalf("function_result should not have id parameter. Output: %s", string(out))
+	}
 	if got := gjson.GetBytes(out, "input.1.result").String(); got != "ok" {
 		t.Fatalf("result = %q, want ok. Output: %s", got, string(out))
 	}
 }
 
+func TestConvertOpenAIRequestToInteractionsInfersToolNamesForOutOfOrderResults(t *testing.T) {
+	raw := []byte(`{
+		"model": "gemini-3.1-flash-lite",
+		"messages": [
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}},
+					{"id": "call_2", "type": "function", "function": {"name": "weather", "arguments": "{\"city\":\"bj\"}"}}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_2", "content": "sunny"},
+			{"role": "tool", "tool_call_id": "call_1", "content": "found"}
+		]
+	}`)
+	out, _ := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
+	// input.0: function_call call_1 (lookup)
+	// input.1: function_call call_2 (weather)
+	// input.2: function_result call_2 (weather)
+	// input.3: function_result call_1 (lookup)
+	if got := gjson.GetBytes(out, "input.2.call_id").String(); got != "call_2" {
+		t.Fatalf("input.2.call_id = %q, want call_2. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "input.2.name").String(); got != "weather" {
+		t.Fatalf("input.2.name = %q, want weather. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "input.3.call_id").String(); got != "call_1" {
+		t.Fatalf("input.3.call_id = %q, want call_1. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "input.3.name").String(); got != "lookup" {
+		t.Fatalf("input.3.name = %q, want lookup. Output: %s", got, string(out))
+	}
+}
+
 func TestConvertInteractionsRequestToOpenAIAcceptsImageContent(t *testing.T) {
-	out := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","input":[{"type":"user_input","content":[{"type":"image","mime_type":"image/png","data":"aGVsbG8="}]}]}`), false)
+	out, _ := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","input":[{"type":"user_input","content":[{"type":"image","mime_type":"image/png","data":"aGVsbG8="}]}]}`), false)
 	if got := gjson.GetBytes(out, "messages.0.content.0.type").String(); got != "image_url" {
 		t.Fatalf("content type = %q, want image_url. Output: %s", got, string(out))
 	}
@@ -91,7 +137,7 @@ func TestConvertInteractionsRequestToOpenAIAcceptsImageContent(t *testing.T) {
 }
 
 func TestConvertInteractionsRequestToOpenAIPreservesNonImageMediaContent(t *testing.T) {
-	out := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","input":[{"type":"user_input","content":[{"type":"audio","mime_type":"audio/wav","data":"UklGRg=="},{"type":"video","mime_type":"video/mp4","data":"AAAAIGZ0eXA="},{"type":"document","mime_type":"application/pdf","data":"JVBERi0="}]}]}`), false)
+	out, _ := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","input":[{"type":"user_input","content":[{"type":"audio","mime_type":"audio/wav","data":"UklGRg=="},{"type":"video","mime_type":"video/mp4","data":"AAAAIGZ0eXA="},{"type":"document","mime_type":"application/pdf","data":"JVBERi0="}]}]}`), false)
 
 	if got := gjson.GetBytes(out, "messages.0.content.0.type").String(); got != "input_audio" {
 		t.Fatalf("audio content type = %q, want input_audio. Output: %s", got, string(out))
@@ -108,7 +154,7 @@ func TestConvertInteractionsRequestToOpenAIPreservesNonImageMediaContent(t *test
 }
 
 func TestConvertInteractionsRequestToOpenAIWithToolMessagesDirect(t *testing.T) {
-	out := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"function_call","name":"lookup","call_id":"call_1","arguments":{"q":"x"}},{"type":"function_result","name":"lookup","call_id":"call_1","result":{"ok":true}}]}`), false)
+	out, _ := ConvertInteractionsRequestToOpenAI("gpt-test", []byte(`{"model":"gpt-test","input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"function_call","name":"lookup","call_id":"call_1","arguments":{"q":"x"}},{"type":"function_result","name":"lookup","call_id":"call_1","result":{"ok":true}}]}`), false)
 	if got := gjson.GetBytes(out, "messages.1.tool_calls.0.function.name").String(); got != "lookup" {
 		t.Fatalf("tool call name = %q, want lookup. Output: %s", got, string(out))
 	}
@@ -129,7 +175,7 @@ func TestConvertOpenAIRequestToInteractions_AntigravitySanitizesGenerationConfig
 		"top_p":0.9,
 		"tools":[{"type":"function","function":{"name":"search","parameters":{"type":"object"}}}]
 	}`)
-	out := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
+	out, _ := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
 	// generation_config should not contain temperature, top_p, max_output_tokens
 	for _, knob := range []string{"temperature", "top_p", "top_k", "stop_sequences", "max_output_tokens"} {
 		if gjson.GetBytes(out, "generation_config."+knob).Exists() {
@@ -148,7 +194,7 @@ func TestConvertOpenAIRequestToInteractions_PreservesEnvironmentIDAndPreviousInt
 		"previous_response_id":"v1_prev123",
 		"environment_id":"env_456"
 	}`)
-	out := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
+	out, _ := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
 	if got := gjson.GetBytes(out, "previous_interaction_id").String(); got != "v1_prev123" {
 		t.Fatalf("previous_interaction_id = %q, want v1_prev123. Output: %s", got, string(out))
 	}
@@ -164,7 +210,7 @@ func TestConvertOpenAIRequestToInteractionsRenamesConflictingAntigravityTools(t 
 		{"type":"function","function":{"name":"execute_code","description":"e","parameters":{"type":"object"}}},
 		{"type":"function","function":{"name":"web_search","description":"s","parameters":{"type":"object"}}}
 	]}`)
-	out := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
+	out, _ := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "external_read_file" {
 		t.Fatalf("tools.0.name = %q, want external_read_file. Output: %s", got, string(out))
 	}
@@ -177,7 +223,7 @@ func TestConvertOpenAIRequestToInteractionsRenamesConflictingAntigravityTools(t 
 	if got := gjson.GetBytes(out, "tools.3.name").String(); got != "web_search" {
 		t.Fatalf("tools.3.name = %q, want web_search (unchanged). Output: %s", got, string(out))
 	}
-	outNonAnti := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
+	outNonAnti, _ := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
 	if got := gjson.GetBytes(outNonAnti, "tools.0.name").String(); got != "read_file" {
 		t.Fatalf("gemini tools.0.name = %q, want read_file (no rename). Output: %s", got, string(outNonAnti))
 	}
@@ -191,7 +237,7 @@ func TestConvertOpenAIRequestToInteractionsRenamesConflictingAntigravityToolCall
 	],"tools":[
 		{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}
 	]}`)
-	out := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
+	out, _ := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
 	if got := gjson.GetBytes(out, "input.1.name").String(); got != "external_read_file" {
 		t.Fatalf("input.1.name (function_call) = %q, want external_read_file. Output: %s", got, string(out))
 	}
@@ -207,11 +253,11 @@ func TestConvertOpenAIRequestToInteractionsRenamesConflictingToolChoice(t *testi
 		"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],
 		"tool_choice":{"type":"function","function":{"name":"read_file"}}
 	}`)
-	out := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
+	out, _ := ConvertOpenAIRequestToInteractions("antigravity-preview-05-2026", raw, false)
 	if got := gjson.GetBytes(out, "generation_config.tool_choice.function.name").String(); got != "external_read_file" {
 		t.Fatalf("generation_config.tool_choice.function.name = %q, want external_read_file. Output: %s", got, string(out))
 	}
-	outNonAnti := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
+	outNonAnti, _ := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
 	if got := gjson.GetBytes(outNonAnti, "generation_config.tool_choice.function.name").String(); got != "read_file" {
 		t.Fatalf("gemini tool_choice.function.name = %q, want read_file (no rename). Output: %s", got, string(outNonAnti))
 	}

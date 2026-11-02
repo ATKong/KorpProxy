@@ -14,12 +14,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -34,6 +34,7 @@ const (
 	defaultOpenAIVideosModel = "sora-2"
 	defaultXAIVideosModel    = "grok-imagine-video"
 	xaiVideos15Model         = "grok-imagine-video-1.5"
+	xaiVideos15LiteModel     = "grok-imagine-video-1.5-lite"
 	xaiVideos15PreviewAlias  = "grok-imagine-video-1.5-preview"
 	xaiVideosHandlerType     = "openai-video"
 	defaultVideosSeconds     = "4"
@@ -149,7 +150,7 @@ func videosModelBase(model string) string {
 func isXAIVideosModel(model string) bool {
 	prefix, baseModel := imagesModelParts(model)
 	baseModel = strings.ToLower(strings.TrimSpace(baseModel))
-	if baseModel != defaultXAIVideosModel && baseModel != xaiVideos15Model && baseModel != xaiVideos15PreviewAlias {
+	if baseModel != defaultXAIVideosModel && baseModel != xaiVideos15Model && baseModel != xaiVideos15LiteModel && baseModel != xaiVideos15PreviewAlias {
 		return false
 	}
 
@@ -203,6 +204,8 @@ func canonicalXAIVideosModel(model string) string {
 		return defaultXAIVideosModel
 	case xaiVideos15Model, xaiVideos15PreviewAlias:
 		return xaiVideos15Model
+	case xaiVideos15LiteModel:
+		return xaiVideos15LiteModel
 	}
 	return defaultXAIVideosModel
 }
@@ -216,6 +219,8 @@ func routingXAIVideosModel(model string) string {
 		return defaultXAIVideosModel
 	case xaiVideos15Model:
 		return xaiVideos15Model
+	case xaiVideos15LiteModel:
+		return xaiVideos15LiteModel
 	case xaiVideos15PreviewAlias:
 		return xaiVideos15PreviewAlias
 	}
@@ -255,6 +260,15 @@ func readXAIVideosNativeRequest(c *gin.Context) ([]byte, error) {
 }
 
 func videosCreateRequestFromForm(c *gin.Context) ([]byte, error) {
+	if strings.EqualFold(strings.TrimSpace(c.ContentType()), "multipart/form-data") {
+		if _, errForm := c.MultipartForm(); errForm != nil {
+			return nil, errForm
+		}
+	} else if c != nil && c.Request != nil {
+		if errForm := c.Request.ParseForm(); errForm != nil {
+			return nil, errForm
+		}
+	}
 	rawJSON := []byte(`{}`)
 	for _, field := range []string{"model", "prompt", "seconds", "size", "aspect_ratio", "resolution"} {
 		if value := strings.TrimSpace(c.PostForm(field)); value != "" {
@@ -287,11 +301,13 @@ func firstPostForm(c *gin.Context, keys ...string) string {
 }
 
 func (h *OpenAIAPIHandler) videoAuthBindingTTL() time.Duration {
-	if h != nil && h.BaseAPIHandler != nil && h.Cfg != nil {
-		raw := strings.TrimSpace(h.Cfg.VideoResultAuthCacheTTL)
-		if raw != "" {
-			if ttl, err := time.ParseDuration(raw); err == nil && ttl > 0 {
-				return ttl
+	if h != nil {
+		if cfg := h.CurrentConfig(); cfg != nil {
+			raw := strings.TrimSpace(cfg.VideoResultAuthCacheTTL)
+			if raw != "" {
+				if ttl, err := time.ParseDuration(raw); err == nil && ttl > 0 {
+					return ttl
+				}
 			}
 		}
 	}
@@ -457,6 +473,8 @@ func xaiVideosResolution(raw string, fallback string) string {
 		return "480p"
 	case "720p":
 		return "720p"
+	case "1080p":
+		return "1080p"
 	default:
 		return fallback
 	}
@@ -692,7 +710,7 @@ func openAIVideoStatus(status string) string {
 func (h *OpenAIAPIHandler) VideosCreate(c *gin.Context) {
 	rawJSON, err := readVideosCreateRequest(c)
 	if err != nil {
-		writeVideosFailedError(c, http.StatusBadRequest, defaultXAIVideosModel, "invalid_request_error", fmt.Sprintf("Invalid request: %v", err))
+		writeVideosFailedError(c, clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), defaultXAIVideosModel, "invalid_request_error", fmt.Sprintf("Invalid request: %v", err))
 		return
 	}
 
@@ -728,7 +746,7 @@ func (h *OpenAIAPIHandler) XAIVideosExtensions(c *gin.Context) {
 func (h *OpenAIAPIHandler) handleXAIVideosNativePost(c *gin.Context) {
 	rawJSON, err := readXAIVideosNativeRequest(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
 				Type:    "invalid_request_error",
@@ -806,7 +824,7 @@ func (h *OpenAIAPIHandler) VideosRetrieve(c *gin.Context) {
 		return
 	}
 
-	out, err := buildVideosRetrieveAPIResponseFromXAI(videoID, resp, defaultOpenAIVideosModel)
+	out, err := buildVideosRetrieveAPIResponseFromXAI(videoID, resp, executionModel)
 	if err != nil {
 		errMsg := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}
 		h.WriteErrorResponse(c, errMsg)
@@ -938,8 +956,10 @@ func (h *OpenAIAPIHandler) videoContentHTTPClient(c *gin.Context) *http.Client {
 		ctx = c.Request.Context()
 	}
 	var cfg *config.Config
-	if h != nil && h.BaseAPIHandler != nil && h.Cfg != nil {
-		cfg = &config.Config{SDKConfig: *h.Cfg}
+	if h != nil {
+		if sdkCfg := h.CurrentConfig(); sdkCfg != nil {
+			cfg = &config.Config{SDKConfig: *sdkCfg}
+		}
 	}
 	return helps.NewProxyAwareHTTPClient(ctx, cfg, h.videoContentDownloadAuth(c), 0)
 }

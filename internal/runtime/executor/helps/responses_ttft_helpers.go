@@ -81,6 +81,15 @@ func IsResponsesTokenEvent(payload []byte) bool {
 			return len(gjson.GetBytes(payload, "item.arguments").String()) > 0
 		case "custom_tool_call":
 			return len(gjson.GetBytes(payload, "item.input").String()) > 0
+		case "reasoning":
+			for _, field := range []string{"item.summary", "item.content"} {
+				for _, part := range gjson.GetBytes(payload, field).Array() {
+					text := part.Get("text")
+					if text.Type == gjson.String && text.String() != "" {
+						return true
+					}
+				}
+			}
 		case "message":
 			for _, content := range gjson.GetBytes(payload, "item.content").Array() {
 				if len(content.Get("text").String()) > 0 || len(content.Get("refusal").String()) > 0 {
@@ -108,6 +117,9 @@ func IsResponsesTokenEvent(payload []byte) bool {
 // represents the first meaningful token event. It records the first packet arrival time as a fallback
 // and exits immediately with zero allocations once effective token TTFT is set.
 func ObserveResponsesTokenEvent(reporter *UsageReporter, payload []byte) {
+	if reporter != nil && len(payload) > 0 {
+		reporter.ObserveResponseModel(payload)
+	}
 	if reporter == nil || len(payload) == 0 {
 		return
 	}

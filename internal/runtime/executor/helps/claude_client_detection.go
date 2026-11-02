@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -60,12 +60,13 @@ var claudeCodeSubclientByEntrypoint = map[string]string{
 	"claude-coworker-terminal":  "claude-coworker-terminal",
 }
 
-// Only product surfaces with verified 2.1.220 wire behavior are eligible for
+// Only product surfaces with verified 2.1.220+ wire behavior are eligible for
 // pass-through. Other first-party-looking entrypoints are cloaked until their
 // CPA-reachable request shape has been captured and reviewed.
 var nativeClaudeEntrypoints = map[string]bool{
 	"cli":           true,
 	"sdk-cli":       true,
+	"sdk-ts":        true,
 	"claude-vscode": true,
 }
 
@@ -75,13 +76,17 @@ const (
 	claudeCodeHelperShapeNone claudeCodeHelperShape = iota
 	claudeCodeHelperShapeMinimal
 	claudeCodeHelperShapeStructured
+	claudeCodeHelperShapeTitle280
 
 	claudeCodeHelperModel = "claude-haiku-4-5-20251001"
 )
 
-// These are the six exact beta sequences observed across 14 markerless native
-// Claude Code 2.1.220 Haiku helper requests. Keeping the allowlist exact avoids
-// turning the helper exception into a generic no-claude-code-beta bypass.
+// These are the exact beta sequences observed on markerless native Haiku
+// helper requests. The first six are Claude Code 2.1.220. The last is the
+// 2.1.280 title helper captured 2026-09-23: structured output, then
+// server-side fallback, fallback credit, and cache diagnosis. Keeping the
+// allowlist exact avoids turning the helper exception into a generic
+// no-claude-code-beta bypass.
 var measuredClaudeCodeHelperBetaProfiles = map[string]claudeCodeHelperShape{
 	claudeCodeHelperBetaProfile(true):  claudeCodeHelperShapeMinimal,
 	claudeCodeHelperBetaProfile(false): claudeCodeHelperShapeMinimal,
@@ -100,6 +105,12 @@ var measuredClaudeCodeHelperBetaProfiles = map[string]claudeCodeHelperShape{
 	claudeCodeHelperBetaProfile(false,
 		"structured-outputs-2025-12-15",
 	): claudeCodeHelperShapeStructured,
+	claudeCodeHelperBetaProfile(true,
+		"structured-outputs-2025-12-15",
+		"server-side-fallback-2026-06-01",
+		"fallback-credit-2026-06-01",
+		"cache-diagnosis-2026-04-07",
+	): claudeCodeHelperShapeTitle280,
 }
 
 // ClaudeCodeRequestDetection records the strong signals and first-party
@@ -107,6 +118,7 @@ var measuredClaudeCodeHelperBetaProfiles = map[string]claudeCodeHelperShape{
 // a client that only copied its User-Agent.
 type ClaudeCodeRequestDetection struct {
 	Confirmed       bool
+	ConfirmedShape  bool
 	StrongSignals   bool
 	NativeClient    bool
 	XAppCLI         bool
@@ -123,8 +135,8 @@ type ClaudeCodeRequestDetection struct {
 // applies CPA's native-client policy. Standard Messages requests require all
 // four strong signals; count_tokens omits metadata.user_id. A separate narrow
 // profile recognizes measured native Haiku helper requests that intentionally
-// omit claude-code-20250219. Generic sdk-ts/sdk-py Agent SDK entrypoints remain
-// unconfirmed and receive CLI cloaking.
+// omit claude-code-20250219. Unverified entrypoints (such as generic sdk-py)
+// remain unconfirmed by default and receive CLI cloaking unless cloak_mode is never.
 func DetectClaudeCodeRequest(headers http.Header, payload []byte, countTokens bool, configs ...*config.Config) ClaudeCodeRequestDetection {
 	var cfg *config.Config
 	if len(configs) > 0 {
@@ -148,6 +160,11 @@ func DetectClaudeCodeRequest(headers http.Header, payload []byte, countTokens bo
 	detection.HelperProfile = detection.NativeClient && matchesMeasuredClaudeCodeHelperProfile(headers, payload, countTokens, detection, cfg)
 	detection.StrongSignals = standardSignals || detection.HelperProfile
 	detection.Confirmed = detection.StrongSignals && detection.NativeClient
+	detection.ConfirmedShape = detection.StrongSignals ||
+		(!countTokens && detection.XAppCLI && detection.UserAgent && detection.MetadataUserID &&
+			claudeCodeSubclientByEntrypoint[entrypoint] != "" &&
+			measuredClaudeCodeHaiku55HelperSessionMatches(headers, payload) &&
+			measuredClaudeCodeBillingAndIdentityMatch(payload, entrypoint))
 	return detection
 }
 
@@ -173,7 +190,6 @@ func matchesMeasuredClaudeCodeHelperProfile(
 	cfg *config.Config,
 ) bool {
 	if countTokens ||
-		detection.Entrypoint != "cli" ||
 		detection.BetasPresent ||
 		!detection.XAppCLI ||
 		!detection.UserAgent ||
@@ -181,14 +197,163 @@ func matchesMeasuredClaudeCodeHelperProfile(
 		return false
 	}
 
-	shape := measuredClaudeCodeHelperBetaProfiles[normalizedClaudeBetaHeader(headers)]
-	if shape == claudeCodeHelperShapeNone || measuredClaudeCodeHelperBodyShape(payload) != shape {
+	if detection.Entrypoint == "cli" {
+		shape := measuredClaudeCodeHelperBetaProfiles[normalizedClaudeBetaHeader(headers)]
+		if shape != claudeCodeHelperShapeNone &&
+			measuredClaudeCodeHelperBodyShape(payload) == shape &&
+			measuredClaudeCodeHelperHeadersMatch(headers, cfg, shape) &&
+			measuredClaudeCodeHelperSessionMatches(headers, payload) {
+			return true
+		}
+	}
+	return matchesMeasuredClaudeCodeHaiku55HelperProfile(headers, payload, detection, cfg)
+}
+
+func matchesMeasuredClaudeCodeHaiku55HelperProfile(
+	headers http.Header,
+	payload []byte,
+	detection ClaudeCodeRequestDetection,
+	cfg *config.Config,
+) bool {
+	if !detection.NativeClient || gjson.GetBytes(payload, "model").String() != "claude-haiku-5-5" {
 		return false
 	}
-	if !measuredClaudeCodeHelperHeadersMatch(headers, cfg, shape) {
+	if !measuredClaudeCodeHaiku55HelperHeadersMatch(headers, cfg) {
 		return false
 	}
-	return measuredClaudeCodeHelperSessionMatches(headers, payload)
+	if !measuredClaudeCodeHaiku55HelperSessionMatches(headers, payload) {
+		return false
+	}
+	return measuredClaudeCodeHaiku55HelperBodyMatches(payload, detection.Entrypoint)
+}
+
+func measuredClaudeCodeHaiku55HelperHeadersMatch(headers http.Header, cfg *config.Config) bool {
+	profile := defaultClaudeDeviceProfile(cfg)
+	expected := map[string]string{
+		"Accept":                  "application/json",
+		"Content-Type":            "application/json",
+		"X-Stainless-Lang":        "js",
+		"X-Stainless-Runtime":     "node",
+		"X-Stainless-Retry-Count": "0",
+		"X-Stainless-Timeout":     claudeDefaultStainlessTimeout,
+		"Anthropic-Version":       claudeAnthropicVersion,
+		"Anthropic-Dangerous-Direct-Browser-Access": "true",
+	}
+	for name, want := range expected {
+		if headerValue(headers, name) != want {
+			return false
+		}
+	}
+	for _, name := range []string{
+		"X-Stainless-Package-Version",
+		"X-Stainless-Runtime-Version",
+		"X-Stainless-OS",
+		"X-Stainless-Arch",
+	} {
+		if headerValue(headers, name) == "" {
+			return false
+		}
+	}
+	if !plausibleClaudeCodeUserAgent(headerValue(headers, "User-Agent"), cfg) ||
+		!plausibleClaudePackageVersion(headerValue(headers, "X-Stainless-Package-Version"), profile.PackageVersion) ||
+		!plausibleClaudeRuntimeVersion(headerValue(headers, "X-Stainless-Runtime-Version"), profile.RuntimeVersion) {
+		return false
+	}
+	if headerValue(headers, "X-Stainless-Async") != "" {
+		return false
+	}
+	if headerValue(headers, "Accept-Encoding") != "gzip, deflate, br, zstd" {
+		return false
+	}
+	if requestID := headerValue(headers, "X-Client-Request-Id"); requestID != "" {
+		if _, errRequestID := uuid.Parse(requestID); errRequestID != nil {
+			return false
+		}
+	}
+	betaHeader := normalizedClaudeBetaHeader(headers)
+	return strings.Contains(betaHeader, "interleaved-thinking-2025-05-14") &&
+		strings.Contains(betaHeader, "thinking-token-count-2026-05-13") &&
+		strings.Contains(betaHeader, "context-management-2025-06-27") &&
+		strings.Contains(betaHeader, "prompt-caching-scope-2026-01-05")
+}
+
+func measuredClaudeCodeHaiku55HelperSessionMatches(headers http.Header, payload []byte) bool {
+	metadata := gjson.GetBytes(payload, "metadata")
+	if !metadata.IsObject() || !claudeJSONObjectHasKeys([]byte(metadata.Raw), []string{"user_id"}) {
+		return false
+	}
+	userID := metadata.Get("user_id")
+	if userID.Type != gjson.String || !isValidUserID(userID.String()) {
+		return false
+	}
+	var identityMap map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal([]byte(userID.String()), &identityMap); errUnmarshal != nil {
+		return false
+	}
+	for key := range identityMap {
+		switch key {
+		case "device_id", "account_uuid", "session_id", "parent_session_id":
+		default:
+			return false
+		}
+	}
+	if len(identityMap) < 3 {
+		return false
+	}
+	return headerValue(headers, ClaudeCodeSessionHeader) == gjson.GetBytes([]byte(userID.String()), "session_id").String()
+}
+
+func measuredClaudeCodeHaiku55HelperBodyMatches(payload []byte, entrypoint string) bool {
+	if gjson.GetBytes(payload, "max_tokens").Type != gjson.Number {
+		return false
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() || len(messages.Array()) != 1 || messages.Get("0.role").String() != "user" {
+		return false
+	}
+	if !measuredClaudeCodeBillingAndIdentityMatch(payload, entrypoint) {
+		return false
+	}
+	tools := gjson.GetBytes(payload, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	toolItems := tools.Array()
+	if len(toolItems) == 0 {
+		format := gjson.GetBytes(payload, "output_config.format")
+		required := format.Get("schema.required")
+		return format.Get("type").String() == "json_schema" &&
+			format.Get("schema.type").String() == "object" &&
+			format.Get("schema.properties.title.type").String() == "string" &&
+			required.IsArray() && len(required.Array()) == 1 && required.Get("0").String() == "title" &&
+			format.Get("schema.additionalProperties").Type == gjson.False
+	}
+	if len(toolItems) == 1 {
+		return toolItems[0].Get("name").String() == "web_search" &&
+			strings.HasPrefix(toolItems[0].Get("type").String(), "web_search_")
+	}
+	return false
+}
+
+func measuredClaudeCodeBillingAndIdentityMatch(payload []byte, entrypoint string) bool {
+	system := gjson.GetBytes(payload, "system")
+	if !system.IsArray() || len(system.Array()) < 2 {
+		return false
+	}
+	billing := system.Get("0.text").String()
+	if !strings.HasPrefix(billing, "x-anthropic-billing-header:") || !strings.Contains(billing, "cc_version=") {
+		return false
+	}
+	if entrypoint != "" && !strings.Contains(billing, "cc_entrypoint="+entrypoint) {
+		return false
+	}
+	if strings.Contains(billing, " cch=") && !measuredClaudeBillingCCH(billing) {
+		return false
+	}
+	identity := strings.TrimSpace(system.Get("1.text").String())
+	return identity == "You are Claude Code, Anthropic's official CLI for Claude." ||
+		identity == "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK." ||
+		identity == "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 }
 
 // normalizedClaudeBetaHeader joins every Anthropic-Beta value in wire order.
@@ -318,12 +483,17 @@ func measuredClaudeCodeHelperSessionMatches(headers http.Header, payload []byte)
 func measuredClaudeCodeHelperBodyShape(payload []byte) claudeCodeHelperShape {
 	minimalKeys := []string{"model", "max_tokens", "messages", "metadata"}
 	structuredKeys := []string{"model", "messages", "system", "tools", "metadata", "max_tokens", "thinking", "temperature", "output_config", "stream"}
+	structuredTitle280Keys := []string{"model", "max_tokens", "messages", "metadata", "output_config"}
 	shape := claudeCodeHelperShapeNone
+	isTitle280 := false
 	switch {
 	case claudeJSONObjectHasKeys(payload, minimalKeys):
 		shape = claudeCodeHelperShapeMinimal
 	case claudeJSONObjectHasKeys(payload, structuredKeys):
 		shape = claudeCodeHelperShapeStructured
+	case claudeJSONObjectHasKeys(payload, structuredTitle280Keys):
+		shape = claudeCodeHelperShapeTitle280
+		isTitle280 = true
 	default:
 		return claudeCodeHelperShapeNone
 	}
@@ -345,6 +515,22 @@ func measuredClaudeCodeHelperBodyShape(payload []byte) claudeCodeHelperShape {
 
 	if shape == claudeCodeHelperShapeMinimal {
 		if maxTokens.Raw != "1" || message.Get("content").Type != gjson.String {
+			return claudeCodeHelperShapeNone
+		}
+		return shape
+	}
+
+	if isTitle280 {
+		outputConfig := gjson.GetBytes(payload, "output_config")
+		format := outputConfig.Get("format")
+		schema := format.Get("schema")
+		if maxTokens.Raw != "80" ||
+			message.Get("content").Type != gjson.String ||
+			!claudeJSONObjectHasKeys([]byte(outputConfig.Raw), []string{"format"}) ||
+			!claudeJSONObjectHasKeys([]byte(format.Raw), []string{"type", "schema"}) ||
+			format.Get("type").String() != "json_schema" ||
+			!claudeJSONObjectHasKeys([]byte(schema.Raw), []string{"type"}) ||
+			schema.Get("type").String() != "object" {
 			return claudeCodeHelperShapeNone
 		}
 		return shape
@@ -465,6 +651,11 @@ func claudeJSONObjectHasKeys(raw []byte, want []string) bool {
 	return errClosing == nil && closing == json.Delim('}') && keyIndex == len(want)
 }
 
+// IsClaudeCodeUserAgent reports whether userAgent identifies a Claude Code CLI client.
+func IsClaudeCodeUserAgent(userAgent string) bool {
+	return claudeCodeUserAgentPattern.MatchString(strings.TrimSpace(userAgent))
+}
+
 func plausibleClaudeCodeUserAgent(userAgent string, cfg *config.Config) bool {
 	userAgent = strings.TrimSpace(userAgent)
 	if !claudeCodeUserAgentPattern.MatchString(userAgent) || !claudeCodeNativeUserAgentPattern.MatchString(userAgent) {
@@ -472,6 +663,7 @@ func plausibleClaudeCodeUserAgent(userAgent string, cfg *config.Config) bool {
 	}
 	candidate, okCandidate := parseClaudeCLIVersion(userAgent)
 	baseline, okBaseline := parseClaudeCLIVersion(defaultClaudeDeviceProfile(cfg).UserAgent)
+	// Patch releases (>= baseline.patch) within the release line preserve native passthrough.
 	return okCandidate && okBaseline && plausibleClaudeCLIVersion(candidate, baseline)
 }
 
