@@ -5,11 +5,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // ConfigSynthesizer generates Auth entries from configuration API keys.
@@ -19,6 +19,54 @@ type ConfigSynthesizer struct{}
 // NewConfigSynthesizer creates a new ConfigSynthesizer instance.
 func NewConfigSynthesizer() *ConfigSynthesizer {
 	return &ConfigSynthesizer{}
+}
+
+// authProxyConnectionPool converts a per-credential pool override from config into
+// the SDK representation carried on the auth record. Values are copied so the auth
+// snapshot never aliases a live config field.
+func authProxyConnectionPool(pool *config.ProxyConnectionPoolConfig) *coreauth.ProxyConnectionPoolOverride {
+	if pool == nil {
+		return nil
+	}
+	out := &coreauth.ProxyConnectionPoolOverride{IdleConnTimeout: pool.IdleConnTimeout}
+	if pool.Enabled != nil {
+		enabled := *pool.Enabled
+		out.Enabled = &enabled
+	}
+	if pool.MaxIdleConnsPerHost != nil {
+		maxIdle := *pool.MaxIdleConnsPerHost
+		out.MaxIdleConnsPerHost = &maxIdle
+	}
+	// A block without fields is still the opt-in: it asks for the pool defaults. It
+	// must therefore stay non-nil, or an operator writing `connection-pool: {}` (or
+	// inheriting an empty group block) would silently get no pooling at all.
+	return out
+}
+
+// openAICompatConnectionPool resolves the pool override for one OpenAI-compatible
+// key: the per-key block wins field by field, so a key that overrides only one value
+// keeps inheriting the provider-group default for the rest.
+func openAICompatConnectionPool(compat *config.OpenAICompatibility, entry *config.OpenAICompatibilityAPIKey) *config.ProxyConnectionPoolConfig {
+	var group *config.ProxyConnectionPoolConfig
+	if compat != nil {
+		group = compat.ConnectionPool
+	}
+	if entry == nil || entry.ConnectionPool == nil {
+		return group
+	}
+	merged := *entry.ConnectionPool
+	if group != nil {
+		if merged.Enabled == nil {
+			merged.Enabled = group.Enabled
+		}
+		if strings.TrimSpace(merged.IdleConnTimeout) == "" {
+			merged.IdleConnTimeout = group.IdleConnTimeout
+		}
+		if merged.MaxIdleConnsPerHost == nil {
+			merged.MaxIdleConnsPerHost = group.MaxIdleConnsPerHost
+		}
+	}
+	return &merged
 }
 
 func addWeightToAttrs(weight *int, attrs map[string]string) {
@@ -52,6 +100,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
 	// xAI API Keys
 	out = append(out, s.synthesizeXAIKeys(ctx)...)
+	// Meta API Keys
+	out = append(out, s.synthesizeMetaKeys(ctx)...)
 	// OpenAI-compat
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
@@ -71,7 +121,6 @@ func (s *ConfigSynthesizer) synthesizeInteractionsKeys(ctx *SynthesisContext) []
 }
 
 func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, entries []config.GeminiKey, idKind, sourceName, label, provider string) []*coreauth.Auth {
-	cfg := ctx.Config
 	now := ctx.Now
 	idGen := ctx.IDGenerator
 
@@ -121,8 +170,10 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
+
+			ProxyConnectionPool: authProxyConnectionPool(entry.ConnectionPool),
 		}
-		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
+		ApplyAuthExcludedModelsMeta(a, entry.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
@@ -171,6 +222,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if ck.RebuildMidSystemMessage {
 			attrs["rebuild_mid_system_message"] = "true"
 		}
+		if ck.NativeToolSearch {
+			attrs["native_tool_search"] = "true"
+		}
 		if profile := strings.ToLower(strings.TrimSpace(ck.FingerprintProfile)); profile != "" {
 			attrs["fingerprint_profile"] = profile
 		}
@@ -189,8 +243,10 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
+
+			ProxyConnectionPool: authProxyConnectionPool(ck.ConnectionPool),
 		}
-		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		ApplyAuthExcludedModelsMeta(a, ck.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
@@ -209,8 +265,12 @@ func (s *ConfigSynthesizer) synthesizeXAIKeys(ctx *SynthesisContext) []*coreauth
 	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.XAIKey, "xai")
 }
 
+// synthesizeMetaKeys creates Auth entries for Meta API keys.
+func (s *ConfigSynthesizer) synthesizeMetaKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	return s.synthesizeCodexStyleKeys(ctx, ctx.Config.MetaKey, "meta")
+}
+
 func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entries []config.CodexKey, provider string) []*coreauth.Auth {
-	cfg := ctx.Config
 	now := ctx.Now
 	idGen := ctx.IDGenerator
 
@@ -251,23 +311,27 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		if provider == "codex" && entry.AlphaSearch {
 			attrs[coreauth.AttributeCodexAlphaSearch] = "true"
 		}
+		if provider == "codex" && entry.DisableCodexCloaking != nil {
+			attrs[coreauth.AttributeCodexDisableCloaking] = strconv.FormatBool(*entry.DisableCodexCloaking)
+		}
 		if hash := diff.ComputeCodexModelsHash(entry.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(entry.Headers, attrs)
 		a := &coreauth.Auth{
-			ID:         id,
-			Provider:   provider,
-			Label:      provider + "-apikey",
-			Prefix:     prefix,
-			Status:     coreauth.StatusActive,
-			ProxyURL:   strings.TrimSpace(entry.ProxyURL),
-			Attributes: attrs,
-			Metadata:   metadata,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:                  id,
+			Provider:            provider,
+			Label:               provider + "-apikey",
+			Prefix:              prefix,
+			Status:              coreauth.StatusActive,
+			ProxyURL:            strings.TrimSpace(entry.ProxyURL),
+			Attributes:          attrs,
+			Metadata:            metadata,
+			CreatedAt:           now,
+			UpdatedAt:           now,
+			ProxyConnectionPool: authProxyConnectionPool(entry.ConnectionPool),
 		}
-		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
+		ApplyAuthExcludedModelsMeta(a, entry.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
@@ -330,16 +394,17 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
-				ID:         id,
-				Provider:   internalProviderKey,
-				Label:      compat.Name,
-				Prefix:     prefix,
-				Status:     coreauth.StatusActive,
-				ProxyURL:   proxyURL,
-				Attributes: attrs,
-				Metadata:   metadata,
-				CreatedAt:  now,
-				UpdatedAt:  now,
+				ID:                  id,
+				Provider:            internalProviderKey,
+				Label:               compat.Name,
+				Prefix:              prefix,
+				Status:              coreauth.StatusActive,
+				ProxyURL:            proxyURL,
+				Attributes:          attrs,
+				Metadata:            metadata,
+				CreatedAt:           now,
+				UpdatedAt:           now,
+				ProxyConnectionPool: authProxyConnectionPool(openAICompatConnectionPool(compat, entry)),
 			}
 			if len(a.Metadata) == 0 {
 				a.Metadata = nil
@@ -372,15 +437,16 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
-				ID:         id,
-				Provider:   internalProviderKey,
-				Label:      compat.Name,
-				Prefix:     prefix,
-				Status:     coreauth.StatusActive,
-				Attributes: attrs,
-				Metadata:   metadata,
-				CreatedAt:  now,
-				UpdatedAt:  now,
+				ID:                  id,
+				Provider:            internalProviderKey,
+				Label:               compat.Name,
+				Prefix:              prefix,
+				Status:              coreauth.StatusActive,
+				Attributes:          attrs,
+				Metadata:            metadata,
+				CreatedAt:           now,
+				UpdatedAt:           now,
+				ProxyConnectionPool: authProxyConnectionPool(openAICompatConnectionPool(compat, nil)),
 			}
 			if len(a.Metadata) == 0 {
 				a.Metadata = nil
@@ -424,6 +490,15 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		if hash := diff.ComputeVertexCompatModelsHash(compat.Models); hash != "" {
 			attrs["models_hash"] = hash
 		}
+		if compat.OpenAPI != nil {
+			attrs["openapi"] = strconv.FormatBool(*compat.OpenAPI)
+		}
+		if loc := strings.TrimSpace(compat.OpenAPILocation); loc != "" {
+			attrs["openapi_location"] = loc
+		}
+		if compat.Interactions != nil && *compat.Interactions {
+			attrs["interactions"] = "true"
+		}
 		addConfigHeadersToAttrs(compat.Headers, attrs)
 		metadata := map[string]any{}
 		if compat.DisableCooling != nil {
@@ -441,8 +516,10 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
+
+			ProxyConnectionPool: authProxyConnectionPool(compat.ConnectionPool),
 		}
-		ApplyAuthExcludedModelsMeta(a, cfg, compat.ExcludedModels, "apikey")
+		ApplyAuthExcludedModelsMeta(a, compat.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
