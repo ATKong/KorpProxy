@@ -67,6 +67,28 @@ func translateCodexRequestPairWithUpdateIntentContext(ctx context.Context, from,
 	return originalTranslated, body, changed, err
 }
 
+// normalizeCodexClaudeOutputBudgetDoc bridges Claude's smaller valid budgets to Codex's minimum.
+func normalizeCodexClaudeOutputBudgetDoc(doc *ojson.Doc, from sdktranslator.Format, payload []byte) {
+	if doc == nil || from != sdktranslator.FormatClaude {
+		return
+	}
+	requested := ojson.GetBytesNoCopy(payload, "max_tokens")
+	if !requested.Exists() {
+		requested = ojson.GetBytesNoCopy(payload, "max_output_tokens")
+	}
+	if requested.Type != ojson.Number {
+		return
+	}
+	requestedTokens, errParse := strconv.ParseInt(requested.Raw, 10, 64)
+	if errParse != nil || requestedTokens < 1 || requestedTokens >= 16 {
+		return
+	}
+	translated := doc.Get("max_output_tokens")
+	if translated.Type == ojson.Number && translated.Int() > 0 && translated.Int() < 16 {
+		_ = doc.Set("max_output_tokens", 16)
+	}
+}
+
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
 func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -359,7 +381,6 @@ func applyModelHeaderOverrides(headers http.Header, modelName string) {
 // applyCodexDirectImageHeaders sets Codex upstream headers for direct /images/* calls.
 // Downstream client User-Agent values are not forwarded to reduce Cloudflare 1010 blocks.
 func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, clientHeaders ...http.Header) {
-	useSIWC := codexUseSIWCForRequest(r.Context(), auth, clientHeaders...)
 	var ginHeaders http.Header
 	if len(clientHeaders) > 0 && clientHeaders[0] != nil {
 		ginHeaders = clientHeaders[0].Clone()
@@ -368,7 +389,7 @@ func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 		ginHeaders = ginCtx.Request.Header.Clone()
 		ginHeaders.Del("User-Agent")
 	}
-	applyCodexHeadersWithSIWC(r, auth, useSIWC, token, stream, cfg, ginHeaders)
+	applyCodexHeadersWithSIWC(r, auth, false, token, stream, cfg, ginHeaders)
 }
 
 func codexSIWCUserAgent(cfg *config.Config) string {
@@ -660,14 +681,11 @@ func normalizeCodexInstructionsDoc(doc *ojson.Doc, nativeRequest ...bool) bool {
 }
 
 func isCodexResponsesLiteRequestDoc(doc *ojson.Doc, headers http.Header) bool {
-	if strings.EqualFold(strings.TrimSpace(headers.Get(codexResponsesLiteHeader)), "true") {
-		return true
-	}
-	if doc == nil {
-		return false
-	}
-	value := doc.Get("client_metadata.ws_request_header_x_openai_internal_codex_responses_lite")
-	return value.Type == ojson.True || (value.Type == ojson.String && strings.EqualFold(strings.TrimSpace(value.String()), "true"))
+	return helps.CodexResponsesLiteRequestDoc(doc, headers)
+}
+
+func isCodexResponsesLiteModel(model string) bool {
+	return helps.CodexModelUsesResponsesLite(model)
 }
 
 var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
@@ -787,7 +805,7 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 }
 
 func ensureImageGenerationToolDoc(doc *ojson.Doc, baseModel string, auth *cliproxyauth.Auth, headers http.Header) bool {
-	if doc == nil || isCodexResponsesLiteRequestDoc(doc, headers) {
+	if doc == nil || isCodexResponsesLiteRequestDoc(doc, headers) || isCodexResponsesLiteModel(baseModel) {
 		return false
 	}
 	if strings.HasSuffix(baseModel, "spark") {
@@ -807,6 +825,57 @@ func ensureImageGenerationToolDoc(doc *ojson.Doc, baseModel string, auth *clipro
 		}
 	}
 	return doc.SetRawBytes("tools.-1", imageGenToolJSON) == nil
+}
+
+func resolveCodexGPTImage2BaseModel(cfg *config.Config) string {
+	if cfg == nil {
+		return codexOpenAIImagesMainModel
+	}
+	model := strings.TrimSpace(cfg.GPTImage2BaseModel)
+	if model == "" {
+		return codexOpenAIImagesMainModel
+	}
+	if !strings.HasPrefix(strings.ToLower(model), "gpt-") || isCodexResponsesLiteModel(model) {
+		return codexOpenAIImagesMainModel
+	}
+	return model
+}
+
+// normalizeCodexImageGenerationToolsDoc strips parameters rejected by the
+// hosted image_generation tool on Codex /responses (which binds to
+// gpt-image-2-codex and rejects the complexity parameter).
+func normalizeCodexImageGenerationToolsDoc(doc *ojson.Doc) bool {
+	if doc == nil {
+		return false
+	}
+	changed := false
+	stripAtPath := func(toolsPath string) {
+		tools := doc.Get(toolsPath)
+		if !tools.IsArray() {
+			return
+		}
+		for idx, tool := range tools.Array() {
+			if strings.TrimSpace(tool.Get("type").String()) != "image_generation" {
+				continue
+			}
+			if tool.Get("complexity").Exists() {
+				if doc.Delete(fmt.Sprintf("%s.%d.complexity", toolsPath, idx)) == nil {
+					changed = true
+				}
+			}
+		}
+	}
+	stripAtPath("tools")
+	input := doc.Get("input")
+	if input.IsArray() {
+		for idx, item := range input.Array() {
+			if strings.TrimSpace(item.Get("type").String()) != "additional_tools" {
+				continue
+			}
+			stripAtPath(fmt.Sprintf("input.%d.tools", idx))
+		}
+	}
+	return changed
 }
 
 func normalizeCodexParallelToolCalls(body []byte, headers http.Header) []byte {
