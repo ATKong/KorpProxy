@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -445,7 +446,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						emitCancellation(ctx.Err())
 						return
 					}
-					if upstreamCompleted || upstreamStreamErr != nil {
+					if upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr)) {
 						break
 					}
 				}
@@ -454,7 +455,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				emitCancellation(ctx.Err())
 				return
 			}
-			if !upstreamCompleted {
+			if !upstreamCompleted || upstreamStreamErr != nil {
 				if emitCancellation(scanner.Err()) {
 					return
 				}
@@ -555,7 +556,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if helps.StopApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 				return
 			}
-			if upstreamCompleted || upstreamStreamErr != nil {
+			if upstreamCompleted || (upstreamStreamErr != nil && !clienterror.IsClaudePolicyRefusalError(upstreamStreamErr)) {
 				break
 			}
 		}
@@ -567,7 +568,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if helps.EndApplyPatchStream(ctx, param, reporter, out, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}) {
 			return
 		}
-		if !upstreamCompleted {
+		if !upstreamCompleted || upstreamStreamErr != nil {
 			if emitCancellation(scanner.Err()) {
 				return
 			}
