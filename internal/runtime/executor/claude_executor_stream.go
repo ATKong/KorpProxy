@@ -221,6 +221,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return nil, err
 		}
 	}
+	helps.NormalizeClaudeToolPropertyNamesDoc(doc)
 	sanitizeClaudeMessagesForClaudeUpstreamWithDebugDoc(ctx, doc, baseModel, helps.APIKeyModelIsCompat(req))
 	if fp.ApplyCLIIdentity {
 		err = applyClaudeCLIIdentityDoc(doc, auth, apiKey, url, claudeSessionID, fp.SynthesizeIdentity)
@@ -228,9 +229,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return nil, err
 		}
 	}
-	if cloaked && len(wireSettings.sensitiveWords) > 0 {
-		matcher := helps.BuildSensitiveWordMatcher(wireSettings.sensitiveWords)
-		helps.ObfuscateSensitiveWordsDoc(doc, matcher)
+	if cloaked {
+		if matcher := wireSettings.buildSensitiveWordMatcher(); matcher != nil {
+			helps.ObfuscateSensitiveWordsDoc(doc, matcher)
+		}
 	}
 	cchBilling := ""
 	if cchSigning {
@@ -248,7 +250,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	touchedPayloadPaths := helps.ApplyPayloadConfigWithTrackedPathsDoc(
 		e.cfg, baseModel, to.String(), from.String(), "", doc, stripTranslatedDefaultMaxTokens(from, originalPayload, originalTranslated),
 		helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers,
-		"diagnostics",
+		"diagnostics", "betas",
 	)
 	if touchedPayloadPaths["diagnostics"] {
 		diagnosticsState = claudeDiagnosticsRequestState{}
@@ -269,18 +271,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, errMidSystem
 	}
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
-	// The upstream request follows downstream cancellation only until
-	// message_stop has been observed. After that it is detached, so the
-	// remaining body can be drained (and the connection pooled) even though
-	// the downstream handler cancels ctx as soon as Chunks closes.
-	upstreamCtx, detachUpstream, releaseUpstream := helps.NewDetachableContext(ctx)
-	streamStarted := false
-	defer func() {
-		if !streamStarted {
-			releaseUpstream()
-		}
-	}()
-	httpReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +289,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		claudeSessionID,
 	); errHeaders != nil {
 		return nil, errHeaders
+	}
+	threadBetas, errThread := e.prepareClaudeThreadBetas(ctx, httpReq, auth, bodyForUpstream, extraBetas, touchedPayloadPaths["betas"], incomingHeaders, wirePolicy.Uncloak, opts.Metadata, req.Metadata)
+	if errThread != nil {
+		return nil, errThread
 	}
 	fastRequest := isAnthropicUpstreamBase(baseURL) && claudeRequestIsFast(httpReq, bodyForUpstream)
 	authID, authLabel, authType, authValue := claudeAuthLogIdentity(auth)
@@ -337,13 +332,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return nil, errClassified
 		}
 		b, readErr := io.ReadAll(errBody)
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			msg := fmt.Sprintf("failed to read error response body: %v", readErr)
 			helps.LogWithRequestID(ctx).Warn(msg)
-			b = []byte(msg)
+			if len(b) == 0 {
+				b = []byte(msg)
+			}
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
@@ -362,34 +359,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, err)
 	}
 	out := make(chan cliproxyexecutor.StreamChunk, 1)
-	streamStarted = true
 	go func() {
-		// detached is set once message_stop has been observed and the upstream
-		// request was detached from downstream cancellation in time.
-		detached := false
-		markUpstreamCompleted := func() {
-			// detach reports false on repeated calls, so a failed first
-			// attempt is never turned into a success later.
-			if !detached {
-				detached = detachUpstream()
-			}
-		}
+		defer close(out)
 		defer func() {
-			// Runs after out is closed, so the drain never delays stream
-			// completion. Drain what is left of the upstream body (chunked
-			// terminator, gzip trailer) so net/http can return the connection to
-			// the pool instead of closing it. The drain is bounded to 64 KiB and
-			// ends when the upstream finishes the response or drops the
-			// connection; it is skipped unless the response completed.
-			if detached {
-				_, _ = io.Copy(io.Discard, io.LimitReader(httpResp.Body, 64<<10))
-			}
 			if errClose := decodedBody.Close(); errClose != nil {
 				log.Errorf("response body close error: %v", errClose)
 			}
-			releaseUpstream()
 		}()
-		defer close(out)
 		var streamUsage helps.StreamUsageBuffer
 		defer streamUsage.Publish(ctx, reporter)
 		emitCancellation := func(cause error) bool {
@@ -424,9 +400,13 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 
+		streamBody := threadBetas.StreamReader(decodedBody, func(messageID string) {
+			commitClaudeContinuity(diagnosticsState, messageID, helps.HeaderValueCaseInsensitive(httpResp.Header, "request-id"))
+			e.rememberClaudeOAuthToolAliases(body, oauthToolNamesReverseMap, messageID)
+		})
 		// If the response target is Claude, directly forward complete SSE events without translation.
 		if responseFormat == to {
-			scanner := bufio.NewScanner(decodedBody)
+			scanner := bufio.NewScanner(streamBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
 			var event bytes.Buffer
 			var upstreamMessageID string
@@ -442,9 +422,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					return true
 				}
 				observeClaudeSSEEvent(event.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
-				if upstreamCompleted {
-					markUpstreamCompleted()
-				}
 				streamUsage.ObserveClaudeSSEEvent(event.Bytes())
 				cloned := bytes.Clone(event.Bytes())
 				event.Reset()
@@ -521,7 +498,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 
 		// For other formats, use translation
-		scanner := bufio.NewScanner(decodedBody)
+		scanner := bufio.NewScanner(streamBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		helps.InitializeApplyPatchStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), bodyForTranslation, &param)
@@ -536,22 +513,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			eventBuf.WriteByte('\n')
 			if len(bytes.TrimSpace(line)) == 0 {
 				observeClaudeSSEEvent(eventBuf.Bytes(), &upstreamMessageID, &upstreamCompleted, &upstreamStreamErr)
-				if upstreamCompleted {
-					markUpstreamCompleted()
-				}
 				streamUsage.ObserveClaudeSSEEvent(eventBuf.Bytes())
 				eventBuf.Reset()
-			}
-			// Translation runs per line, so the message_stop data line can already
-			// yield the terminal event (e.g. response.completed) and the client may
-			// cancel before the event's blank separator is read. Treat that line as
-			// completion and detach before it is translated, so the loop exits after
-			// delivering it instead of waiting for the separator; translators ignore
-			// non-data lines, and the buffered event is observed after the loop. Like
-			// the event observer, only valid JSON counts.
-			if payload := helps.JSONPayload(line); !upstreamCompleted && payload != nil && ojson.ValidBytes(payload) && ojson.GetBytesNoCopy(payload, "type").String() == "message_stop" {
-				upstreamCompleted = true
-				markUpstreamCompleted()
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			reporter.ObserveResponseModel(line)
