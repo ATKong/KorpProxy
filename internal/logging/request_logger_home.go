@@ -3,10 +3,10 @@ package logging
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 )
@@ -256,4 +256,16 @@ func (w *homeStreamingLogWriter) Close() error {
 		return errMarshal
 	}
 	return client.RPushRequestLog(context.Background(), raw)
+}
+
+func (w *homeStreamingLogWriter) Discard() error {
+	if w == nil {
+		return nil
+	}
+	if w.chunkChan != nil {
+		close(w.chunkChan)
+		<-w.doneChan
+		w.chunkChan = nil
+	}
+	return nil
 }
