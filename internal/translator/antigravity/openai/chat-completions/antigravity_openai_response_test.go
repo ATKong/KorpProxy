@@ -2,6 +2,7 @@ package chat_completions
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
@@ -77,10 +78,15 @@ func TestFinishReasonMaxTokens(t *testing.T) {
 	chunk2 := []byte(`{"response":{"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":100,"totalTokenCount":110}}}`)
 	result2 := ConvertAntigravityResponseToOpenAI(ctx, "model", nil, nil, chunk2, &param)
 
-	// Verify finish_reason is "max_tokens"
+	// Verify finish_reason is "length" (the OpenAI value for an output token limit)
 	fr := ojson.GetBytesNoCopy(result2[0], "choices.0.finish_reason").String()
-	if fr != "max_tokens" {
-		t.Errorf("Expected finish_reason 'max_tokens', got: %s", fr)
+	if fr != "length" {
+		t.Errorf("Expected finish_reason 'length', got: %s", fr)
+	}
+	// Verify native_finish_reason preserves the upstream value
+	nfr := ojson.GetBytesNoCopy(result2[0], "choices.0.native_finish_reason").String()
+	if nfr != "max_tokens" {
+		t.Errorf("Expected native_finish_reason 'max_tokens', got: %s", nfr)
 	}
 }
 
@@ -96,7 +102,7 @@ func TestToolCallTakesPriorityOverMaxTokens(t *testing.T) {
 	chunk2 := []byte(`{"response":{"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":100,"totalTokenCount":110}}}`)
 	result2 := ConvertAntigravityResponseToOpenAI(ctx, "model", nil, nil, chunk2, &param)
 
-	// Verify finish_reason is "tool_calls" (takes priority over max_tokens)
+	// Verify finish_reason is "tool_calls" (takes priority over upstream MAX_TOKENS)
 	fr := ojson.GetBytesNoCopy(result2[0], "choices.0.finish_reason").String()
 	if fr != "tool_calls" {
 		t.Errorf("Expected finish_reason 'tool_calls', got: %s", fr)
@@ -292,6 +298,123 @@ func TestConvertAntigravityResponseToOpenAI_ResponseFreeEventDoesNotStartStream(
 	}
 }
 
+func TestConvertAntigravityResponseToOpenAI_UsesEmptyObjectWhenFunctionArgsAreOmitted(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	chunk := []byte(`{"response":{"responseId":"resp_1","candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"get_current_time"}}]}}]}}`)
+
+	outputs := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3.8-flash-high", nil, nil, chunk, &param)
+	if len(outputs) != 1 {
+		t.Fatalf("output count = %d, want 1; output=%s", len(outputs), outputs)
+	}
+	if got := ojson.GetBytesNoCopy(outputs[0], "choices.0.delta.tool_calls.0.function.arguments").String(); got != "{}" {
+		t.Fatalf("function.arguments = %q, want valid empty JSON object %q; output=%s", got, "{}", outputs[0])
+	}
+}
+
+func TestConvertAntigravityResponseToOpenAI_PreservesArgumentsAfterStreamingToolStart(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	chunks := [][]byte{
+		[]byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"get_value","willContinue":true}}]}}]}}`),
+		[]byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","args":{"value":1}}}]}}]}}`),
+		[]byte(`{"response":{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`),
+	}
+
+	var arguments strings.Builder
+	for _, chunk := range chunks {
+		for _, output := range ConvertAntigravityResponseToOpenAI(ctx, "gemini-3.8-flash-high", nil, nil, chunk, &param) {
+			arguments.WriteString(ojson.GetBytesNoCopy(output, "choices.0.delta.tool_calls.0.function.arguments").String())
+		}
+	}
+	if got := arguments.String(); got != `{"value":1}` {
+		t.Fatalf("concatenated function.arguments = %q, want valid JSON %q", got, `{"value":1}`)
+	}
+}
+
+func TestConvertAntigravityResponseToOpenAI_ContinuesUnnamedFunctionCallAtActiveIndex(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	firstChunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"write_file","args":{"path":"a.txt"}}}]}}]}}`)
+	firstOutput := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3.8-flash-high", nil, nil, firstChunk, &param)
+	if len(firstOutput) != 1 {
+		t.Fatalf("first chunk count = %d, want 1; output=%s", len(firstOutput), firstOutput)
+	}
+
+	continuationChunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"content":"hello"}}}]}}]}}`)
+	continuationOutput := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3.8-flash-high", nil, nil, continuationChunk, &param)
+	if len(continuationOutput) != 1 {
+		t.Fatalf("continuation chunk count = %d, want 1; output=%s", len(continuationOutput), continuationOutput)
+	}
+
+	toolCall := ojson.GetBytesNoCopy(continuationOutput[0], "choices.0.delta.tool_calls.0")
+	if got := toolCall.Get("index").Int(); got != 0 {
+		t.Fatalf("continuation index = %d, want 0; output=%s", got, continuationOutput[0])
+	}
+	if id := toolCall.Get("id"); id.Exists() {
+		t.Fatalf("continuation must omit id, got %s; output=%s", id.Raw, continuationOutput[0])
+	}
+	if name := toolCall.Get("function.name"); name.Exists() {
+		t.Fatalf("continuation must omit function.name, got %s; output=%s", name.Raw, continuationOutput[0])
+	}
+	if got := toolCall.Get("function.arguments").String(); got != `,"content":"hello"` {
+		t.Fatalf("continuation arguments = %q, want %q; output=%s", got, `,"content":"hello"`, continuationOutput[0])
+	}
+
+	textChunk := []byte(`{"response":{"candidates":[{"content":{"parts":[{"text":"done"}]}}]}}`)
+	textOutput := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3.8-flash-high", nil, nil, textChunk, &param)
+	if len(textOutput) != 1 {
+		t.Fatalf("text chunk count = %d, want 1; output=%s", len(textOutput), textOutput)
+	}
+	textCalls := ojson.GetBytesNoCopy(textOutput[0], "choices.0.delta.tool_calls")
+	if got := textCalls.Array()[0].Get("function.arguments").String(); got != "}" {
+		t.Fatalf("text transition argument delta = %q, want closing brace; output=%s", got, textOutput[0])
+	}
+
+	terminalChunk := []byte(`{"response":{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}`)
+	terminalOutput := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3.8-flash-high", nil, nil, terminalChunk, &param)
+	if len(terminalOutput) != 1 {
+		t.Fatalf("terminal chunk count = %d, want 1; output=%s", len(terminalOutput), terminalOutput)
+	}
+
+	var argumentFragments strings.Builder
+	for _, output := range append(firstOutput, append(continuationOutput, append(textOutput, terminalOutput...)...)...) {
+		argumentFragments.WriteString(ojson.GetBytesNoCopy(output, "choices.0.delta.tool_calls.0.function.arguments").String())
+	}
+	if got := argumentFragments.String(); got != `{"path":"a.txt","content":"hello"}` {
+		t.Fatalf("concatenated arguments = %q, want valid merged JSON %q", got, `{"path":"a.txt","content":"hello"}`)
+	}
+}
+
+func TestConvertAntigravityResponseToOpenAI_UsesUpstreamIDForUnnamedContinuation(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	chunks := [][]byte{
+		[]byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_a","name":"first","args":{"value":1}}}]}}]}}`),
+		[]byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_b","name":"second","args":{"value":2}}}]}}]}}`),
+		[]byte(`{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_a","args":{"extra":3}}}]}}]}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertAntigravityResponseToOpenAI(ctx, "gemini-3.8-flash-high", nil, nil, chunk, &param)...)
+	}
+	continuation := ojson.GetBytesNoCopy(outputs[2], "choices.0.delta.tool_calls.0")
+	if got := continuation.Get("index").Int(); got != 0 {
+		t.Fatalf("continuation index = %d, want index 0 from upstream call_a; output=%s", got, outputs[2])
+	}
+	if id := continuation.Get("id"); id.Exists() {
+		t.Fatalf("continuation must omit id, got %s", id.Raw)
+	}
+	if name := continuation.Get("function.name"); name.Exists() {
+		t.Fatalf("continuation must omit function.name, got %s", name.Raw)
+	}
+	if got := continuation.Get("function.arguments").String(); got != `,"extra":3` {
+		t.Fatalf("continuation arguments = %q, want %q", got, `,"extra":3`)
+	}
+}
+
 func TestConvertAntigravityResponseToOpenAINonStreamRestoresDisambiguatedName(t *testing.T) {
 	first := "mcp__plugin_cloudflare_cloudflare-builds__workers_builds_get_build"
 	second := "mcp__plugin_cloudflare_cloudflare-builds__workers_builds_get_build_logs"
@@ -410,8 +533,8 @@ func TestConvertAntigravityResponseToOpenAI_OmitToolCallsWhenAbsentInStreamingDe
 	if gotName := tc.Array()[0].Get("function.name").String(); gotName != "get_weather" {
 		t.Fatalf("function.name = %q, want get_weather", gotName)
 	}
-	if gotArgs := tc.Array()[0].Get("function.arguments").String(); gotArgs != `{"city":"Beijing"}` {
-		t.Fatalf("function.arguments = %q, want {\"city\":\"Beijing\"}", gotArgs)
+	if gotArgs := tc.Array()[0].Get("function.arguments").String(); gotArgs != `{"city":"Beijing"` {
+		t.Fatalf("function.arguments = %q, want unclosed fragment {\"city\":\"Beijing\"", gotArgs)
 	}
 
 	// 4. Final chunk with finishReason and usage: delta must omit tool_calls.
@@ -420,8 +543,12 @@ func TestConvertAntigravityResponseToOpenAI_OmitToolCallsWhenAbsentInStreamingDe
 	if len(finalResults) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(finalResults))
 	}
-	if tcFinal := ojson.GetBytesNoCopy(finalResults[0], "choices.0.delta.tool_calls"); tcFinal.Exists() {
-		t.Fatalf("choices.0.delta.tool_calls must not exist in final chunk, got: %s (type: %s)", tcFinal.Raw, tcFinal.Type)
+	finalCalls := ojson.GetBytesNoCopy(finalResults[0], "choices.0.delta.tool_calls")
+	if !finalCalls.Exists() || !finalCalls.IsArray() || len(finalCalls.Array()) != 1 {
+		t.Fatalf("final chunk must close the pending arguments with one tool call delta, got: %s", finalCalls.Raw)
+	}
+	if got := finalCalls.Array()[0].Get("function.arguments").String(); got != "}" {
+		t.Fatalf("final argument delta = %q, want closing brace", got)
 	}
 
 	// 5. Synthesized DONE terminal chunk: delta must omit tool_calls.
@@ -498,6 +625,73 @@ func TestConvertAntigravityResponseToOpenAI_MultiPartThoughtAndTrailingSignature
 		}
 		if got := ojson.GetBytesNoCopy(out[0], "choices.0.delta.content").String(); got != "Hello world" {
 			t.Fatalf("delta.content = %q, want %q; payload=%s", got, "Hello world", out[0])
+		}
+	})
+}
+
+func TestConvertAntigravityResponseToOpenAI_SignatureOnlyEmptyTextDoesNotStartStreamOrEmitNullDelta(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	chunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"opaque-sig","text":""}]}}],"cpaUsageMetadata":{"promptTokenCount":378515,"cachedContentTokenCount":376466,"totalTokenCount":378515},"modelVersion":"gemini-4-hydrogen","responseId":"resp-7536"}}`)
+	out := ConvertAntigravityResponseToOpenAI(ctx, "gemini-4-hydrogen", nil, nil, chunk, &param)
+	if len(out) != 0 {
+		t.Fatalf("signature-only empty-text chunk with filtered usage must not emit all-null delta, got %d chunk(s): %s", len(out), out[0])
+	}
+	done := ConvertAntigravityResponseToOpenAI(ctx, "gemini-4-hydrogen", nil, nil, []byte("[DONE]"), &param)
+	if len(done) != 0 {
+		t.Fatalf("signature-only empty-text stream must not synthesize stop on [DONE], got %d chunk(s): %s", len(done), done[0])
+	}
+}
+
+func TestConvertAntigravityResponseToOpenAI_SkipsThoughtInlineDataImages(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("streaming drops thought draft image and keeps deliverable image at index 0", func(t *testing.T) {
+		var param any
+
+		thoughtImgChunk := []byte(`{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"thought":true,"inlineData":{"mimeType":"image/png","data":"RFJBRlRfSU1BR0U="}}]}}],"cpaUsageMetadata":{"promptTokenCount":12},"modelVersion":"gemini-3-pro-image","responseId":"resp_ag_7566"}}`)
+		if out := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3-pro-image", nil, nil, thoughtImgChunk, &param); len(out) != 0 {
+			t.Fatalf("standalone thought inlineData chunk must not emit delta, got %d chunk(s): %s", len(out), out[0])
+		}
+
+		finalChunk := []byte(`{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"thought":true,"text":"Refining."},{"thought":true,"inline_data":{"mime_type":"image/png","data":"RFJBRlRfMg=="}},{"inlineData":{"mimeType":"image/png","data":"RklOQUxfSU1BR0U="},"thoughtSignature":"EjQKDg=="}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":1120,"thoughtsTokenCount":584,"totalTokenCount":1716},"modelVersion":"gemini-3-pro-image","responseId":"resp_ag_7566"}}`)
+		out := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3-pro-image", nil, nil, finalChunk, &param)
+		if len(out) != 1 {
+			t.Fatalf("finalChunk count = %d, want 1", len(out))
+		}
+		images := ojson.GetBytesNoCopy(out[0], "choices.0.delta.images").Array()
+		if len(images) != 1 {
+			t.Fatalf("len(delta.images) = %d, want 1; payload=%s", len(images), out[0])
+		}
+		if got := images[0].Get("index").Int(); got != 0 {
+			t.Fatalf("delta.images[0].index = %d, want 0; payload=%s", got, out[0])
+		}
+		if got := images[0].Get("image_url.url").String(); got != "data:image/png;base64,RklOQUxfSU1BR0U=" {
+			t.Fatalf("delta.images[0].image_url.url = %q, want deliverable image URL; payload=%s", got, out[0])
+		}
+	})
+
+	t.Run("non-streaming delegates and skips thought draft image", func(t *testing.T) {
+		raw := []byte(`{"response":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"thought":true,"text":"Drafting."},{"thought":true,"inlineData":{"mimeType":"image/png","data":"RFJBRlRfSU1BR0U="}},{"inlineData":{"mimeType":"image/png","data":"RklOQUxfSU1BR0U="}}]},"finishReason":"STOP"}]}}`)
+		out := ConvertAntigravityResponseToOpenAINonStream(ctx, "gemini-3-pro-image", nil, nil, raw, nil)
+		images := ojson.GetBytesNoCopy(out, "choices.0.message.images").Array()
+		if len(images) != 1 {
+			t.Fatalf("len(message.images) = %d, want 1; payload=%s", len(images), out)
+		}
+		if got := images[0].Get("image_url.url").String(); got != "data:image/png;base64,RklOQUxfSU1BR0U=" {
+			t.Fatalf("message.images[0].image_url.url = %q, want deliverable image URL; payload=%s", got, out)
+		}
+	})
+
+	t.Run("thought-only image chunk without output tokens does not start stream on DONE", func(t *testing.T) {
+		var param any
+		chunk := []byte(`{"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"inlineData":{"mimeType":"image/png","data":"RFJBRlRfSU1BR0U="}}]}}],"cpaUsageMetadata":{"promptTokenCount":12,"totalTokenCount":12},"modelVersion":"gemini-3-pro-image","responseId":"resp_ag_empty"}}`)
+		if out := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3-pro-image", nil, nil, chunk, &param); len(out) != 0 {
+			t.Fatalf("expected 0 chunks for thought-only image, got %d: %s", len(out), out[0])
+		}
+		if done := ConvertAntigravityResponseToOpenAI(ctx, "gemini-3-pro-image", nil, nil, []byte("[DONE]"), &param); len(done) != 0 {
+			t.Fatalf("thought-only image stream must not synthesize stop on [DONE], got %d: %s", len(done), done[0])
 		}
 	})
 }
