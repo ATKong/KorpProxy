@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/antigravity"
@@ -837,21 +837,19 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			return
 		}
 
-		projectID := ""
-		if accessToken != "" {
-			fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
-			if errProject != nil {
-				if sessionProxyURL != "" {
-					log.Errorf("antigravity: failed to fetch project ID: %s", redactSessionProxyInString(errProject.Error(), sessionProxyURL))
-					SetOAuthSessionError(state, "Failed to fetch project ID")
-					return
-				}
-				log.Warnf("antigravity: failed to fetch project ID: %v", errProject)
-			} else {
-				projectID = fetchedProjectID
-				log.Infof("antigravity: obtained project ID %s", util.HideAPIKey(projectID))
-			}
+		fetchedProjectID, errProject := authSvc.FetchProjectID(ctx, accessToken)
+		if errProject != nil {
+			log.Errorf("antigravity: failed to fetch project ID: %s", redactSessionProxyInString(errProject.Error(), sessionProxyURL))
+			SetOAuthSessionError(state, "Failed to fetch project ID")
+			return
 		}
+		projectID := strings.TrimSpace(fetchedProjectID)
+		if projectID == "" {
+			log.Error("antigravity: project ID discovery returned empty project")
+			SetOAuthSessionError(state, "Failed to fetch project ID")
+			return
+		}
+		log.Infof("antigravity: obtained project ID %s", util.HideAPIKey(projectID))
 
 		now := time.Now()
 		metadata := map[string]any{
@@ -1938,8 +1936,8 @@ func (h *Handler) restoreOverwrittenPluginRecord(ctx context.Context, rb savedPl
 			}
 		}
 	}
-	if len(rb.prevDiskBytes) > 0 && h.pluginHost != nil {
-		if restored := h.pluginHost.AuthDataToCoreAuth(pluginapi.AuthData{
+	if host := h.pluginHostSnapshot(); len(rb.prevDiskBytes) > 0 && host != nil {
+		if restored := host.AuthDataToCoreAuth(pluginapi.AuthData{
 			Provider:    restoreRecord.Provider,
 			ID:          restoreRecord.ID,
 			FileName:    restoreRecord.FileName,

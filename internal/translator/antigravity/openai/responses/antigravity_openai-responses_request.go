@@ -2,9 +2,9 @@ package responses
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
@@ -132,7 +132,7 @@ func ConvertOpenAIResponsesRequestToAntigravity(modelName string, inputRawJSON [
 		Body:   inputRawJSON,
 		Stream: stream,
 	})
-	return req.Body, nil
+	return req.Body, req.Err
 }
 
 // ConvertOpenAIResponsesRequestEnvelopeToAntigravity translates an OpenAI Responses
