@@ -2,15 +2,17 @@ package claude
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"github.com/MoeForge/moego/base64"
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -1529,7 +1531,8 @@ func TestConvertClaudeRequestToAntigravity_CacheModeRecoversSignatureWhenClientO
 
 	validNativeSig := testAnthropicNativeSignature(t)
 	expectedAntigravitySig := base64.StdEncoding.EncodeToString([]byte(validNativeSig))
-	cache.CacheSignature("claude-sonnet-4-5-thinking", "Let me think...", validNativeSig)
+	ctx := cache.WithSignatureCacheScope(context.Background(), "test-account")
+	cache.CacheSignatureBestEffort(ctx, "claude-sonnet-4-5-thinking", "Let me think...", validNativeSig)
 
 	// Client omitted signature (signature is empty or absent).
 	inputJSON := []byte(`{
@@ -1545,10 +1548,17 @@ func TestConvertClaudeRequestToAntigravity_CacheModeRecoversSignatureWhenClientO
 		]
 	}`)
 
-	output, _ := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5-thinking", inputJSON, false)
-	parts := ojson.GetBytesNoCopy(output, "request.contents.0.parts").Array()
+	translated := sdktranslator.TranslateRequestEnvelope(ctx, sdktranslator.FormatClaude, sdktranslator.FormatAntigravity, sdktranslator.RequestEnvelope{
+		Format: sdktranslator.FormatClaude,
+		Model:  "claude-sonnet-4-5-thinking",
+		Body:   inputJSON,
+	})
+	if translated.Err != nil {
+		t.Fatalf("TranslateRequestEnvelope() error = %v", translated.Err)
+	}
+	parts := ojson.GetBytesNoCopy(translated.Body, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
-		t.Fatalf("Expected omitted signature thinking block to be recovered from cache, got %d parts; output=%s", len(parts), output)
+		t.Fatalf("Expected omitted signature thinking block to be recovered from cache, got %d parts; output=%s", len(parts), translated.Body)
 	}
 	if !parts[0].Get("thought").Bool() || parts[0].Get("thoughtSignature").String() != expectedAntigravitySig {
 		t.Fatalf("Expected recovered thinking part with signature %s, got %s", expectedAntigravitySig, parts[0].Raw)
@@ -1943,7 +1953,7 @@ func TestConvertClaudeRequestToAntigravity_ToolUsePreservesPresentNonObjectInput
 		{name: "number", inputJSON: `42`, wantArgs: `42`, wantFunctionCall: true},
 		{name: "boolean", inputJSON: `true`, wantArgs: `true`, wantFunctionCall: true},
 		{name: "null", inputJSON: `null`, wantArgs: `{}`, wantFunctionCall: true},
-		{name: "missing", wantFunctionCall: false},
+		{name: "missing", wantArgs: `{}`, wantFunctionCall: true},
 	}
 
 	for _, tc := range tests {
@@ -1980,6 +1990,67 @@ func TestConvertClaudeRequestToAntigravity_ToolUsePreservesPresentNonObjectInput
 				t.Fatalf("missing input should not create functionCall, output: %s", output)
 			}
 		})
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_ToolUseWithoutInputPreservesToolResultPair(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"messages": [
+			{
+				"role": "user",
+				"content": "What time is it?"
+			},
+			{
+				"role": "assistant",
+				"content": [{
+					"type": "tool_use",
+					"id": "toolu_1",
+					"name": "get_time"
+				}]
+			},
+			{
+				"role": "user",
+				"content": [{
+					"type": "tool_result",
+					"tool_use_id": "toolu_1",
+					"content": "12:00"
+				}]
+			}
+		]
+	}`)
+
+	output, err := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	if err != nil {
+		t.Fatalf("ConvertClaudeRequestToAntigravity() error = %v", err)
+	}
+
+	contents := ojson.GetBytesNoCopy(output, "request.contents").Array()
+	if len(contents) != 3 {
+		t.Fatalf("request.contents length = %d, want 3; output: %s", len(contents), output)
+	}
+	functionCall := contents[1].Get("parts.0.functionCall")
+	if !functionCall.Exists() {
+		t.Fatalf("assistant functionCall is missing; output: %s", output)
+	}
+	if got := functionCall.Get("id").String(); got != "toolu_1" {
+		t.Fatalf("functionCall.id = %q, want toolu_1", got)
+	}
+	if got := functionCall.Get("name").String(); got != "get_time" {
+		t.Fatalf("functionCall.name = %q, want get_time", got)
+	}
+	if got := functionCall.Get("args").Raw; got != `{}` {
+		t.Fatalf("functionCall.args = %q, want {}; output: %s", got, output)
+	}
+	functionResponse := contents[2].Get("parts.0.functionResponse")
+	if !functionResponse.Exists() {
+		t.Fatalf("user functionResponse is missing; output: %s", output)
+	}
+	if got := functionResponse.Get("id").String(); got != "toolu_1" {
+		t.Fatalf("functionResponse.id = %q, want toolu_1", got)
+	}
+	if got := functionResponse.Get("name").String(); got != "get_time" {
+		t.Fatalf("functionResponse.name = %q, want get_time", got)
 	}
 }
 
@@ -4027,5 +4098,63 @@ func TestConvertClaudeRequestToAntigravity_PreservesToolResultErrors(t *testing.
 				}
 			})
 		}
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_ToolResultDocumentExtractedToParts(t *testing.T) {
+	tests := []struct {
+		name       string
+		content    string
+		wantResult string
+	}{
+		{
+			name:       "array text and pdf document",
+			content:    `[{"type":"text","text":"Loaded sample.pdf"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}]`,
+			wantResult: `{"text":"Loaded sample.pdf","type":"text"}`,
+		},
+		{
+			name:       "array pdf document only",
+			content:    `[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}]`,
+			wantResult: `""`,
+		},
+		{
+			name:       "object pdf document",
+			content:    `{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}`,
+			wantResult: `""`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := []byte(fmt.Sprintf(`{
+				"model": "claude-sonnet-4-6",
+				"messages": [
+					{"role": "assistant", "content": [{"type": "tool_use", "id": "call_pdf", "name": "read_file", "input": {}}]},
+					{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_pdf", "content": %s}]}
+				]
+			}`, tt.content))
+
+			output, err := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", input, false)
+			if err != nil {
+				t.Fatalf("ConvertClaudeRequestToAntigravity failed: %v", err)
+			}
+			fr := ojson.GetBytesNoCopy(output, "request.contents.1.parts.0.functionResponse")
+			if !fr.Exists() {
+				t.Fatalf("functionResponse missing: %s", output)
+			}
+			if got := fr.Get("parts.0.inlineData").Raw; got != `{"mimeType":"application/pdf","data":"JVBERi0xLjQK"}` {
+				t.Fatalf("functionResponse.parts[0].inlineData = %s, want pdf inlineData; fr=%s", got, fr.Raw)
+			}
+			if strings.Contains(fr.Get("response.result").Raw, "JVBERi0xLjQK") {
+				t.Fatalf("base64 PDF leaked into response.result: %s", fr.Get("response.result").Raw)
+			}
+			if tt.wantResult == `""` {
+				if fr.Get("response.result").String() != "" {
+					t.Fatalf("response.result = %s, want empty string", fr.Get("response.result").Raw)
+				}
+			} else if got := fr.Get("response.result.text").String(); got != "Loaded sample.pdf" {
+				t.Fatalf("response.result.text = %q, want Loaded sample.pdf (raw=%s)", got, fr.Get("response.result").Raw)
+			}
+		})
 	}
 }

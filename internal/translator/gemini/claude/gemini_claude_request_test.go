@@ -11,6 +11,49 @@ import (
 	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 )
 
+func TestConvertClaudeRequestToGemini_ToolUseWithoutInputDefaultsToEmptyObject(t *testing.T) {
+	inputJSON := []byte(`{
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "toolu_1", "name": "get_time"}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "toolu_1", "content": "12:00"}
+				]
+			}
+		]
+	}`)
+
+	output, errConvert := ConvertClaudeRequestToGemini("gemini-3-flash-preview", inputJSON, false)
+	if errConvert != nil {
+		t.Fatalf("ConvertClaudeRequestToGemini() error = %v", errConvert)
+	}
+
+	contents := ojson.GetBytesNoCopy(output, "contents").Array()
+	if len(contents) != 2 {
+		t.Fatalf("contents count = %d, want 2; output=%s", len(contents), output)
+	}
+	functionCall := contents[0].Get("parts.0.functionCall")
+	if functionCall.Get("id").String() != "toolu_1" || functionCall.Get("name").String() != "get_time" {
+		t.Fatalf("functionCall = %s, want id toolu_1 and name get_time", functionCall.Raw)
+	}
+	if functionCall.Get("args").Raw != `{}` {
+		t.Fatalf("functionCall.args = %s, want {}", functionCall.Get("args").Raw)
+	}
+	functionResponse := contents[1].Get("parts.0.functionResponse")
+	if functionResponse.Get("id").String() != "toolu_1" {
+		t.Fatalf("functionResponse = %s, want id toolu_1", functionResponse.Raw)
+	}
+	if errPairing := internalsignature.ValidateGeminiFunctionCallPairing(output); errPairing != nil {
+		t.Fatalf("translated tool history is invalid: %v; output=%s", errPairing, output)
+	}
+}
+
 func TestConvertClaudeRequestToGemini_ToolChoice_SpecificTool(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gemini-3-flash-preview",
@@ -1009,5 +1052,70 @@ func TestConvertClaudeRequestToGemini_ImageURLAndRedactedThinkingStaySkipped(t *
 	parts := ojson.GetBytesNoCopy(output, "contents.0.parts").Array()
 	if len(parts) != 1 || parts[0].Get("text").String() != "keep me" {
 		t.Fatalf("old skip paths changed the turn: %s", output)
+	}
+}
+
+func TestConvertClaudeRequestToGemini_ToolResultDocumentNestedInFunctionResponseParts(t *testing.T) {
+	tests := []struct {
+		name       string
+		content    string
+		wantResult string
+	}{
+		{
+			name:       "array text and pdf document",
+			content:    `[{"type":"text","text":"Loaded sample.pdf"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}]`,
+			wantResult: "Loaded sample.pdf",
+		},
+		{
+			name:       "array pdf document only",
+			content:    `[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}]`,
+			wantResult: "",
+		},
+		{
+			name:       "object pdf document",
+			content:    `{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}`,
+			wantResult: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputJSON := []byte(fmt.Sprintf(`{
+				"model": "gemini-3.1-pro-preview",
+				"messages": [
+					{"role": "assistant", "content": [{"type": "tool_use", "id": "call_pdf", "name": "read_file", "input": {}}]},
+					{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_pdf", "content": %s}]}
+				]
+			}`, tt.content))
+
+			output, err := ConvertClaudeRequestToGemini("gemini-3.1-pro-preview", inputJSON, false)
+			if err != nil {
+				t.Fatalf("ConvertClaudeRequestToGemini failed: %v", err)
+			}
+			fr := ojson.GetBytesNoCopy(output, "contents.1.parts.0.functionResponse")
+			if !fr.Exists() {
+				t.Fatalf("functionResponse missing: %s", output)
+			}
+			pdf := fr.Get("parts.0.inlineData")
+			if !pdf.Exists() {
+				t.Fatalf("expected functionResponse.parts.0.inlineData to exist, got %s", fr.Raw)
+			}
+			if got := pdf.Get("mimeType").String(); got != "application/pdf" {
+				t.Fatalf("mimeType = %q, want application/pdf", got)
+			}
+			if got := pdf.Get("data").String(); got != "JVBERi0xLjQK" {
+				t.Fatalf("data = %q, want JVBERi0xLjQK", got)
+			}
+			if strings.Contains(fr.Get("response.result").Raw, "JVBERi0xLjQK") {
+				t.Fatalf("base64 PDF leaked into response.result: %s", fr.Get("response.result").Raw)
+			}
+			if tt.wantResult == "" {
+				if got := fr.Get("response.result").String(); got != "" {
+					t.Fatalf("response.result = %q, want empty", got)
+				}
+			} else if got := fr.Get("response.result.text").String(); got != tt.wantResult {
+				t.Fatalf("response.result.text = %q, want %q (raw=%s)", got, tt.wantResult, fr.Get("response.result").Raw)
+			}
+		})
 	}
 }
