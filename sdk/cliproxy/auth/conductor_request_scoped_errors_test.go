@@ -9,6 +9,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -67,6 +68,9 @@ func TestUnwrapExecutionBoundaryErrorRemovesInternalMarkers(t *testing.T) {
 	}{
 		{name: "attempt inside stop", err: wrapRequestStopError(markUpstreamExecutionAttempt(base))},
 		{name: "stop inside attempt", err: markUpstreamExecutionAttempt(wrapRequestStopError(base))},
+		{name: "scheduler reject", err: wrapSchedulerRejectError(base)},
+		{name: "attempt inside round scheduler reject", err: markRoundEndedBySchedulerReject(markUpstreamExecutionAttempt(base))},
+		{name: "round scheduler reject inside attempt", err: markUpstreamExecutionAttempt(markRoundEndedBySchedulerReject(base))},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := unwrapExecutionBoundaryError(test.err); got != base {
@@ -1284,5 +1288,141 @@ func TestRequestScopedErrors_ResponseBodyProvider_MatchesUnderlyingPayload(t *te
 	a1, _ := m.GetByID("auth-fast-wrapped-1")
 	if !a1.Unavailable || a1.NextRetryAfter.IsZero() {
 		t.Fatal("expected auth1 to be in cooldown when matching ResponseBody()")
+	}
+}
+
+func TestHomeExecutionAttachesRequestScopedErrorConfigToContext(t *testing.T) {
+	cfg := &internalconfig.Config{
+		Home: internalconfig.HomeConfig{Enabled: true},
+		OAuthRequestScopedErrors: map[string][]internalconfig.RequestScopedErrorRule{
+			"codex": {
+				{
+					Status: http.StatusNotFound,
+					Match:  []string{"model_not_found_on_route"},
+					Action: RequestScopedActionStop,
+				},
+			},
+		},
+	}
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(cfg)
+
+	var observedAction string
+	var observedMatched bool
+	exec := &mockCustomErrorExecutor{
+		identifier: "codex",
+		executeFn: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			err := customStatusError{code: http.StatusNotFound, msg: "model_not_found_on_route"}
+			observedAction, observedMatched = MatchRequestScopedErrorAction(auth, err, RequestScopedErrorConfigFromContext(ctx))
+			return cliproxyexecutor.Response{}, err
+		},
+	}
+	m.RegisterExecutor(exec)
+
+	executions := executionregistry.New()
+	dispatcher := &accountedHomeExecutionDispatcher{
+		auths: []Auth{{
+			ID:         "home-oauth-1",
+			Provider:   "codex",
+			Status:     StatusActive,
+			Attributes: map[string]string{"auth_kind": "oauth"},
+		}},
+	}
+	m.PublishHomeDispatch(dispatcher, executions, 1)
+
+	_, errExec := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+	if errExec == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !observedMatched || observedAction != RequestScopedActionStop {
+		t.Fatalf("executor context did not match request-scoped rule: matched=%v action=%q", observedMatched, observedAction)
+	}
+}
+
+func TestRequestScopedErrors_VertexResolvedFromManagerConfig(t *testing.T) {
+	vertexRules := []internalconfig.RequestScopedErrorRule{
+		{
+			Status: http.StatusBadRequest,
+			Match:  []string{"vertex_api_key_rule"},
+			Action: RequestScopedActionStop,
+		},
+	}
+	compatRules := []internalconfig.RequestScopedErrorRule{
+		{
+			Status: http.StatusBadRequest,
+			Match:  []string{"compat_rule_must_not_leak"},
+			Action: RequestScopedActionContinueAndCooldown,
+		},
+	}
+	oauthRules := []internalconfig.RequestScopedErrorRule{
+		{
+			Status: http.StatusBadRequest,
+			Match:  []string{"vertex_oauth_rule"},
+			Action: RequestScopedActionContinue,
+		},
+	}
+
+	cfg := &internalconfig.Config{
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{
+			{
+				Name:                "my-compat",
+				BaseURL:             "https://compat.api",
+				RequestScopedErrors: compatRules,
+			},
+		},
+		VertexCompatAPIKey: []internalconfig.VertexCompatKey{
+			{
+				APIKey:              "vk-test-0",
+				BaseURL:             "https://vertex.example.com",
+				RequestScopedErrors: vertexRules,
+			},
+			{
+				APIKey:  "vk-test-1-no-rules",
+				BaseURL: "https://vertex.example.com",
+			},
+		},
+		OAuthRequestScopedErrors: map[string][]internalconfig.RequestScopedErrorRule{
+			"vertex": oauthRules,
+		},
+	}
+
+	vertexAPIKeyAuth := &Auth{
+		ID:       "vertex-apikey-0",
+		Provider: "vertex",
+		Label:    "vertex-apikey",
+		Attributes: map[string]string{
+			AttributeSource:      "config:vertex-apikey[0]",
+			"provider_key":       "vertex",
+			AttributeConfigIndex: "0",
+		},
+	}
+	resolved := extractRequestScopedErrorRules(vertexAPIKeyAuth, cfg)
+	if len(resolved) != 1 || len(resolved[0].Match) != 1 || resolved[0].Match[0] != "vertex_api_key_rule" || resolved[0].Action != RequestScopedActionStop {
+		t.Fatalf("vertex API key resolved rules = %#v, want %#v", resolved, vertexRules)
+	}
+
+	// A Vertex API-key entry without rules must not inherit OpenAICompatibility[0] rules
+	// even though synthesizeVertexCompat sets provider_key="vertex" and config_index.
+	vertexNoRulesCfg := &internalconfig.Config{
+		OpenAICompatibility: cfg.OpenAICompatibility,
+		VertexCompatAPIKey: []internalconfig.VertexCompatKey{
+			{APIKey: "vk-no-rules", BaseURL: "https://vertex.example.com"},
+		},
+	}
+	if leaked := extractRequestScopedErrorRules(vertexAPIKeyAuth, vertexNoRulesCfg); len(leaked) != 0 {
+		t.Fatalf("vertex API key without rules unexpectedly inherited %#v", leaked)
+	}
+
+	// Vertex OAuth auth must continue resolving oauth-request-scoped-errors["vertex"].
+	vertexOAuthAuth := &Auth{
+		ID:       "vertex-oauth-0",
+		Provider: "vertex",
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+		},
+	}
+	resolvedOAuth := extractRequestScopedErrorRules(vertexOAuthAuth, cfg)
+	if len(resolvedOAuth) != 1 || len(resolvedOAuth[0].Match) != 1 || resolvedOAuth[0].Match[0] != "vertex_oauth_rule" {
+		t.Fatalf("vertex OAuth resolved rules = %#v, want %#v", resolvedOAuth, oauthRules)
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -61,6 +61,34 @@ func TestAuthDispatchRequestDefaultsCountToOne(t *testing.T) {
 	}
 	if req.CredentialPolicy != "" {
 		t.Fatalf("credential policy = %q, want empty", req.CredentialPolicy)
+	}
+}
+
+func TestAuthDispatchRequestAdvertisesExecutorPlugins(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		plugins map[string][]string
+		want    string
+	}{
+		{name: "absent"},
+		{name: "supported-with-no-plugins", plugins: map[string][]string{}, want: `{}`},
+		{name: "ready", plugins: map[string][]string{"demo": {"antigravity"}}, want: `{"demo":["antigravity"]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := newAuthDispatchRequest("model", "", "", nil, 1, "", nil, "")
+			req.ExecutorPlugins = tt.plugins
+			raw, errMarshal := json.Marshal(req)
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			var payload map[string]json.RawMessage
+			if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if got := string(payload["executor_plugins"]); got != tt.want {
+				t.Errorf("executor_plugins = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
