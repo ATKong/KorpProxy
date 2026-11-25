@@ -90,8 +90,12 @@ func extractSummaryConfigFromGetter(get func(string) ojson.Result, normalized st
 		if config, ok := firstSummaryBoolConfigFromGetter(get, []string{
 			"generationConfig.thinkingConfig.includeThoughts",
 			"generationConfig.thinkingConfig.include_thoughts",
+			"generationConfig.thinking_config.include_thoughts",
+			"generationConfig.thinking_config.includeThoughts",
 			"generation_config.thinking_config.include_thoughts",
 			"generation_config.thinking_config.includeThoughts",
+			"generation_config.thinkingConfig.include_thoughts",
+			"generation_config.thinkingConfig.includeThoughts",
 		}); ok {
 			return config
 		}
@@ -324,6 +328,9 @@ func applySummaryConfigForProviderDoc(doc *ojson.Doc, docValid bool, format, mod
 		value := "omitted"
 		if enabled {
 			value = "summarized"
+			if strings.EqualFold(strings.TrimSpace(doc.Get("thinking.display").String()), "updates") {
+				value = "updates"
+			}
 		}
 		if doc.Set("thinking.display", value) == nil {
 			modified = true
@@ -554,7 +561,7 @@ func claudeSummaryConfigFromGetter(get func(string) ojson.Result, path string) (
 		return SummaryConfig{}, false
 	}
 	switch strings.ToLower(strings.TrimSpace(value.String())) {
-	case "summarized":
+	case "summarized", "updates":
 		return SummaryConfig{Mode: SummaryEnabled, Detail: "auto"}, true
 	case "omitted":
 		return SummaryConfig{Mode: SummaryDisabled}, true

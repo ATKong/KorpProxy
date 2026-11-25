@@ -15,7 +15,7 @@ func newUsageExhaustionManager(authID, model string) *Manager {
 	m := &Manager{
 		auths:        map[string]*Auth{authID: {ID: authID, Provider: "claude"}},
 		executors:    map[string]ProviderExecutor{"claude": schedulerTestExecutor{}},
-		hook:         NoopHook{},
+		hook:         &hookChain{primary: NoopHook{}},
 		authLoadGate: semaphore.NewWeighted(math.MaxInt64),
 	}
 	m.scheduler = newAuthScheduler(&RoundRobinSelector{})

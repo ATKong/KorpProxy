@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
@@ -150,8 +151,8 @@ func TestConvertGeminiResponseToClaude_VertexStreamingPartialArgs(t *testing.T) 
 		if got := block0JSON.String(); got != `{"city":"Berlin"}` {
 			t.Fatalf("block 0 JSON = %q, want %q", got, `{"city":"Berlin"}`)
 		}
-		if len(deferredSigs) != 2 || deferredSigs[0] != "sig-mid-1" || deferredSigs[1] != "sig-mid-2" {
-			t.Fatalf("expected deferred signatures [sig-mid-1 sig-mid-2], got %v", deferredSigs)
+		if len(deferredSigs) != 2 || deferredSigs[0] != "cpa-gemini-carrier-v1:previous:function:c2lnLW1pZC0x" || deferredSigs[1] != "cpa-gemini-carrier-v1:previous:function:c2lnLW1pZC0y" {
+			t.Fatalf("expected backward-bound deferred function signatures, got %v", deferredSigs)
 		}
 	})
 
@@ -206,8 +207,8 @@ func TestConvertGeminiResponseToClaude_VertexStreamingPartialArgs(t *testing.T) 
 		cArgs := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Paris"},"partialArgs":[]}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2,"totalTokenCount":7},"modelVersion":"gemini-2.5-pro","responseId":"resp-claude-args"}`)
 		outs2 := ConvertGeminiResponseToClaude(ctx, "gemini-2.5-pro", nil, nil, cArgs, &p2)
 		text2 := string(bytes.Join(outs2, nil))
-		if !strings.Contains(text2, `{\"city\":\"Paris\"}`) {
-			t.Fatalf("expected Paris args to be preserved when partialArgs is empty array, got: %s", text2)
+		if got := geminiClaudeInputJSONDeltas(t, text2); got != `{"city":"Paris"}` {
+			t.Fatalf("expected Paris args to be preserved when partialArgs is empty array, got %q (stream: %s)", got, text2)
 		}
 	})
 
@@ -355,8 +356,8 @@ func TestConvertGeminiResponseToClaudeNonStream_PartWithThoughtSignatureWithoutT
 	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	blocks := outputJSON.Get("content").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 content blocks (thinking + text), got %d: %s", len(blocks), string(output))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 content blocks (carrier + signed text + unsigned text), got %d: %s", len(blocks), string(output))
 	}
 
 	thinkingBlock := blocks[0]
@@ -371,8 +372,11 @@ func TestConvertGeminiResponseToClaudeNonStream_PartWithThoughtSignatureWithoutT
 	}
 
 	textBlock := blocks[1]
-	if textBlock.Get("type").String() != "text" || textBlock.Get("text").String() != "inferred reasoningfinal answer" {
+	if textBlock.Get("type").String() != "text" || textBlock.Get("text").String() != "inferred reasoning" {
 		t.Fatalf("unexpected text block: %s", textBlock.Raw)
+	}
+	if blocks[2].Get("type").String() != "text" || blocks[2].Get("text").String() != "final answer" {
+		t.Fatalf("unsigned text must remain a separate block: %s", blocks[2].Raw)
 	}
 }
 
@@ -740,6 +744,71 @@ func TestConvertGeminiResponseToClaude_MalformedFunctionCallWithToolUsePreserves
 	}
 }
 
+func TestConvertGeminiResponseToClaudeStream_IgnoresEmptyFinishReasonWithUsage(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"hi"}]}`)
+	ctx := context.Background()
+
+	for _, finishReason := range []string{"null", `""`} {
+		t.Run(finishReason, func(t *testing.T) {
+			var param any
+			firstChunk := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":` + finishReason + `}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1,"totalTokenCount":11}}`)
+			terminalChunk := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":" world"}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`)
+
+			firstOutput := bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-2.5-pro", requestJSON, requestJSON, firstChunk, &param), nil)
+			if strings.Contains(string(firstOutput), `"type":"message_delta"`) || strings.Contains(string(firstOutput), `"type":"content_block_stop"`) {
+				t.Fatalf("intermediate finishReason %s emitted terminal events:\n%s", finishReason, firstOutput)
+			}
+
+			fullOutput := append(firstOutput, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-2.5-pro", requestJSON, requestJSON, terminalChunk, &param), nil)...)
+			fullOutput = append(fullOutput, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-2.5-pro", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+
+			var textBlockStarts, blockStops, messageDeltas int
+			var messageDelta ojson.Result
+			var text strings.Builder
+			for _, line := range strings.Split(string(fullOutput), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+				switch ojson.Get(payload, "type").String() {
+				case "content_block_start":
+					if ojson.Get(payload, "content_block.type").String() == "text" {
+						textBlockStarts++
+					}
+				case "content_block_stop":
+					blockStops++
+				case "content_block_delta":
+					if ojson.Get(payload, "delta.type").String() == "text_delta" {
+						text.WriteString(ojson.Get(payload, "delta.text").String())
+					}
+				case "message_delta":
+					messageDeltas++
+					messageDelta = ojson.Parse(payload)
+				}
+			}
+
+			if textBlockStarts != 1 {
+				t.Fatalf("text content_block_start count = %d, want 1; output:\n%s", textBlockStarts, fullOutput)
+			}
+			if blockStops != 1 {
+				t.Fatalf("content_block_stop count = %d, want 1; output:\n%s", blockStops, fullOutput)
+			}
+			if messageDeltas != 1 {
+				t.Fatalf("message_delta count = %d, want 1; output:\n%s", messageDeltas, fullOutput)
+			}
+			if got := text.String(); got != "hello world" {
+				t.Fatalf("text = %q, want %q; output:\n%s", got, "hello world", fullOutput)
+			}
+			if got := messageDelta.Get("delta.stop_reason").String(); got != "max_tokens" {
+				t.Fatalf("stop_reason = %q, want max_tokens; output:\n%s", got, fullOutput)
+			}
+			if got := messageDelta.Get("usage.output_tokens").Int(); got != 5 {
+				t.Fatalf("output_tokens = %d, want 5; output:\n%s", got, fullOutput)
+			}
+		})
+	}
+}
+
 func TestConvertGeminiResponseToClaudeStream_PartlessStopClosesMessageWithEndTurn(t *testing.T) {
 	requestJSON := []byte(`{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`)
 	chunk := []byte(`{
@@ -1093,7 +1162,7 @@ func TestConvertGeminiResponseToClaudeStream_Issue6409_SplitTrailingSignature(t 
 	if !strings.Contains(outputText, `{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}`) {
 		t.Fatalf("expected block 1 trailing carrier thinking, got: %s", outputText)
 	}
-	if !strings.Contains(outputText, `{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig-stream-trailing"}}`) {
+	if !strings.Contains(outputText, `{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"cpa-gemini-carrier-v1:previous:text:c2lnLXN0cmVhbS10cmFpbGluZw"}}`) {
 		t.Fatalf("expected block 1 signature_delta, got: %s", outputText)
 	}
 	if !strings.Contains(outputText, `{"type":"content_block_stop","index":1}`) {
@@ -1182,8 +1251,8 @@ func TestConvertGeminiResponseToClaudeStream_Issue6409_FunctionCallContinuationS
 	if !strings.Contains(outputText, `"type":"input_json_delta"`) {
 		t.Fatalf("expected input_json_delta, got: %s", outputText)
 	}
-	if !strings.Contains(outputText, `"signature":"sig-fc-cont-done"`) {
-		t.Fatalf("expected signature_delta with 'sig-fc-cont-done', got: %s", outputText)
+	if !strings.Contains(outputText, `"signature":"cpa-gemini-carrier-v1:previous:function:c2lnLWZjLWNvbnQtZG9uZQ"`) {
+		t.Fatalf("expected backward-bound signature_delta for the continued call, got: %s", outputText)
 	}
 }
 
@@ -1427,5 +1496,441 @@ func TestConvertGeminiResponseToClaude_ImplicitOpenToolContinuationOrdering(t *t
 				t.Fatalf("expected concatenated partial_json %s, got %q (stream: %s)", tc.want, got, string(streamBytes))
 			}
 		})
+	}
+}
+
+func TestConvertGeminiResponseToClaude_PartialVisibleTextWithMalformedFunctionCallPreservesText(t *testing.T) {
+	requestJSON := []byte(`{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`)
+	rawNonStream := []byte(`{
+		"candidates": [{
+			"content": {"role": "model", "parts": [{"text": "partial answer"}]},
+			"index": 0,
+			"finishReason": "MALFORMED_FUNCTION_CALL"
+		}],
+		"usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 3, "totalTokenCount": 53},
+		"modelVersion": "m",
+		"responseId": "resp-partial"
+	}`)
+
+	ctx := context.Background()
+	nonStream := ConvertGeminiResponseToClaudeNonStream(ctx, "claude-opus-5-5", requestJSON, requestJSON, rawNonStream, nil)
+	nonStreamJSON := util.ParseGJSONBytesNoCopy(nonStream)
+	if got := nonStreamJSON.Get("type").String(); got != "message" {
+		t.Fatalf("non-stream type = %q, want message; output: %s", got, nonStream)
+	}
+	if got := nonStreamJSON.Get("content.0.text").String(); got != "partial answer" {
+		t.Fatalf("non-stream text = %q, want partial answer; output: %s", got, nonStream)
+	}
+	if got := nonStreamJSON.Get("stop_reason").String(); got != "end_turn" {
+		t.Fatalf("non-stream stop_reason = %q, want end_turn; output: %s", got, nonStream)
+	}
+
+	chunk1 := []byte(`{
+		"candidates": [{
+			"content": {"role": "model", "parts": [{"text": "partial answer"}]},
+			"index": 0
+		}],
+		"modelVersion": "m",
+		"responseId": "resp-partial"
+	}`)
+	chunk2 := []byte(`{
+		"candidates": [{
+			"content": {"role": "model", "parts": []},
+			"index": 0,
+			"finishReason": "MALFORMED_FUNCTION_CALL"
+		}],
+		"usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 3, "totalTokenCount": 53},
+		"modelVersion": "m",
+		"responseId": "resp-partial"
+	}`)
+	var param any
+	streamOut := bytes.Join(ConvertGeminiResponseToClaude(ctx, "claude-opus-5-5", requestJSON, requestJSON, chunk1, &param), nil)
+	streamOut = append(streamOut, bytes.Join(ConvertGeminiResponseToClaude(ctx, "claude-opus-5-5", requestJSON, requestJSON, chunk2, &param), nil)...)
+	streamOut = append(streamOut, bytes.Join(ConvertGeminiResponseToClaude(ctx, "claude-opus-5-5", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+	streamText := string(streamOut)
+	if strings.Contains(streamText, "event: error\n") {
+		t.Fatalf("unexpected error event when partial text was already emitted:\n%s", streamText)
+	}
+	if !strings.Contains(streamText, "partial answer") || !strings.Contains(streamText, `"type":"message_stop"`) {
+		t.Fatalf("expected partial text and message_stop in stream output:\n%s", streamText)
+	}
+}
+
+func TestConvertGeminiResponseToClaude_EmptyFunctionCallPlaceholderReturnsError(t *testing.T) {
+	requestJSON := []byte(`{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}`)
+	rawJSON := []byte(`{
+		"candidates": [{
+			"content": {"role": "model", "parts": [{"functionCall": {}}]},
+			"index": 0,
+			"finishReason": "MALFORMED_FUNCTION_CALL"
+		}],
+		"usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 1, "totalTokenCount": 51},
+		"modelVersion": "m",
+		"responseId": "resp-empty-fc"
+	}`)
+
+	ctx := context.Background()
+	nonStream := ConvertGeminiResponseToClaudeNonStream(ctx, "claude-opus-5-5", requestJSON, requestJSON, rawJSON, nil)
+	if got := util.ParseGJSONBytesNoCopy(nonStream).Get("type").String(); got != "error" {
+		t.Fatalf("non-stream type = %q, want error for empty functionCall placeholder; output: %s", got, nonStream)
+	}
+	var param any
+	streamOut := bytes.Join(ConvertGeminiResponseToClaude(ctx, "claude-opus-5-5", requestJSON, requestJSON, rawJSON, &param), nil)
+	streamOut = append(streamOut, bytes.Join(ConvertGeminiResponseToClaude(ctx, "claude-opus-5-5", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+	if !strings.Contains(string(streamOut), "event: error\n") {
+		t.Fatalf("expected error event for empty functionCall placeholder:\n%s", streamOut)
+	}
+}
+
+func TestConvertGeminiResponseToClaudeStream_CoalescesConsecutiveUnsignedTextChunks(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-4-argon","messages":[{"role":"user","content":"why is the sky blue?"}]}`)
+	chunks := [][]byte{
+		[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"First chunk, "}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587"}`),
+		[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"second chunk, "}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587"}`),
+		[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"third chunk, "}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587"}`),
+		[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"fourth chunk, "}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587"}`),
+		[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"fifth chunk."}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587"}`),
+		[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"","thoughtSignature":"sig-7587"}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587"}`),
+		[]byte(`{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20},"modelVersion":"gemini-4-argon","responseId":"resp-7587"}`),
+		[]byte("[DONE]"),
+	}
+
+	var param any
+	ctx := context.Background()
+	var fullOut []byte
+	for _, chunk := range chunks {
+		fullOut = append(fullOut, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-4-argon", requestJSON, requestJSON, chunk, &param), nil)...)
+	}
+
+	textBlockStarts := 0
+	thinkingBlockStarts := 0
+	var block0Text strings.Builder
+	var carrierSig string
+	for _, line := range strings.Split(string(fullOut), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		switch ojson.Get(payload, "type").String() {
+		case "content_block_start":
+			switch ojson.Get(payload, "content_block.type").String() {
+			case "text":
+				textBlockStarts++
+			case "thinking":
+				thinkingBlockStarts++
+			}
+		case "content_block_delta":
+			switch ojson.Get(payload, "delta.type").String() {
+			case "text_delta":
+				if idx := ojson.Get(payload, "index").Int(); idx != 0 {
+					t.Fatalf("text_delta index = %d, want 0; output:\n%s", idx, string(fullOut))
+				}
+				block0Text.WriteString(ojson.Get(payload, "delta.text").String())
+			case "signature_delta":
+				if idx := ojson.Get(payload, "index").Int(); idx != 1 {
+					t.Fatalf("signature_delta index = %d, want 1; output:\n%s", idx, string(fullOut))
+				}
+				carrierSig = ojson.Get(payload, "delta.signature").String()
+			}
+		}
+	}
+
+	if textBlockStarts != 1 {
+		t.Fatalf("text content_block_start count = %d, want 1; output:\n%s", textBlockStarts, string(fullOut))
+	}
+	if thinkingBlockStarts != 1 {
+		t.Fatalf("thinking content_block_start count = %d, want 1; output:\n%s", thinkingBlockStarts, string(fullOut))
+	}
+	if got := block0Text.String(); got != "First chunk, second chunk, third chunk, fourth chunk, fifth chunk." {
+		t.Fatalf("block 0 text = %q, want concatenated text", got)
+	}
+	if carrierSig != "cpa-gemini-carrier-v1:previous:text:c2lnLTc1ODc" {
+		t.Fatalf("carrier signature = %q, want previous:text carrier", carrierSig)
+	}
+
+	t.Run("isolates explicitly signed text part between unsigned chunks", func(t *testing.T) {
+		var p any
+		mixedChunks := [][]byte{
+			[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"before-1 "}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587-mixed"}`),
+			[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"before-2 "}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587-mixed"}`),
+			[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"signed-mid","thoughtSignature":"sig-mid"}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587-mixed"}`),
+			[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"after-1 "}]}}],"modelVersion":"gemini-4-argon","responseId":"resp-7587-mixed"}`),
+			[]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"after-2"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20},"modelVersion":"gemini-4-argon","responseId":"resp-7587-mixed"}`),
+			[]byte("[DONE]"),
+		}
+		var mixedOut []byte
+		for _, ch := range mixedChunks {
+			mixedOut = append(mixedOut, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-4-argon", requestJSON, requestJSON, ch, &p), nil)...)
+		}
+		content := ojson.Parse(claudeContentFromGeminiStream(t, mixedOut).String()).Array()
+		if len(content) != 4 {
+			t.Fatalf("expected 4 content blocks (text, carrier, signed text, text), got %d: %s", len(content), string(mixedOut))
+		}
+		if content[0].Get("type").String() != "text" || content[0].Get("text").String() != "before-1 before-2 " {
+			t.Fatalf("block 0 = %s, want coalesced 'before-1 before-2 '", content[0].Raw)
+		}
+		if content[1].Get("type").String() != "thinking" || content[1].Get("signature").String() != "sig-mid" {
+			t.Fatalf("block 1 = %s, want carrier for sig-mid", content[1].Raw)
+		}
+		if content[2].Get("type").String() != "text" || content[2].Get("text").String() != "signed-mid" {
+			t.Fatalf("block 2 = %s, want isolated 'signed-mid'", content[2].Raw)
+		}
+		if content[3].Get("type").String() != "text" || content[3].Get("text").String() != "after-1 after-2" {
+			t.Fatalf("block 3 = %s, want coalesced 'after-1 after-2'", content[3].Raw)
+		}
+	})
+}
+
+func geminiClaudeInputJSONDeltaPieces(streamText string) []string {
+	var pieces []string
+	for _, line := range strings.Split(streamText, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if ojson.Get(payload, "delta.type").String() == "input_json_delta" {
+			pieces = append(pieces, ojson.Get(payload, "delta.partial_json").String())
+		}
+	}
+	return pieces
+}
+
+func TestConvertGeminiResponseToClaude_ContinuationMergesObjectArgs(t *testing.T) {
+	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"search","input_schema":{"type":"object","additionalProperties":true}}]}`)
+
+	testCases := []struct {
+		name   string
+		chunks [][]byte
+		check  func(t *testing.T, combined string, pieces []string, streamText string)
+	}{
+		{
+			name: "merges_two_continuation_objects_into_single_json_object",
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{"k1":1}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-merge-2"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"k2":2}}}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5},"modelVersion":"gemini-3-flash","responseId":"resp-merge-2"}`),
+				[]byte("[DONE]"),
+			},
+			check: func(t *testing.T, combined string, _ []string, streamText string) {
+				t.Helper()
+				if !ojson.Valid(combined) {
+					t.Fatalf("expected valid merged JSON, got %q (stream: %s)", combined, streamText)
+				}
+				parsed := ojson.Parse(combined)
+				if !parsed.IsObject() || parsed.Get("k1").Int() != 1 || parsed.Get("k2").Int() != 2 {
+					t.Fatalf("expected {k1:1, k2:2}, got %q (stream: %s)", combined, streamText)
+				}
+			},
+		},
+		{
+			name: "merges_three_continuation_objects_before_next_block",
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{"a":"x"}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-merge-3"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"b":2}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-merge-3"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"c":true}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-merge-3"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"text":"done"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5},"modelVersion":"gemini-3-flash","responseId":"resp-merge-3"}`),
+				[]byte("[DONE]"),
+			},
+			check: func(t *testing.T, combined string, _ []string, streamText string) {
+				t.Helper()
+				if !ojson.Valid(combined) {
+					t.Fatalf("expected valid merged JSON, got %q (stream: %s)", combined, streamText)
+				}
+				parsed := ojson.Parse(combined)
+				if !parsed.IsObject() || parsed.Get("a").String() != "x" || parsed.Get("b").Int() != 2 || !parsed.Get("c").Bool() {
+					t.Fatalf("expected {a:x, b:2, c:true}, got %q (stream: %s)", combined, streamText)
+				}
+			},
+		},
+		{
+			name: "whitespace_empty_object_then_real_args",
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{ }}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-ws-1"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"k":"v"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-ws-1"}`),
+				[]byte("[DONE]"),
+			},
+			check: func(t *testing.T, combined string, _ []string, streamText string) {
+				t.Helper()
+				if !ojson.Valid(combined) || ojson.Parse(combined).Get("k").String() != "v" {
+					t.Fatalf("expected valid JSON object with k=v, got %q (stream: %s)", combined, streamText)
+				}
+			},
+		},
+		{
+			name: "single_chunk_whitespace_empty_object",
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{ }}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-ws-2"}`),
+				[]byte("[DONE]"),
+			},
+			check: func(t *testing.T, combined string, _ []string, streamText string) {
+				t.Helper()
+				if combined != "{}" {
+					t.Fatalf("expected {}, got %q (stream: %s)", combined, streamText)
+				}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var param any
+			var streamBytes []byte
+			for _, chunk := range tc.chunks {
+				streamBytes = append(streamBytes, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-3-flash", origRequest, origRequest, chunk, &param), nil)...)
+			}
+			streamText := string(streamBytes)
+			pieces := geminiClaudeInputJSONDeltaPieces(streamText)
+			for i, piece := range pieces {
+				if piece == "" {
+					t.Fatalf("unexpected empty input_json_delta at index %d (pieces=%q, stream: %s)", i, pieces, streamText)
+				}
+			}
+			tc.check(t, strings.Join(pieces, ""), pieces, streamText)
+		})
+	}
+}
+
+func TestConvertGeminiResponseToClaude_NoSpuriousEmptyInputJSONDelta(t *testing.T) {
+	testCases := []struct {
+		name        string
+		origRequest []byte
+		chunks      [][]byte
+		wantJSON    string
+	}{
+		{
+			name:        "real_args_then_empty_continuation",
+			origRequest: []byte(`{"model":"gemini-3-flash","tools":[{"name":"echo","input_schema":{"type":"object","properties":{}}}]}`),
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":{"user":"v"}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-empty-1"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-empty-1"}`),
+				[]byte("[DONE]"),
+			},
+			wantJSON: `{"user":"v"}`,
+		},
+		{
+			name:        "real_args_then_placeholder_continuation",
+			origRequest: []byte(`{"model":"gemini-3-flash","tools":[{"name":"echo","input_schema":{"type":"object","properties":{}}}]}`),
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"echo","args":{"user":"v"}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-empty-2"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"reason":"done"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-empty-2"}`),
+				[]byte("[DONE]"),
+			},
+			wantJSON: `{"user":"v"}`,
+		},
+		{
+			name:        "parameterless_closed_schema_with_continuation",
+			origRequest: []byte(`{"model":"gemini-3-flash","tools":[{"name":"EnterPlanMode","input_schema":{"type":"object","properties":{},"additionalProperties":false}}]}`),
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"EnterPlanMode","args":{"reason":"start"}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-empty-3"}`),
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"reason":"more"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-empty-3"}`),
+				[]byte("[DONE]"),
+			},
+			wantJSON: "{}",
+		},
+		{
+			name:        "parameterless_missing_schema_single_chunk",
+			origRequest: []byte(`{"model":"gemini-3-flash","tools":[{"name":"Ping"}]}`),
+			chunks: [][]byte{
+				[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"Ping","args":{}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-empty-4"}`),
+				[]byte("[DONE]"),
+			},
+			wantJSON: "{}",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var param any
+			var streamBytes []byte
+			for _, chunk := range tc.chunks {
+				streamBytes = append(streamBytes, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-3-flash", tc.origRequest, tc.origRequest, chunk, &param), nil)...)
+			}
+			streamText := string(streamBytes)
+			pieces := geminiClaudeInputJSONDeltaPieces(streamText)
+			if len(pieces) == 0 {
+				t.Fatalf("expected at least one input_json_delta, got none (stream: %s)", streamText)
+			}
+			for i, piece := range pieces {
+				if piece == "" {
+					t.Fatalf("unexpected spurious empty input_json_delta at index %d (pieces=%q, stream: %s)", i, pieces, streamText)
+				}
+			}
+			if got := strings.Join(pieces, ""); got != tc.wantJSON {
+				t.Fatalf("concatenated partial_json = %q, want %q (pieces=%q, stream: %s)", got, tc.wantJSON, pieces, streamText)
+			}
+		})
+	}
+}
+
+func TestConvertGeminiResponseToClaude_ContinuationMiddleThoughtSignatureKeepsOpenToolBlock(t *testing.T) {
+	origRequest := []byte(`{"model":"gemini-3-flash","tools":[{"name":"search","input_schema":{"type":"object","additionalProperties":true}}]}`)
+	chunks := [][]byte{
+		[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{"a":1}}}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-mid-sig"}`),
+		[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"b":2}},"thoughtSignature":"sig-mid-cont"}],"role":"model"}}],"modelVersion":"gemini-3-flash","responseId":"resp-mid-sig"}`),
+		[]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"c":3}}}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5},"modelVersion":"gemini-3-flash","responseId":"resp-mid-sig"}`),
+		[]byte("[DONE]"),
+	}
+
+	ctx := context.Background()
+	var param any
+	var streamBytes []byte
+	for _, chunk := range chunks {
+		streamBytes = append(streamBytes, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-3-flash", origRequest, origRequest, chunk, &param), nil)...)
+	}
+	streamText := string(streamBytes)
+
+	toolUseStarts := 0
+	var toolIndex int64 = -1
+	var toolName string
+	var toolInputPieces []string
+	var carrierSig string
+	for _, line := range strings.Split(streamText, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		switch ojson.Get(payload, "type").String() {
+		case "content_block_start":
+			if ojson.Get(payload, "content_block.type").String() == "tool_use" {
+				toolUseStarts++
+				toolIndex = ojson.Get(payload, "index").Int()
+				toolName = ojson.Get(payload, "content_block.name").String()
+			}
+		case "content_block_delta":
+			switch ojson.Get(payload, "delta.type").String() {
+			case "input_json_delta":
+				piece := ojson.Get(payload, "delta.partial_json").String()
+				if piece == "" {
+					t.Fatalf("unexpected empty input_json_delta (stream: %s)", streamText)
+				}
+				if gotIdx := ojson.Get(payload, "index").Int(); gotIdx != toolIndex {
+					t.Fatalf("input_json_delta index = %d, want %d (stream: %s)", gotIdx, toolIndex, streamText)
+				}
+				toolInputPieces = append(toolInputPieces, piece)
+			case "signature_delta":
+				carrierSig = ojson.Get(payload, "delta.signature").String()
+			}
+		}
+	}
+
+	if toolUseStarts != 1 {
+		t.Fatalf("expected exactly 1 tool_use block, got %d (stream: %s)", toolUseStarts, streamText)
+	}
+	if toolName != "search" {
+		t.Fatalf("tool_use name = %q, want %q (stream: %s)", toolName, "search", streamText)
+	}
+	combined := strings.Join(toolInputPieces, "")
+	if !ojson.Valid(combined) {
+		t.Fatalf("expected valid merged JSON, got %q (stream: %s)", combined, streamText)
+	}
+	parsed := ojson.Parse(combined)
+	if !parsed.IsObject() || parsed.Get("a").Int() != 1 || parsed.Get("b").Int() != 2 || parsed.Get("c").Int() != 3 {
+		t.Fatalf("expected {a:1, b:2, c:3}, got %q (stream: %s)", combined, streamText)
+	}
+	wantSig := translatorcommon.EncodeGeminiClaudeCarrierSignature("sig-mid-cont", translatorcommon.GeminiClaudeCarrierPrevious, translatorcommon.GeminiClaudeCarrierFunction)
+	if carrierSig != wantSig {
+		t.Fatalf("carrier signature = %q, want %q (stream: %s)", carrierSig, wantSig, streamText)
 	}
 }
