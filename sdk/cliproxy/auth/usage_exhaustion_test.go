@@ -15,7 +15,7 @@ func newUsageExhaustionManager(authID, model string) *Manager {
 	m := &Manager{
 		auths:        map[string]*Auth{authID: {ID: authID, Provider: "claude"}},
 		executors:    map[string]ProviderExecutor{"claude": schedulerTestExecutor{}},
-		hook:         NoopHook{},
+		hook:         &hookChain{primary: NoopHook{}},
 		authLoadGate: semaphore.NewWeighted(math.MaxInt64),
 	}
 	m.scheduler = newAuthScheduler(&RoundRobinSelector{})
@@ -105,6 +105,30 @@ func TestMarkResultSuccess_PreservesActiveUsageBlock(t *testing.T) {
 	}
 	if state := auth.ModelStates[model]; state == nil || state.Quota.Reason != usageLimitReason {
 		t.Fatalf("usage-limit quota reason must be preserved, got %+v", auth.ModelStates[model])
+	}
+}
+
+func TestMarkResultSuccess_ClearsCredentialRetryDuringActiveUsageBlock(t *testing.T) {
+	const authID, model = "claude-exhaust-7", "claude-sonnet-4-6"
+	m := newUsageExhaustionManager(authID, model)
+	t.Cleanup(func() { registry.GetGlobalRegistry().RegisterClient(authID, "claude", nil) })
+
+	m.MarkUsageExhausted(authID, time.Now().Add(time.Hour))
+	auth := m.auths[authID]
+	auth.credentialRetryAfter = time.Now().Add(time.Minute)
+	auth.nonAuthCredentialRetryAfter = time.Now().Add(time.Minute)
+	auth.nonAuthCredentialLastError = &Error{Message: "transient"}
+
+	// A newer success proves the credential works, so account-wide retry state
+	// clears even though the model's usage block stays authoritative.
+	m.MarkResult(context.Background(), Result{AuthID: authID, Model: model, Success: true})
+
+	if !auth.credentialRetryAfter.IsZero() || !auth.nonAuthCredentialRetryAfter.IsZero() || auth.nonAuthCredentialLastError != nil {
+		t.Fatalf("credential retry state not cleared: retry=%v nonAuthRetry=%v nonAuthErr=%v",
+			auth.credentialRetryAfter, auth.nonAuthCredentialRetryAfter, auth.nonAuthCredentialLastError)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, model, time.Now()); !blocked {
+		t.Fatalf("active usage block must survive a successful request")
 	}
 }
 
