@@ -1759,13 +1759,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				// rate-limit headers) is authoritative until its window resets; a
 				// request that streams through must not clear it, otherwise the
 				// account would be re-selected while still maxed.
+				auth.credentialRetryAfter = time.Time{}
+				auth.nonAuthCredentialRetryAfter = time.Time{}
+				auth.nonAuthCredentialLastError = nil
 				if hasActiveUsageLimitBlock(state, now) {
 					updateAggregatedAvailability(auth, now)
 				} else {
 					resetModelState(state, now)
-					auth.credentialRetryAfter = time.Time{}
-					auth.nonAuthCredentialRetryAfter = time.Time{}
-					auth.nonAuthCredentialLastError = nil
 					updateAggregatedAvailability(auth, now)
 					if !auth.Disabled && auth.Status != StatusDisabled && !hasModelError(auth, now) && !effectiveAuthForceUntil(auth).After(now) {
 						auth.LastError = nil

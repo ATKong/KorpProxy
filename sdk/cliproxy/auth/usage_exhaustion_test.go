@@ -108,6 +108,30 @@ func TestMarkResultSuccess_PreservesActiveUsageBlock(t *testing.T) {
 	}
 }
 
+func TestMarkResultSuccess_ClearsCredentialRetryDuringActiveUsageBlock(t *testing.T) {
+	const authID, model = "claude-exhaust-7", "claude-sonnet-4-6"
+	m := newUsageExhaustionManager(authID, model)
+	t.Cleanup(func() { registry.GetGlobalRegistry().RegisterClient(authID, "claude", nil) })
+
+	m.MarkUsageExhausted(authID, time.Now().Add(time.Hour))
+	auth := m.auths[authID]
+	auth.credentialRetryAfter = time.Now().Add(time.Minute)
+	auth.nonAuthCredentialRetryAfter = time.Now().Add(time.Minute)
+	auth.nonAuthCredentialLastError = &Error{Message: "transient"}
+
+	// A newer success proves the credential works, so account-wide retry state
+	// clears even though the model's usage block stays authoritative.
+	m.MarkResult(context.Background(), Result{AuthID: authID, Model: model, Success: true})
+
+	if !auth.credentialRetryAfter.IsZero() || !auth.nonAuthCredentialRetryAfter.IsZero() || auth.nonAuthCredentialLastError != nil {
+		t.Fatalf("credential retry state not cleared: retry=%v nonAuthRetry=%v nonAuthErr=%v",
+			auth.credentialRetryAfter, auth.nonAuthCredentialRetryAfter, auth.nonAuthCredentialLastError)
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, model, time.Now()); !blocked {
+		t.Fatalf("active usage block must survive a successful request")
+	}
+}
+
 func TestMarkResultSuccess_ClearsExpiredUsageBlock(t *testing.T) {
 	const authID, model = "claude-exhaust-6", "claude-sonnet-4-6"
 	m := newUsageExhaustionManager(authID, model)
