@@ -2,13 +2,13 @@ package pluginhost
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -58,6 +58,11 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 		return marshalRPCError("unknown_method", "unknown method "+method), nil
 	case pluginabi.MethodPluginReconfigure:
 		return l.callLifecycle(request, true)
+	case pluginabi.MethodExecutorIdentifier:
+		if l.active.Capabilities.Executor == nil {
+			return nil, fmt.Errorf("missing executor")
+		}
+		return marshalRPCResult(rpcIdentifierResponse{Identifier: l.active.Capabilities.Executor.Identifier()})
 	case pluginabi.MethodThinkingIdentifier:
 		if l.active.Capabilities.ThinkingApplier == nil {
 			return nil, fmt.Errorf("missing thinking applier")
@@ -249,6 +254,19 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 		resp, errPick := l.active.Capabilities.Scheduler.Pick(ctx, req)
 		if errPick != nil {
 			return nil, errPick
+		}
+		return marshalRPCResult(resp)
+	case pluginabi.MethodSchedulerContinuity:
+		if l.active.Capabilities.SchedulerContinuity == nil {
+			return nil, fmt.Errorf("missing scheduler continuity")
+		}
+		var req pluginapi.SchedulerContinuityRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errEval := l.active.Capabilities.SchedulerContinuity.Continuity(ctx, req)
+		if errEval != nil {
+			return nil, errEval
 		}
 		return marshalRPCResult(resp)
 	case pluginabi.MethodModelRoute:
