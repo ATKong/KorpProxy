@@ -20,6 +20,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 )
 
+// geminiSSEKeepAliveFrame is an empty SSE frame used for Gemini SSE heartbeats.
+// google.golang.org/genai's iterateResponseStream skips empty frames but rejects
+// SSE comment lines (": keep-alive") with "invalid stream chunk".
+var geminiSSEKeepAliveFrame = []byte("\n\n")
+
 // GeminiAPIHandler contains the handlers for Gemini API endpoints.
 // It holds a pool of clients to interact with the backend service.
 type GeminiAPIHandler struct {
@@ -140,8 +145,9 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		})
 		return
 	}
-	action := strings.Split(strings.TrimPrefix(request.Action, "/"), ":")
-	if len(action) != 2 {
+	trimmedAction := strings.TrimPrefix(request.Action, "/")
+	colonIdx := strings.LastIndex(trimmedAction, ":")
+	if colonIdx <= 0 || colonIdx == len(trimmedAction)-1 {
 		c.JSON(http.StatusNotFound, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("%s not found.", c.Request.URL.Path),
@@ -151,7 +157,8 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		return
 	}
 
-	method := action[1]
+	modelName := trimmedAction[:colonIdx]
+	method := trimmedAction[colonIdx+1:]
 	rawJSON, errRead := c.GetRawData()
 	if errRead != nil && c.Request != nil && c.Request.Body != nil {
 		c.JSON(clienterror.HTTPStatusFromErrorOr(errRead, http.StatusBadRequest), handlers.ErrorResponse{
@@ -165,11 +172,18 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 
 	switch method {
 	case "generateContent":
-		h.handleGenerateContent(c, action[0], rawJSON)
+		h.handleGenerateContent(c, modelName, rawJSON)
 	case "streamGenerateContent":
-		h.handleStreamGenerateContent(c, action[0], rawJSON)
+		h.handleStreamGenerateContent(c, modelName, rawJSON)
 	case "countTokens":
-		h.handleCountTokens(c, action[0], rawJSON)
+		h.handleCountTokens(c, modelName, rawJSON)
+	default:
+		c.JSON(http.StatusNotFound, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Unsupported method: %s", method),
+				Type:    "invalid_request_error",
+			},
+		})
 	}
 }
 
@@ -218,7 +232,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 	writeKeepAlive := func() bool {
 		commitHeaders()
-		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+		_, _ = c.Writer.Write(geminiSSEKeepAliveFrame)
 		flusher.Flush()
 		return true
 	}
@@ -236,6 +250,8 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		return
 	}
 	upstreamHeaders = resolvedHeaders
+	waitKeepAliveC, canWriteWaitKeepAlive, stopWaitKeepAlive := h.StartContinuityWaitKeepAliveForPeek(c, keepAliveC)
+	defer stopWaitKeepAlive()
 
 	// Peek at the first chunk
 	for {
@@ -251,6 +267,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			}
 			if committed {
 				stopKeepAlive()
+				stopWaitKeepAlive()
 				pendingErrors := make(chan *interfaces.ErrorMessage, 1)
 				pendingErrors <- errMsg
 				close(pendingErrors)
@@ -268,6 +285,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		case chunk, ok := <-dataChan:
 			if !ok {
 				stopKeepAlive()
+				stopWaitKeepAlive()
 				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
 					if committed {
 						pendingErrors := make(chan *interfaces.ErrorMessage, 1)
@@ -293,6 +311,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 
 			// Success! Set headers.
 			stopKeepAlive()
+			stopWaitKeepAlive()
 			commitHeaders()
 
 			// Write first chunk
@@ -308,8 +327,14 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			// Continue
 			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
+		case <-waitKeepAliveC:
+			if canWriteWaitKeepAlive() && !writeKeepAlive() {
+				return
+			}
 		case <-keepAliveC:
-			writeKeepAlive()
+			if !writeKeepAlive() {
+				return
+			}
 		}
 	}
 }
@@ -371,6 +396,11 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		KeepAliveInterval: keepAliveInterval,
+		WriteKeepAlive: func() {
+			if alt == "" {
+				_, _ = c.Writer.Write(geminiSSEKeepAliveFrame)
+			}
+		},
 		WriteChunk: func(chunk []byte) {
 			if alt == "" {
 				_, _ = c.Writer.Write([]byte("data: "))
