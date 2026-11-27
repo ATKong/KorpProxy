@@ -30,34 +30,36 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	// Model mapping
 	_ = outDoc.Set("model", modelName)
 
-	// Generation config mapping
-	if genConfig := root.Get("generationConfig"); genConfig.Exists() {
+	// Generation config mapping (supports both camelCase and snake_case Gemini SDK spellings)
+	if genConfig := firstGeminiObject(root, "generationConfig", "generation_config"); genConfig.Exists() {
 		// Temperature
-		if temp := genConfig.Get("temperature"); temp.Exists() {
+		if temp, ok := firstGeminiNumber(genConfig, "temperature"); ok {
 			_ = outDoc.Set("temperature", temp.Float())
 		}
 
 		// Max tokens
-		if maxTokens := genConfig.Get("maxOutputTokens"); maxTokens.Exists() {
+		if maxTokens, ok := firstGeminiNumber(genConfig, "maxOutputTokens", "max_output_tokens"); ok && maxTokens.Int() > 0 {
 			_ = outDoc.Set("max_tokens", maxTokens.Int())
 		}
 
 		// Top P
-		if topP := genConfig.Get("topP"); topP.Exists() {
+		if topP, ok := firstGeminiNumber(genConfig, "topP", "top_p"); ok {
 			_ = outDoc.Set("top_p", topP.Float())
 		}
 
 		// Top K (OpenAI doesn't have direct equivalent, but we can map it)
-		if topK := genConfig.Get("topK"); topK.Exists() {
+		if topK, ok := firstGeminiNumber(genConfig, "topK", "top_k"); ok {
 			// Store as custom parameter for potential use
 			_ = outDoc.Set("top_k", topK.Int())
 		}
 
 		// Stop sequences
-		if stopSequences := genConfig.Get("stopSequences"); stopSequences.Exists() && stopSequences.IsArray() {
+		if stopSequences := firstGeminiArray(genConfig, "stopSequences", "stop_sequences"); stopSequences.Exists() {
 			var stops []string
 			stopSequences.ForEach(func(_, value ojson.Result) bool {
-				stops = append(stops, value.String())
+				if value.Type == ojson.String {
+					stops = append(stops, value.String())
+				}
 				return true
 			})
 			if len(stops) > 0 {
@@ -66,13 +68,16 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		}
 
 		// Candidate count (OpenAI 'n' parameter)
-		if candidateCount := genConfig.Get("candidateCount"); candidateCount.Exists() {
+		if candidateCount, ok := firstGeminiNumber(genConfig, "candidateCount", "candidate_count"); ok && candidateCount.Int() > 0 {
 			_ = outDoc.Set("n", candidateCount.Int())
 		}
 
-		if responseModalities := genConfig.Get("responseModalities"); responseModalities.Exists() && responseModalities.IsArray() {
+		if responseModalities := firstGeminiArray(genConfig, "responseModalities", "response_modalities"); responseModalities.Exists() {
 			var modalities []string
 			responseModalities.ForEach(func(_, value ojson.Result) bool {
+				if value.Type != ojson.String {
+					return true
+				}
 				switch strings.ToLower(strings.TrimSpace(value.String())) {
 				case "text":
 					modalities = append(modalities, "text")
@@ -90,26 +95,13 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 		// Map Gemini thinkingConfig to OpenAI reasoning_effort.
 		// Always perform conversion to support allowCompat models that may not be in registry.
-		// Note: Google official Python SDK sends snake_case fields (thinking_level/thinking_budget).
-		if thinkingConfig := genConfig.Get("thinkingConfig"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-			thinkingLevel := thinkingConfig.Get("thinkingLevel")
-			if !thinkingLevel.Exists() {
-				thinkingLevel = thinkingConfig.Get("thinking_level")
-			}
-			if thinkingLevel.Exists() {
-				effort := strings.ToLower(strings.TrimSpace(thinkingLevel.String()))
-				if effort != "" {
+		// Note: Google official Python SDK sends snake_case fields (thinking_config/thinking_level/thinking_budget).
+		if thinkingConfig := firstGeminiObject(genConfig, "thinkingConfig", "thinking_config"); thinkingConfig.Exists() {
+			if effort := strings.ToLower(firstGeminiNonEmptyString(thinkingConfig, "thinkingLevel", "thinking_level")); effort != "" {
+				_ = outDoc.Set("reasoning_effort", effort)
+			} else if thinkingBudget, ok := firstGeminiNumber(thinkingConfig, "thinkingBudget", "thinking_budget"); ok {
+				if effort, okConvert := thinking.ConvertBudgetToLevel(int(thinkingBudget.Int())); okConvert {
 					_ = outDoc.Set("reasoning_effort", effort)
-				}
-			} else {
-				thinkingBudget := thinkingConfig.Get("thinkingBudget")
-				if !thinkingBudget.Exists() {
-					thinkingBudget = thinkingConfig.Get("thinking_budget")
-				}
-				if thinkingBudget.Exists() {
-					if effort, ok := thinking.ConvertBudgetToLevel(int(thinkingBudget.Int())); ok {
-						_ = outDoc.Set("reasoning_effort", effort)
-					}
 				}
 			}
 		}
@@ -173,10 +165,46 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	if contents := root.Get("contents"); contents.Exists() && contents.IsArray() {
 		msgIdx := 0
 		previousRole := ""
+		pendingTurnCallCount := 0
+		var pendingToolRelayMedia []openAIGeminiToolRelayGroup
+		var pendingUserContentItems [][]byte
+		var pendingUserTextBuilder strings.Builder
+		pendingUserOnlyText := true
+		flushPendingUserAndRelay := func() {
+			if len(pendingToolRelayMedia) == 0 && len(pendingUserContentItems) == 0 {
+				return
+			}
+			relayMsgDoc := ojson.NewDocString(`{"role":"user","content":""}`)
+			if len(pendingToolRelayMedia) > 0 {
+				relayItems := buildOpenAIGeminiToolRelayItems(pendingToolRelayMedia)
+				relayItems = append(relayItems, pendingUserContentItems...)
+				_ = relayMsgDoc.SetRawBytes("content", translatorcommon.JoinRawArray(relayItems))
+			} else if pendingUserOnlyText {
+				_ = relayMsgDoc.Set("content", pendingUserTextBuilder.String())
+			} else {
+				_ = relayMsgDoc.SetRawBytes("content", translatorcommon.JoinRawArray(pendingUserContentItems))
+			}
+			messageItems = append(messageItems, relayMsgDoc.Bytes())
+			pendingToolRelayMedia = nil
+			pendingUserContentItems = nil
+			pendingUserTextBuilder.Reset()
+			pendingUserOnlyText = true
+		}
+
 		contents.ForEach(func(_, content ojson.Result) bool {
 			parts := content.Get("parts")
 			role := translatorcommon.NormalizeGeminiTurnRole(content.Get("role").String(), parts, previousRole)
 			previousRole = role
+			hasTurnFR := translatorcommon.GeminiPartsHaveFunctionResponse(parts)
+			if !hasTurnFR && (len(pendingToolRelayMedia) > 0 || len(pendingUserContentItems) > 0) {
+				pendingTurnCallCount = 0
+				if role != "user" {
+					flushPendingUserAndRelay()
+				}
+			}
+			if role == "assistant" && !hasTurnFR {
+				pendingTurnCallCount = 0
+			}
 
 			msgDoc := ojson.NewDocString(`{"role":"","content":""}`)
 			_ = msgDoc.Set("role", role)
@@ -222,7 +250,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					if functionCall := translatorcommon.GeminiPartFunctionCall(part); functionCall.Exists() {
 						funcName := functionCall.Get("name").String()
 						argsRaw := ""
-						if args := functionCall.Get("args"); args.Exists() {
+						if args := functionCall.Get("args"); args.IsObject() {
 							argsRaw = args.Raw
 						}
 						toolCallID := explicitGeminiToolID(functionCall)
@@ -246,27 +274,73 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						}
 
 						toolCallItems = append(toolCallItems, toolCallDoc.Bytes())
+						pendingTurnCallCount++
 					}
 
 					// Handle function responses (Gemini) -> tool role messages (OpenAI)
 					if functionResponse := translatorcommon.GeminiPartFunctionResponse(part); functionResponse.Exists() {
+						if pendingTurnCallCount > 0 {
+							pendingTurnCallCount--
+						}
 						funcName := functionResponse.Get("name").String()
 						// Create tool message for function response
 						toolMsgDoc := ojson.NewDocString(`{"role":"tool","tool_call_id":"","content":""}`)
 
 						responseRaw := ""
+						responseNonEmpty := false
 						// Convert response.content to JSON string
 						if response := functionResponse.Get("response"); response.Exists() {
 							if contentField := response.Get("content"); contentField.Exists() {
 								responseRaw = contentField.Raw
-								_ = toolMsgDoc.Set("content", responseRaw)
+								responseNonEmpty = !isEmptyGeminiOpenAIResponseValue(contentField)
 							} else {
 								responseRaw = response.Raw
-								_ = toolMsgDoc.Set("content", responseRaw)
+								responseNonEmpty = !isEmptyGeminiOpenAIResponseValue(response)
 							}
 						}
 
+						var frTextParts []string
+						var thisResponseMedia [][]byte
+						if frParts := functionResponse.Get("parts"); frParts.Exists() && frParts.IsArray() {
+							frParts.ForEach(func(_, nested ojson.Result) bool {
+								if text := nested.Get("text"); text.Exists() {
+									if strings.TrimSpace(text.String()) != "" {
+										frTextParts = append(frTextParts, text.String())
+									}
+									return true
+								}
+								if contentPart, ok := openAIContentPartFromGeminiInlineData(nested); ok {
+									thisResponseMedia = append(thisResponseMedia, contentPart)
+									return true
+								}
+								if contentPart, ok := openAIContentPartFromGeminiFileData(nested); ok {
+									thisResponseMedia = append(thisResponseMedia, contentPart)
+									return true
+								}
+								return true
+							})
+						}
+						toolContent := responseRaw
+						if len(thisResponseMedia) > 0 || len(frTextParts) > 0 {
+							var textSegments []string
+							if responseNonEmpty {
+								textSegments = append(textSegments, responseRaw)
+							}
+							textSegments = append(textSegments, frTextParts...)
+							joined := strings.Join(textSegments, "\n\n")
+							if strings.TrimSpace(joined) != "" {
+								toolContent = joined
+							} else if len(thisResponseMedia) > 0 {
+								toolContent = geminiToolResultRelayPlaceholder(thisResponseMedia)
+							}
+						}
+						if toolContent != "" || functionResponse.Get("response").Exists() {
+							_ = toolMsgDoc.Set("content", toolContent)
+						}
+
+						var resolvedToolCallID string
 						if toolCallID := explicitGeminiToolID(functionResponse); toolCallID != "" {
+							resolvedToolCallID = toolCallID
 							_ = toolMsgDoc.Set("tool_call_id", toolCallID)
 							if queue := toolCallIDsByName[funcName]; len(queue) > 0 {
 								for i, id := range queue {
@@ -278,12 +352,22 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 							}
 						} else if queue := toolCallIDsByName[funcName]; len(queue) > 0 {
 							toolCallID := queue[0]
+							resolvedToolCallID = toolCallID
 							toolCallIDsByName[funcName] = queue[1:]
 							_ = toolMsgDoc.Set("tool_call_id", toolCallID)
 						} else {
 							// Generate a deterministic tool call ID fallback if none available
 							fallbackID := deterministicToolCallID("response", msgIdx, currentPartIdx, funcName, responseRaw)
+							resolvedToolCallID = fallbackID
 							_ = toolMsgDoc.Set("tool_call_id", fallbackID)
+						}
+
+						if len(thisResponseMedia) > 0 {
+							pendingToolRelayMedia = append(pendingToolRelayMedia, openAIGeminiToolRelayGroup{
+								toolName: funcName,
+								callID:   resolvedToolCallID,
+								items:    thisResponseMedia,
+							})
 						}
 
 						messageItems = append(messageItems, toolMsgDoc.Bytes())
@@ -292,6 +376,44 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 					return true
 				})
+			}
+
+			// OpenAI tool messages cannot carry image/file parts, and parallel tool
+			// messages must remain contiguous. Hold user content and relayed media
+			// until all pending tool results in the batch have been emitted.
+			if hasTurnFR && pendingTurnCallCount > 0 {
+				if role == "user" && len(contentItems) > 0 {
+					pendingUserContentItems = append(pendingUserContentItems, contentItems...)
+					pendingUserTextBuilder.WriteString(textBuilder.String())
+					pendingUserOnlyText = pendingUserOnlyText && onlyTextContent
+					contentItems = nil
+					textBuilder.Reset()
+				}
+			} else if len(pendingToolRelayMedia) > 0 || len(pendingUserContentItems) > 0 {
+				if role == "user" && len(contentItems) > 0 {
+					var prefixItems [][]byte
+					if len(pendingToolRelayMedia) > 0 {
+						prefixItems = buildOpenAIGeminiToolRelayItems(pendingToolRelayMedia)
+						onlyTextContent = false
+					}
+					if len(pendingUserContentItems) > 0 {
+						prefixItems = append(prefixItems, pendingUserContentItems...)
+						if len(pendingToolRelayMedia) == 0 && pendingUserOnlyText && onlyTextContent {
+							combined := pendingUserTextBuilder.String() + textBuilder.String()
+							textBuilder.Reset()
+							textBuilder.WriteString(combined)
+						} else {
+							onlyTextContent = false
+						}
+					}
+					contentItems = append(prefixItems, contentItems...)
+					pendingToolRelayMedia = nil
+					pendingUserContentItems = nil
+					pendingUserTextBuilder.Reset()
+					pendingUserOnlyText = true
+				} else {
+					flushPendingUserAndRelay()
+				}
 			}
 
 			// Set content
@@ -317,59 +439,101 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 			msgIdx++
 			return true
 		})
+		flushPendingUserAndRelay()
 	}
 	translatorcommon.SetRawArrayItemsDoc(outDoc, "messages", messageItems)
 
 	// Tools mapping: Gemini tools -> OpenAI tools
+	type openAIToolEntry struct {
+		name string
+		raw  []byte
+	}
+	var toolEntries []openAIToolEntry
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
-		var toolItems [][]byte
 		tools.ForEach(func(_, tool ojson.Result) bool {
-			if functionDeclarations := tool.Get("functionDeclarations"); functionDeclarations.Exists() && functionDeclarations.IsArray() {
+			if functionDeclarations := firstGeminiArray(tool, "functionDeclarations", "function_declarations"); functionDeclarations.Exists() {
 				functionDeclarations.ForEach(func(_, funcDecl ojson.Result) bool {
+					funcName := funcDecl.Get("name").String()
 					openAIToolDoc := ojson.NewDocString(`{"type":"function","function":{"name":"","description":""}}`)
-					_ = openAIToolDoc.Set("function.name", funcDecl.Get("name").String())
+					_ = openAIToolDoc.Set("function.name", funcName)
 					_ = openAIToolDoc.Set("function.description", funcDecl.Get("description").String())
 
 					// Convert parameters schema
-					if parameters := funcDecl.Get("parameters"); parameters.Exists() {
-						normalizedParams := util.NormalizeJSONSchemaNumericConstraints(parameters.Raw)
-						_ = openAIToolDoc.SetRaw("function.parameters", normalizedParams)
-					} else if parameters := funcDecl.Get("parametersJsonSchema"); parameters.Exists() {
+					if parameters := firstGeminiObject(funcDecl, "parameters", "parametersJsonSchema", "parameters_json_schema"); parameters.Exists() {
 						normalizedParams := util.NormalizeJSONSchemaNumericConstraints(parameters.Raw)
 						_ = openAIToolDoc.SetRaw("function.parameters", normalizedParams)
 					}
 
-					toolItems = append(toolItems, openAIToolDoc.Bytes())
+					toolEntries = append(toolEntries, openAIToolEntry{
+						name: funcName,
+						raw:  openAIToolDoc.Bytes(),
+					})
 					return true
 				})
 			}
 			return true
 		})
-		if len(toolItems) > 0 {
-			_ = outDoc.SetRawBytes("tools", translatorcommon.JoinRawArray(toolItems))
+	}
+
+	// Resolve tool choice and apply multi-tool allowlist filtering before serializing tools.
+	hadDeclaredTools := len(toolEntries) > 0
+	toolChoiceMode := ""
+	var allowedValidNames []string
+	allowedNameSet := make(map[string]struct{})
+	if functionCallingConfig := geminiFunctionCallingConfig(root); functionCallingConfig.Exists() {
+		if modeResult := functionCallingConfig.Get("mode"); modeResult.Type == ojson.String {
+			toolChoiceMode = strings.ToUpper(strings.TrimSpace(modeResult.String()))
+			if toolChoiceMode == "ANY" {
+				if allowedNames := firstGeminiArray(functionCallingConfig, "allowedFunctionNames", "allowed_function_names"); allowedNames.IsArray() {
+					for _, item := range allowedNames.Array() {
+						if item.Type != ojson.String {
+							continue
+						}
+						name := strings.TrimSpace(item.String())
+						if name == "" {
+							continue
+						}
+						if _, exists := allowedNameSet[name]; exists {
+							continue
+						}
+						allowedNameSet[name] = struct{}{}
+						allowedValidNames = append(allowedValidNames, name)
+					}
+				}
+				if len(allowedValidNames) > 1 && len(toolEntries) > 0 {
+					filtered := make([]openAIToolEntry, 0, len(toolEntries))
+					for _, entry := range toolEntries {
+						if _, okAllowed := allowedNameSet[entry.name]; okAllowed {
+							filtered = append(filtered, entry)
+						}
+					}
+					toolEntries = filtered
+				}
+			}
 		}
 	}
 
+	if len(toolEntries) > 0 {
+		toolItems := make([][]byte, 0, len(toolEntries))
+		for _, entry := range toolEntries {
+			toolItems = append(toolItems, entry.raw)
+		}
+		_ = outDoc.SetRawBytes("tools", translatorcommon.JoinRawArray(toolItems))
+	}
+
 	// Tool choice mapping (Gemini doesn't have direct equivalent, but we can handle it)
-	if toolConfig := root.Get("toolConfig"); toolConfig.Exists() {
-		if functionCallingConfig := toolConfig.Get("functionCallingConfig"); functionCallingConfig.Exists() {
-			mode := functionCallingConfig.Get("mode").String()
-			allowedNames := functionCallingConfig.Get("allowedFunctionNames")
-			switch mode {
-			case "NONE":
-				_ = outDoc.Set("tool_choice", "none")
-			case "AUTO":
-				_ = outDoc.Set("tool_choice", "auto")
-			case "ANY":
-				allowedNameItems := allowedNames.Array()
-				if allowedNames.IsArray() && len(allowedNameItems) == 1 {
-					choice := []byte(`{"type":"function","function":{"name":""}}`)
-					choice, _ = ojson.SetBytes(choice, "function.name", allowedNameItems[0].String())
-					_ = outDoc.SetRawBytes("tool_choice", choice)
-				} else {
-					_ = outDoc.Set("tool_choice", "required")
-				}
-			}
+	switch toolChoiceMode {
+	case "NONE":
+		_ = outDoc.Set("tool_choice", "none")
+	case "AUTO":
+		_ = outDoc.Set("tool_choice", "auto")
+	case "ANY":
+		if len(allowedValidNames) == 1 {
+			choiceDoc := ojson.NewDocString(`{"type":"function","function":{"name":""}}`)
+			_ = choiceDoc.Set("function.name", allowedValidNames[0])
+			_ = outDoc.SetRawBytes("tool_choice", choiceDoc.Bytes())
+		} else if !(len(allowedValidNames) > 1 && hadDeclaredTools && len(toolEntries) == 0) {
+			_ = outDoc.Set("tool_choice", "required")
 		}
 	}
 
@@ -381,12 +545,66 @@ func deterministicToolCallID(kind string, msgIdx, partIdx int, name, payload str
 	return "call_" + hex.EncodeToString(sum[:12])
 }
 
+func firstGeminiObject(obj ojson.Result, keys ...string) ojson.Result {
+	for _, key := range keys {
+		if v := obj.Get(key); v.IsObject() {
+			return v
+		}
+	}
+	return ojson.Result{}
+}
+
+func firstGeminiArray(obj ojson.Result, keys ...string) ojson.Result {
+	for _, key := range keys {
+		if v := obj.Get(key); v.IsArray() {
+			return v
+		}
+	}
+	return ojson.Result{}
+}
+
+func firstGeminiNumber(obj ojson.Result, keys ...string) (ojson.Result, bool) {
+	for _, key := range keys {
+		if v := obj.Get(key); v.Type == ojson.Number {
+			return v, true
+		}
+	}
+	return ojson.Result{}, false
+}
+
+func firstGeminiNonEmptyString(obj ojson.Result, keys ...string) string {
+	for _, key := range keys {
+		if v := obj.Get(key); v.Type == ojson.String {
+			if s := strings.TrimSpace(v.String()); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func geminiFunctionCallingConfig(root ojson.Result) ojson.Result {
+	for _, path := range []string{
+		"toolConfig.functionCallingConfig",
+		"toolConfig.function_calling_config",
+		"tool_config.function_calling_config",
+		"tool_config.functionCallingConfig",
+	} {
+		if cfg := root.Get(path); cfg.IsObject() {
+			return cfg
+		}
+	}
+	return ojson.Result{}
+}
+
 func geminiFunctionCallThoughtSignature(part ojson.Result) string {
 	for _, path := range []string{
 		"thoughtSignature",
 		"thought_signature",
 		"functionCall.thoughtSignature",
 		"functionCall.thought_signature",
+		"function_call.thoughtSignature",
+		"function_call.thought_signature",
 		"extra_content.google.thought_signature",
 	} {
 		if sig := part.Get(path); sig.Exists() && sig.String() != "" {
@@ -442,9 +660,13 @@ func openAIContentPartFromGeminiInlineData(part ojson.Result) ([]byte, bool) {
 		contentPart, _ = ojson.SetBytes(contentPart, "video_url.url", dataURL)
 		return contentPart, true
 	default:
+		fileData := dataURL
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(data)), "data:") {
+			fileData = data
+		}
 		contentPartDoc := ojson.NewDocString(`{"type":"file","file":{"filename":"","file_data":""}}`)
 		_ = contentPartDoc.Set("file.filename", openAIFileNameFromMIME(mimeType))
-		_ = contentPartDoc.Set("file.file_data", data)
+		_ = contentPartDoc.Set("file.file_data", fileData)
 		return contentPartDoc.Bytes(), true
 	}
 }
@@ -527,4 +749,117 @@ func openAIFileNameFromMIME(mimeType string) string {
 		}
 		return "document"
 	}
+}
+
+func classifyGeminiRelayedToolMedia(items [][]byte) (hasImage, hasFile bool) {
+	for _, item := range items {
+		switch ojson.GetBytesNoCopy(item, "type").String() {
+		case "image_url":
+			hasImage = true
+		case "file", "input_audio", "video_url":
+			hasFile = true
+		}
+	}
+	return hasImage, hasFile
+}
+
+func geminiToolResultRelayPlaceholder(items [][]byte) string {
+	hasImage, hasFile := classifyGeminiRelayedToolMedia(items)
+	switch {
+	case hasFile && !hasImage:
+		return "[Tool returned document content; the documents follow in the next user message.]"
+	case hasFile && hasImage:
+		return "[Tool returned media content; the attachments follow in the next user message.]"
+	default:
+		return "[Tool returned image content; the images follow in the next user message.]"
+	}
+}
+
+func isEmptyGeminiOpenAIResponseValue(v ojson.Result) bool {
+	if !v.Exists() {
+		return true
+	}
+	if v.IsObject() {
+		empty := true
+		v.ForEach(func(_, _ ojson.Result) bool {
+			empty = false
+			return false
+		})
+		return empty
+	}
+	return strings.TrimSpace(v.Raw) == ""
+}
+
+type openAIGeminiToolRelayGroup struct {
+	toolName string
+	callID   string
+	items    [][]byte
+}
+
+func formatGeminiToolRelayGroupLabel(toolName, callID string) string {
+	switch {
+	case toolName != "" && callID != "":
+		return fmt.Sprintf("Tool %s (%s):", toolName, callID)
+	case toolName != "":
+		return fmt.Sprintf("Tool %s:", toolName)
+	case callID != "":
+		return fmt.Sprintf("Tool call %s:", callID)
+	default:
+		return "Tool:"
+	}
+}
+
+func buildOpenAIGeminiToolRelayItems(groups []openAIGeminiToolRelayGroup) [][]byte {
+	var allItems [][]byte
+	for _, group := range groups {
+		allItems = append(allItems, group.items...)
+	}
+	noticeDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+	if len(groups) == 1 {
+		_ = noticeDoc.Set("text", geminiToolResultRelaySingleNoticeText(groups[0]))
+		relayItems := make([][]byte, 0, len(groups[0].items)+1)
+		relayItems = append(relayItems, noticeDoc.Bytes())
+		relayItems = append(relayItems, groups[0].items...)
+		return relayItems
+	}
+	_ = noticeDoc.Set("text", geminiToolResultRelayNoticeText(allItems))
+	relayItems := make([][]byte, 0, len(allItems)+len(groups)+1)
+	relayItems = append(relayItems, noticeDoc.Bytes())
+	for _, group := range groups {
+		labelDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+		_ = labelDoc.Set("text", formatGeminiToolRelayGroupLabel(group.toolName, group.callID))
+		relayItems = append(relayItems, labelDoc.Bytes())
+		relayItems = append(relayItems, group.items...)
+	}
+	return relayItems
+}
+
+func geminiToolResultRelayMediaKind(items [][]byte) string {
+	hasImage, hasFile := classifyGeminiRelayedToolMedia(items)
+	switch {
+	case hasFile && !hasImage:
+		return "Documents"
+	case hasFile && hasImage:
+		return "Media"
+	default:
+		return "Images"
+	}
+}
+
+func geminiToolResultRelaySingleNoticeText(group openAIGeminiToolRelayGroup) string {
+	kind := geminiToolResultRelayMediaKind(group.items)
+	switch {
+	case group.toolName != "" && group.callID != "":
+		return fmt.Sprintf("%s returned by tool %s (%s):", kind, group.toolName, group.callID)
+	case group.toolName != "":
+		return fmt.Sprintf("%s returned by tool %s:", kind, group.toolName)
+	case group.callID != "":
+		return fmt.Sprintf("%s returned by tool call %s:", kind, group.callID)
+	default:
+		return kind + " returned by the preceding tool call(s):"
+	}
+}
+
+func geminiToolResultRelayNoticeText(items [][]byte) string {
+	return geminiToolResultRelayMediaKind(items) + " returned by the preceding tool call(s):"
 }

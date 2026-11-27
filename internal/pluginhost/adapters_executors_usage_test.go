@@ -3,8 +3,11 @@ package pluginhost
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,8 +63,57 @@ func (p *testUsageCapturePlugin) assertNoRecord(t *testing.T, wait time.Duration
 	}
 }
 
+const testUsageDrainPluginName = "pluginhost-test-usage-drain"
+
+var (
+	testUsageDrainMu           sync.Mutex
+	testUsageBarrierID         atomic.Uint64
+	testUsageDrainAfterPublish func()
+)
+
+type testUsageBarrierPlugin struct {
+	barrier string
+	onHit   func()
+}
+
+func (p testUsageBarrierPlugin) HandleUsage(_ context.Context, record coreusage.Record) {
+	if record.Provider == p.barrier && p.onHit != nil {
+		p.onHit()
+	}
+}
+
+func drainTestUsageQueue(t *testing.T) {
+	t.Helper()
+	testUsageDrainMu.Lock()
+	defer testUsageDrainMu.Unlock()
+
+	done := make(chan struct{})
+	var once sync.Once
+	barrier := fmt.Sprintf("pluginhost-usage-drain-%d", testUsageBarrierID.Add(1))
+	coreusage.RegisterNamedPlugin(testUsageDrainPluginName, testUsageBarrierPlugin{
+		barrier: barrier,
+		onHit: func() {
+			once.Do(func() { close(done) })
+		},
+	})
+	defer coreusage.RegisterNamedPlugin(testUsageDrainPluginName, noopUsagePlugin{})
+
+	coreusage.PublishRecord(context.Background(), coreusage.Record{Provider: barrier})
+	if hook := testUsageDrainAfterPublish; hook != nil {
+		hook()
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out draining default usage queue")
+	}
+}
+
 func registerTestUsagePlugin(t *testing.T, name string, plugin coreusage.Plugin) {
 	t.Helper()
+	// Drain preexisting records queued by earlier tests before registering
+	// this capture plugin so FIFO delivery only observes records published after setup.
+	drainTestUsageQueue(t)
 	coreusage.RegisterNamedPlugin(name, plugin)
 	t.Cleanup(func() {
 		coreusage.RegisterNamedPlugin(name, noopUsagePlugin{})
@@ -71,6 +123,67 @@ func registerTestUsagePlugin(t *testing.T, name string, plugin coreusage.Plugin)
 type noopUsagePlugin struct{}
 
 func (noopUsagePlugin) HandleUsage(context.Context, coreusage.Record) {}
+
+func TestRegisterTestUsagePluginDrainsQueuedRecords(t *testing.T) {
+	gateEntered := make(chan struct{})
+	gateRelease := make(chan struct{})
+	releaseGate := sync.OnceFunc(func() { close(gateRelease) })
+	defer releaseGate()
+
+	gateProvider := fmt.Sprintf("%s-gate-%d", t.Name(), testUsageBarrierID.Add(1))
+	gateName := t.Name() + "-gate"
+	var enterOnce sync.Once
+	coreusage.RegisterNamedPlugin(gateName, testUsageBarrierPlugin{
+		barrier: gateProvider,
+		onHit: func() {
+			enterOnce.Do(func() { close(gateEntered) })
+			<-gateRelease
+		},
+	})
+	t.Cleanup(func() {
+		releaseGate()
+		coreusage.RegisterNamedPlugin(gateName, noopUsagePlugin{})
+	})
+
+	// Block the global usage worker inside gate.HandleUsage so staleRecord is guaranteed
+	// to remain queued when registerTestUsagePlugin starts.
+	coreusage.PublishRecord(t.Context(), coreusage.Record{Provider: gateProvider})
+	select {
+	case <-gateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for usage worker to enter gate")
+	}
+
+	staleAuthID := fmt.Sprintf("%s-stale-%d", t.Name(), testUsageBarrierID.Add(1))
+	coreusage.PublishRecord(t.Context(), coreusage.Record{
+		Provider:     "antigravity",
+		ExecutorType: "plugin:" + homePluginID,
+		Model:        homePluginModel,
+		AuthID:       staleAuthID,
+	})
+
+	prevHook := testUsageDrainAfterPublish
+	testUsageDrainAfterPublish = releaseGate
+	defer func() { testUsageDrainAfterPublish = prevHook }()
+
+	capture := newTestUsageCapturePlugin("")
+	registerTestUsagePlugin(t, t.Name(), capture)
+	// If registerTestUsagePlugin did not drain before registering capture, releasing
+	// the gate here deterministically delivers the queued stale record to capture.
+	releaseGate()
+
+	barrier := fmt.Sprintf("%s-barrier-%d", t.Name(), testUsageBarrierID.Add(1))
+	coreusage.PublishRecord(t.Context(), coreusage.Record{Provider: barrier})
+	for {
+		rec := capture.waitRecord(t, 5*time.Second)
+		if rec.Provider == barrier {
+			break
+		}
+		if rec.AuthID == staleAuthID {
+			t.Fatalf("captured preexisting queued usage record: %+v", rec)
+		}
+	}
+}
 
 func TestExecutorAdapterExecutePublishesUsage(t *testing.T) {
 	plugin := newTestUsageCapturePlugin("plugin-provider")
@@ -1006,6 +1119,75 @@ func TestUsageAdapterPropagatesNativeKeyAndAccessProvider(t *testing.T) {
 	}
 }
 
+func TestUsageAdapterDeliversClaudeStreamingAndNonStreamingCacheCreationTTL(t *testing.T) {
+	plugin := &capturingUsagePlugin{captured: make(chan pluginapi.UsageRecord, 2)}
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-claude-ttl",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-claude-ttl",
+		plugin:   plugin,
+	}
+
+	// Non-streaming Claude usage payload with 5m + 1h breakdown.
+	nonStreamDetail := helps.ParseClaudeUsage([]byte(`{
+		"usage": {
+			"input_tokens": 100,
+			"output_tokens": 50,
+			"cache_creation_input_tokens": 1500,
+			"cache_creation": {
+				"ephemeral_5m_input_tokens": 1000,
+				"ephemeral_1h_input_tokens": 500
+			}
+		}
+	}`))
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider: "claude",
+		Model:    "claude-sonnet-4-6",
+		Stream:   false,
+		Detail:   nonStreamDetail,
+	})
+	recNonStream := <-plugin.captured
+	if recNonStream.Detail.CacheCreationTokens != 1500 {
+		t.Fatalf("non-stream CacheCreationTokens = %d, want 1500", recNonStream.Detail.CacheCreationTokens)
+	}
+	if recNonStream.Detail.CacheCreation5mTokens == nil || *recNonStream.Detail.CacheCreation5mTokens != 1000 {
+		t.Fatalf("non-stream CacheCreation5mTokens = %v, want 1000", recNonStream.Detail.CacheCreation5mTokens)
+	}
+	if recNonStream.Detail.CacheCreation1hTokens == nil || *recNonStream.Detail.CacheCreation1hTokens != 500 {
+		t.Fatalf("non-stream CacheCreation1hTokens = %v, want 500", recNonStream.Detail.CacheCreation1hTokens)
+	}
+
+	// Streaming Claude SSE events with 5m=0 and 1h=45045 preserved across message_start + message_delta.
+	var streamBuf helps.StreamUsageBuffer
+	streamBuf.ObserveClaudeStream([]byte(`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-6","usage":{"input_tokens":16,"cache_creation_input_tokens":45045,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":45045},"output_tokens":4}}}`))
+	streamBuf.ObserveClaudeStream([]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":24}}`))
+	streamDetail, ok := streamBuf.Detail()
+	if !ok {
+		t.Fatal("expected streaming Claude usage detail")
+	}
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider: "claude",
+		Model:    "claude-sonnet-4-6",
+		Stream:   true,
+		Detail:   streamDetail,
+	})
+	recStream := <-plugin.captured
+	if recStream.Detail.CacheCreationTokens != 45045 {
+		t.Fatalf("stream CacheCreationTokens = %d, want 45045", recStream.Detail.CacheCreationTokens)
+	}
+	if recStream.Detail.CacheCreation5mTokens == nil || *recStream.Detail.CacheCreation5mTokens != 0 {
+		t.Fatalf("stream CacheCreation5mTokens = %v, want explicit 0", recStream.Detail.CacheCreation5mTokens)
+	}
+	if recStream.Detail.CacheCreation1hTokens == nil || *recStream.Detail.CacheCreation1hTokens != 45045 {
+		t.Fatalf("stream CacheCreation1hTokens = %v, want 45045", recStream.Detail.CacheCreation1hTokens)
+	}
+}
+
 func TestExecutorAdapterExecuteAttributesResponsesUsageToSelectedAuth(t *testing.T) {
 	plugin := newTestUsageCapturePlugin("plugin-provider-responses")
 	registerTestUsagePlugin(t, "test-executor-adapter-responses-auth-usage", plugin)
@@ -1306,5 +1488,120 @@ func waitPluginUsageRecord(t *testing.T, ch <-chan pluginapi.UsageRecord) plugin
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for pluginapi.UsageRecord")
 		return pluginapi.UsageRecord{}
+	}
+}
+
+func TestExecutorAdapterPropagatesAttributionAndPluginExecutorType(t *testing.T) {
+	plugin := newTestUsageCapturePlugin("")
+	registerTestUsagePlugin(t, "test-executor-adapter-plugin-type", plugin)
+
+	executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "custom-plugin-id"})
+	host := newHostWithRecords(executorRecord)
+
+	exec := &fakeExecutor{
+		identifier: "plugin-provider",
+		execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			return pluginapi.ExecutorResponse{
+				Payload:  []byte(`{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`),
+				Metadata: map[string]any{"k": "v"},
+				Attribution: &pluginapi.UsageAttribution{
+					AuthIndex: " idx-1 ",
+					AuthType:  " oauth ",
+					Source:    " acct@example.com ",
+				},
+			}, nil
+		},
+		executeStream: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
+			ch := make(chan pluginapi.ExecutorStreamChunk, 1)
+			ch <- pluginapi.ExecutorStreamChunk{Payload: []byte("data: [DONE]\n\n")}
+			close(ch)
+			return pluginapi.ExecutorStreamResponse{
+				Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Attribution: &pluginapi.UsageAttribution{
+					AuthIndex: "idx-stream",
+					AuthType:  "api_key",
+					Source:    "stream-acct",
+				},
+				Chunks: ch,
+			}, nil
+		},
+	}
+
+	executorRecord.plugin.Capabilities.Executor = exec
+	executorRecord.plugin.Capabilities.ExecutorInputFormats = []string{"openai"}
+	executorRecord.plugin.Capabilities.ExecutorOutputFormats = []string{"openai"}
+	host = newHostWithRecords(executorRecord)
+	adapter := newExecutorAdapterForRecordForTest(host, executorRecord, exec,
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAI},
+	)
+
+	req := coreexecutor.Request{
+		Model:   "test-model",
+		Payload: []byte(`{"model":"test-model","messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := coreexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAI,
+	}
+
+	_, attr, errExec := host.ExecutePluginExecutorWithAttribution(context.Background(), "custom-plugin-id", req, opts)
+	if errExec != nil {
+		t.Fatalf("ExecutePluginExecutorWithAttribution error = %v", errExec)
+	}
+	if attr == nil ||
+		attr.AuthIndex != " idx-1 " ||
+		attr.AuthType != " oauth " ||
+		attr.Source != " acct@example.com " {
+		t.Fatalf("attr = %+v", attr)
+	}
+
+	streamRes, streamAttr, errStream := host.ExecutePluginExecutorStreamWithAttribution(context.Background(), "custom-plugin-id", req, opts)
+	if errStream != nil {
+		t.Fatalf("ExecutePluginExecutorStreamWithAttribution error = %v", errStream)
+	}
+	if streamAttr == nil ||
+		streamAttr.AuthIndex != "idx-stream" ||
+		streamAttr.AuthType != "api_key" ||
+		streamAttr.Source != "stream-acct" {
+		t.Fatalf("streamAttr = %+v", streamAttr)
+	}
+	for range streamRes.Chunks {
+	}
+
+	// Verify auth-backed executions report "plugin:<id>", preserve auth credentials, and apply source attribution.
+	auth := &coreauth.Auth{
+		ID:         "auth-1",
+		Provider:   "plugin-provider",
+		FileName:   "auth-1.json",
+		Attributes: map[string]string{coreauth.AttributeAuthKind: "oauth"},
+	}
+	if _, errAuthExec := adapter.Execute(context.Background(), auth, req, opts); errAuthExec != nil {
+		t.Fatalf("Execute(auth!=nil) error = %v", errAuthExec)
+	}
+	rec := plugin.waitRecord(t, 2*time.Second)
+	if rec.ExecutorType != "plugin:custom-plugin-id" ||
+		rec.Provider != "plugin-provider" ||
+		rec.AuthID != "auth-1" ||
+		rec.AuthIndex != auth.EnsureIndex() ||
+		rec.AuthType != "oauth" ||
+		rec.Source != "acct@example.com" {
+		t.Fatalf("auth-backed Execute rec = %+v", rec)
+	}
+
+	authStreamRes, errAuthStream := adapter.ExecuteStream(context.Background(), auth, req, opts)
+	if errAuthStream != nil {
+		t.Fatalf("ExecuteStream(auth!=nil) error = %v", errAuthStream)
+	}
+	for range authStreamRes.Chunks {
+	}
+	streamRec := plugin.waitRecord(t, 2*time.Second)
+	if streamRec.ExecutorType != "plugin:custom-plugin-id" ||
+		streamRec.Provider != "plugin-provider" ||
+		streamRec.AuthID != "auth-1" ||
+		streamRec.AuthIndex != auth.EnsureIndex() ||
+		streamRec.AuthType != "oauth" ||
+		streamRec.Source != "stream-acct" {
+		t.Fatalf("auth-backed ExecuteStream rec = %+v", streamRec)
 	}
 }

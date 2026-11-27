@@ -961,21 +961,108 @@ func TestConvertOpenAIRequestToClaude_ResponseFormatJSONSchema(t *testing.T) {
 	}`)
 
 	out, _ := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", inputJSON, false)
-	system := ojson.GetBytesNoCopy(out, "system")
-	if !system.Exists() || !system.IsArray() || len(system.Array()) == 0 {
-		t.Fatalf("system blocks missing or empty. Output: %s", string(out))
+	schema := ojson.GetBytes(inputJSON, "response_format.json_schema.schema")
+	if got := ojson.GetBytesNoCopy(out, "output_config.format.type").String(); got != "json_schema" {
+		t.Fatalf("output_config.format.type = %q. Output: %s", got, string(out))
 	}
+	if got := ojson.GetBytesNoCopy(out, "output_config.format.schema").Raw; got != schema.Raw {
+		t.Fatalf("output_config.format.schema = %s, want %s", got, schema.Raw)
+	}
+	if keys := ojson.GetBytesNoCopy(out, "output_config.format").Map(); len(keys) != 2 {
+		t.Fatalf("output_config.format must hold only type and schema. Output: %s", string(out))
+	}
+	if ojson.GetBytesNoCopy(out, "system").Exists() {
+		t.Fatalf("expected no system instruction without a description. Output: %s", string(out))
+	}
+}
 
-	foundSchemaInstruction := false
-	for _, block := range system.Array() {
-		text := block.Get("text").String()
-		if strings.Contains(text, "JSON") && strings.Contains(text, "facts") {
-			foundSchemaInstruction = true
-			break
-		}
+func TestConvertOpenAIRequestToClaude_ResponseFormatJSONSchemaByModel(t *testing.T) {
+	for _, tc := range []struct {
+		model  string
+		native bool
+	}{
+		{"claude-sonnet-4-20250514", false},
+		{"claude-opus-4-20250514", false},
+		{"claude-opus-4-1-20250805", false},
+		{"anthropic/claude-sonnet-4", false},
+		{"claude-3-7-sonnet-20250219", false},
+		{"claude-3-5-haiku-20241022", false},
+		{"claude-sonnet-4-5-20250929", true},
+		{"claude-opus-4-5-20251101", true},
+		{"claude-haiku-4-5-20251001", true},
+		{"claude-sonnet-5-5", true},
+		{"an-unknown-model", true},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			inputJSON := []byte(`{"model":"` + tc.model + `","messages":[{"role":"user","content":"Hi."}],` +
+				`"response_format":{"type":"json_schema","json_schema":{"name":"facts","schema":{"type":"object","properties":{"facts":{"type":"string"}},"required":["facts"]}}}}`)
+			out, _ := ConvertOpenAIRequestToClaude(tc.model, inputJSON, false)
+			hasFormat := ojson.GetBytesNoCopy(out, "output_config.format").Exists()
+			hasInstruction := strings.Contains(ojson.GetBytesNoCopy(out, "system").Raw, "conforms strictly")
+			if hasFormat != tc.native || hasInstruction == tc.native {
+				t.Fatalf("output_config.format = %v, instruction = %v, want native = %v. Output: %s", hasFormat, hasInstruction, tc.native, string(out))
+			}
+		})
 	}
-	if !foundSchemaInstruction {
-		t.Fatalf("expected structured output instructions containing schema in system prompt. Output: %s", string(out))
+}
+
+func TestConvertOpenAIRequestToClaude_ResponseFormatJSONSchemaKeepsKeyOrder(t *testing.T) {
+	schema := `{"required":["b","a"],"properties":{"b":{"type":"string"},"a":{"type":"integer"}},"type":"object"}`
+	inputJSON := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi."}],` +
+		`"response_format":{"type":"json_schema","json_schema":{"name":"order","schema":` + schema + `}}}`)
+	out, _ := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", inputJSON, false)
+	if got := ojson.GetBytesNoCopy(out, "output_config.format.schema").Raw; got != schema {
+		t.Fatalf("output_config.format.schema = %s, want %s", got, schema)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_ResponseFormatJSONSchemaKeepsDescription(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-6",
+		"messages": [{"role": "user", "content": "Suggest a recipe."}],
+		"response_format": {"type": "json_schema", "json_schema": {"name": "recipe", "description": "A dish for two, ready in 20 minutes.", "schema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}}}
+	}`)
+	out, _ := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", inputJSON, false)
+	if !ojson.GetBytesNoCopy(out, "output_config.format.schema").IsObject() {
+		t.Fatalf("output_config.format missing. Output: %s", string(out))
+	}
+	system := ojson.GetBytesNoCopy(out, "system").Raw
+	if !strings.Contains(system, "A dish for two, ready in 20 minutes.") || !strings.Contains(system, "Schema Name: recipe") {
+		t.Fatalf("expected schema name and description in system prompt. Output: %s", string(out))
+	}
+	if strings.Contains(system, "conforms strictly") || strings.Contains(system, `\"properties\"`) {
+		t.Fatalf("schema must not be repeated as text. Output: %s", string(out))
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_ResponseFormatJSONSchemaKeepsEffort(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-6",
+		"reasoning_effort": "high",
+		"messages": [{"role": "user", "content": "Extract facts."}],
+		"response_format": {"type": "json_schema", "json_schema": {"name": "facts", "schema": {"type": "object", "properties": {"facts": {"type": "string"}}, "required": ["facts"]}}}
+	}`)
+	out, _ := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", inputJSON, false)
+	if got := ojson.GetBytesNoCopy(out, "output_config.effort").String(); got != "high" {
+		t.Fatalf("output_config.effort = %q. Output: %s", got, string(out))
+	}
+	if got := ojson.GetBytesNoCopy(out, "output_config.format.schema.required.0").String(); got != "facts" {
+		t.Fatalf("output_config.format missing beside effort. Output: %s", string(out))
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_ResponseFormatJSONSchemaWithoutSchema(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-6",
+		"messages": [{"role": "user", "content": "Return JSON."}],
+		"response_format": {"type": "json_schema", "json_schema": {"name": "no_schema"}}
+	}`)
+	out, _ := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", inputJSON, false)
+	if ojson.GetBytesNoCopy(out, "output_config.format").Exists() {
+		t.Fatalf("output_config.format without a schema. Output: %s", string(out))
+	}
+	if !strings.Contains(ojson.GetBytesNoCopy(out, "system").Raw, "valid JSON object") {
+		t.Fatalf("expected JSON object instruction in system prompt. Output: %s", string(out))
 	}
 }
 
@@ -1603,4 +1690,94 @@ func TestConvertOpenAIRequestToClaude_DropsEmptyAndWhitespaceTextBlocks(t *testi
 	if mixedRoot.Get("messages.0.content.2.cache_control").Exists() {
 		t.Fatalf("messages.0.content.2 must not receive cache_control from middle empty part")
 	}
+}
+
+func TestConvertOpenAIRequestToClaude_IgnoresNullAndInvalidOptionalFields(t *testing.T) {
+	t.Run("null top_p stop and max_tokens with max_completion_tokens", func(t *testing.T) {
+		input := `{"model":"claude-sonnet-4-6","max_tokens":null,"max_completion_tokens":1024,"top_p":null,"stop":null,"messages":[{"role":"user","content":"hi"}]}`
+		out, errConvert := ConvertOpenAIRequestToClaude("claude-sonnet-4-6", []byte(input), false)
+		if errConvert != nil {
+			t.Fatalf("unexpected error: %v", errConvert)
+		}
+		root := util.ParseGJSONBytesNoCopy(out)
+		if got := root.Get("max_tokens").Int(); got != 1024 {
+			t.Fatalf("max_tokens = %d, want 1024; output=%s", got, out)
+		}
+		if root.Get("top_p").Exists() {
+			t.Fatalf("top_p must be omitted when null; output=%s", out)
+		}
+		if root.Get("stop_sequences").Exists() {
+			t.Fatalf("stop_sequences must be omitted when stop is null; output=%s", out)
+		}
+	})
+
+	t.Run("non-positive or non-numeric max_tokens falls back", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			input     string
+			wantLimit int64
+		}{
+			{
+				name:      "zero max_tokens falls back to max_completion_tokens",
+				input:     `{"model":"claude-sonnet-4-6","max_tokens":0,"max_completion_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`,
+				wantLimit: 1024,
+			},
+			{
+				name:      "negative max_tokens keeps default",
+				input:     `{"model":"claude-test","max_tokens":-5,"messages":[{"role":"user","content":"hi"}]}`,
+				wantLimit: 32000,
+			},
+			{
+				name:      "string max_tokens keeps default",
+				input:     `{"model":"claude-test","max_tokens":"","messages":[{"role":"user","content":"hi"}]}`,
+				wantLimit: 32000,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				out, errConvert := ConvertOpenAIRequestToClaude("claude-test", []byte(tc.input), false)
+				if errConvert != nil {
+					t.Fatalf("unexpected error: %v", errConvert)
+				}
+				if got := ojson.GetBytesNoCopy(out, "max_tokens").Int(); got != tc.wantLimit {
+					t.Fatalf("max_tokens = %d, want %d; output=%s", got, tc.wantLimit, out)
+				}
+			})
+		}
+	})
+
+	t.Run("top_p numeric zero preserved and non-number omitted", func(t *testing.T) {
+		numOut, _ := ConvertOpenAIRequestToClaude("claude-test", []byte(`{"top_p":0,"messages":[{"role":"user","content":"hi"}]}`), false)
+		if got := ojson.GetBytesNoCopy(numOut, "top_p"); !got.Exists() || got.Float() != 0 {
+			t.Fatalf("numeric top_p=0 should be preserved; output=%s", numOut)
+		}
+		strOut, _ := ConvertOpenAIRequestToClaude("claude-test", []byte(`{"top_p":"0.5","messages":[{"role":"user","content":"hi"}]}`), false)
+		if ojson.GetBytesNoCopy(strOut, "top_p").Exists() {
+			t.Fatalf("non-numeric top_p should be omitted; output=%s", strOut)
+		}
+	})
+
+	t.Run("stop empty string and array with null or empty items", func(t *testing.T) {
+		emptyStrOut, _ := ConvertOpenAIRequestToClaude("claude-test", []byte(`{"stop":"","messages":[{"role":"user","content":"hi"}]}`), false)
+		if ojson.GetBytesNoCopy(emptyStrOut, "stop_sequences").Exists() {
+			t.Fatalf("stop_sequences must be omitted for empty stop string; output=%s", emptyStrOut)
+		}
+
+		emptyArrOut, _ := ConvertOpenAIRequestToClaude("claude-test", []byte(`{"stop":[null,""],"messages":[{"role":"user","content":"hi"}]}`), false)
+		if ojson.GetBytesNoCopy(emptyArrOut, "stop_sequences").Exists() {
+			t.Fatalf("stop_sequences must be omitted when array only has null/empty; output=%s", emptyArrOut)
+		}
+
+		mixedArrOut, _ := ConvertOpenAIRequestToClaude("claude-test", []byte(`{"stop":["END",null,"","\n",123],"messages":[{"role":"user","content":"hi"}]}`), false)
+		seqs := ojson.GetBytesNoCopy(mixedArrOut, "stop_sequences").Array()
+		if len(seqs) != 2 || seqs[0].String() != "END" || seqs[1].String() != "\n" {
+			t.Fatalf("stop_sequences = %s, want [\"END\",\"\\n\"]; output=%s", ojson.GetBytesNoCopy(mixedArrOut, "stop_sequences").Raw, mixedArrOut)
+		}
+
+		newlineOut, _ := ConvertOpenAIRequestToClaude("claude-test", []byte(`{"stop":"\n","messages":[{"role":"user","content":"hi"}]}`), false)
+		newlineSeqs := ojson.GetBytesNoCopy(newlineOut, "stop_sequences").Array()
+		if len(newlineSeqs) != 1 || newlineSeqs[0].String() != "\n" {
+			t.Fatalf("stop_sequences = %s, want [\"\\n\"]; output=%s", ojson.GetBytesNoCopy(newlineOut, "stop_sequences").Raw, newlineOut)
+		}
+	})
 }
