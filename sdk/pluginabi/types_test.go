@@ -1,9 +1,10 @@
 package pluginabi
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/MoeForge/moego/json"
 )
 
 func TestEnvelopeRoundTrip(t *testing.T) {
@@ -28,11 +29,14 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 }
 
 func TestMethodNamesAreStable(t *testing.T) {
-	if SchemaVersion != 10 {
-		t.Fatalf("SchemaVersion = %d, want 10", SchemaVersion)
+	if SchemaVersion != 11 {
+		t.Fatalf("SchemaVersion = %d, want 11", SchemaVersion)
 	}
 	if SchemaVersionMultiAuthProviders != 10 {
 		t.Fatalf("SchemaVersionMultiAuthProviders = %d, want 10", SchemaVersionMultiAuthProviders)
+	}
+	if SchemaVersionSchedulerPickCancel != 11 {
+		t.Fatalf("SchemaVersionSchedulerPickCancel = %d, want 11", SchemaVersionSchedulerPickCancel)
 	}
 	if SchemaVersionWebSocketResponseObserver != 4 {
 		t.Fatalf("SchemaVersionWebSocketResponseObserver = %d, want 4", SchemaVersionWebSocketResponseObserver)
@@ -94,8 +98,20 @@ func TestMethodNamesAreStable(t *testing.T) {
 	if MethodHostHTTPDoStream != "host.http.do_stream" {
 		t.Fatalf("MethodHostHTTPDoStream = %q", MethodHostHTTPDoStream)
 	}
+	if MethodSchedulerPick != "scheduler.pick" {
+		t.Fatalf("MethodSchedulerPick = %q", MethodSchedulerPick)
+	}
+	if MethodSchedulerPickCancel != "scheduler.pick.cancel" {
+		t.Fatalf("MethodSchedulerPickCancel = %q", MethodSchedulerPickCancel)
+	}
 	if MethodHostHTTPOperationOpen != "host.http.operation_open" {
 		t.Fatalf("MethodHostHTTPOperationOpen = %q", MethodHostHTTPOperationOpen)
+	}
+	if MethodHostContextDone != "host.context.done" {
+		t.Fatalf("MethodHostContextDone = %q", MethodHostContextDone)
+	}
+	if MethodHostContextWait != "host.context.wait" {
+		t.Fatalf("MethodHostContextWait = %q", MethodHostContextWait)
 	}
 	if MethodHostHTTPCancel != "host.http.cancel" {
 		t.Fatalf("MethodHostHTTPCancel = %q", MethodHostHTTPCancel)
@@ -206,5 +222,89 @@ func TestErrorInterfaceAndConstructor(t *testing.T) {
 	}
 	if strings.Contains(string(defaultEnvBytes), "http_status") {
 		t.Fatalf("default envelope JSON unexpectedly contained http_status: %s", string(defaultEnvBytes))
+	}
+}
+
+func TestErrorCredentialScopedAndCodes(t *testing.T) {
+	var _ interface{ IsCredentialScoped() bool } = (*Error)(nil)
+
+	var nilErr *Error
+	if nilErr.IsCredentialScoped() {
+		t.Fatal("nil Error reported IsCredentialScoped() = true")
+	}
+
+	modelScoped := NewError("rate_limited", "per-model rate limit", 429)
+	if modelScoped.IsCredentialScoped() {
+		t.Fatal("model-scoped Error reported IsCredentialScoped() = true")
+	}
+
+	flagScoped := &Error{
+		Code:              "rate_limited",
+		Message:           "account limited, resets at 2026-01-01T00:00:00Z",
+		HTTPStatus:        429,
+		RetryAfterSeconds: 120,
+		CredentialScoped:  true,
+	}
+	if !flagScoped.IsCredentialScoped() {
+		t.Fatal("Error with CredentialScoped=true reported IsCredentialScoped() = false")
+	}
+
+	raw, errMarshal := json.Marshal(Envelope{OK: false, Error: flagScoped})
+	if errMarshal != nil {
+		t.Fatalf("marshal credential-scoped envelope: %v", errMarshal)
+	}
+	if !strings.Contains(string(raw), `"credential_scoped":true`) {
+		t.Fatalf("marshaled envelope missing credential_scoped: %s", string(raw))
+	}
+	var decoded Envelope
+	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
+		t.Fatalf("unmarshal credential-scoped envelope: %v", errUnmarshal)
+	}
+	if decoded.Error == nil || !decoded.Error.CredentialScoped || !decoded.Error.IsCredentialScoped() {
+		t.Fatalf("decoded error = %+v, want CredentialScoped=true", decoded.Error)
+	}
+
+	codeScoped := NewError(ErrorCodeCredentialQuota, "daily quota spent", 429)
+	if !codeScoped.IsCredentialScoped() {
+		t.Fatal("Error with ErrorCodeCredentialQuota reported IsCredentialScoped() = false")
+	}
+	if codeScoped.IsRequestScoped() || codeScoped.IsTransientRateLimit() {
+		t.Fatal("credential-scoped Error reported request-scoped or transient-rate-limit")
+	}
+
+	reqScoped := NewError(ErrorCodeRequestScoped, "invalid prompt", 400)
+	if !reqScoped.IsRequestScoped() {
+		t.Fatal("Error with ErrorCodeRequestScoped reported IsRequestScoped() = false")
+	}
+
+	transientRL := NewError(ErrorCodeTransientRateLimit, "turn rate limit", 429)
+	if !transientRL.IsTransientRateLimit() {
+		t.Fatal("Error with ErrorCodeTransientRateLimit reported IsTransientRateLimit() = false")
+	}
+
+	truncated := NewError(ErrorCodeStreamTruncated, "stream ended early", 502)
+	if !truncated.IsStreamTruncated() {
+		t.Fatal("Error with ErrorCodeStreamTruncated reported IsStreamTruncated() = false")
+	}
+	truncatedCredScoped := &Error{
+		Code:             ErrorCodeStreamTruncated,
+		Message:          "stream ended early",
+		HTTPStatus:       429,
+		CredentialScoped: true,
+	}
+	if !truncatedCredScoped.IsCredentialScoped() || truncatedCredScoped.IsStreamTruncated() {
+		t.Fatal("credential-scoped Error with stream_truncated code must prioritize IsCredentialScoped()")
+	}
+
+	if ErrorCodeCredentialQuota != "credential_quota" ||
+		ErrorCodeTransientRateLimit != "transient_rate_limit" ||
+		ErrorCodeRequestScoped != "request_scoped" ||
+		ErrorCodeForceCooldown != "force_cooldown" ||
+		ErrorCodeStreamTruncated != "stream_truncated" ||
+		ErrorCodeConnectionLifecycle != "connection_lifecycle" ||
+		ErrorCodeTransientTransport != "transient_transport" ||
+		ErrorCodeModelNotFound != "model_not_found" ||
+		ErrorCodeNotImplemented != "not_implemented" {
+		t.Fatal("unexpected routing/cooldown error code constant values")
 	}
 }
