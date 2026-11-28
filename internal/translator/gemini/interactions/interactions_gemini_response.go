@@ -13,13 +13,27 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
+// Match the native Interactions SSE frame limit for the total buffered arguments.
+const maxInteractionsGeminiBufferedArguments = 50 << 20
+
 type interactionsToGeminiStreamState struct {
-	ID             string
-	Model          string
-	ServiceTier    string
-	StepNames      map[int]string
-	StepIDs        map[int]string
-	StepSignatures map[int]string
+	ID                    string
+	Model                 string
+	ServiceTier           string
+	StepNames             map[int]string
+	StepIDs               map[int]string
+	StepSignatures        map[int]string
+	PendingFunctionSteps  map[int]string
+	FunctionArguments     map[int]*interactionsGeminiArguments // A nil entry marks an emitted or closed call.
+	BufferedArgumentBytes int
+}
+
+type interactionsGeminiArguments struct {
+	raw      []byte
+	depth    int
+	inString bool
+	escaped  bool
+	complete bool
 }
 
 func ConvertGeminiResponseToInteractions(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
@@ -63,7 +77,7 @@ func ConvertInteractionsResponseToGeminiNonStream(_ context.Context, modelName s
 		parts = append(parts, interactionsStepToGeminiParts(step)...)
 		return true
 	})
-	out := buildInteractionsGeminiChunk(st, modelName, parts, "STOP", translatorcommon.InteractionsUsage(root), true)
+	out := buildInteractionsGeminiChunk(st, modelName, parts, mapInteractionsFinishReasonToGemini(root, interaction), translatorcommon.InteractionsUsage(root), true)
 	return out
 }
 
@@ -100,16 +114,31 @@ func convertInteractionsEventToGemini(modelName string, rawJSON []byte, st *inte
 		st.Model = strings.Clone(firstNonEmptyInteractionString(st.Model, interaction.Get("model").String(), modelName))
 	case "step.start":
 		rememberInteractionsGeminiStep(root, st)
+		if chunk := emitInteractionsGeminiFunctionCall(modelName, int(root.Get("index").Int()), st); len(chunk) > 0 {
+			return [][]byte{chunk}
+		}
 	case "step.delta":
 		if chunk := interactionsStepDeltaToGeminiChunk(modelName, root, st); len(chunk) > 0 {
 			return [][]byte{chunk}
+		}
+	case "step.stop":
+		index := int(root.Get("index").Int())
+		if _, tracked := st.FunctionArguments[index]; tracked {
+			st.closeFunctionArguments(index)
+			break
+		}
+		if step, ok := st.PendingFunctionSteps[index]; ok {
+			delete(st.PendingFunctionSteps, index)
+			st.FunctionArguments[index] = nil
+			part := interactionsFunctionCallStepToGeminiPart(ojson.Parse(step))
+			return [][]byte{buildInteractionsGeminiChunk(st, modelName, [][]byte{part}, "", ojson.Result{}, false)}
 		}
 	case "interaction.completed", "finish":
 		interaction := root.Get("interaction")
 		st.ID = strings.Clone(firstNonEmptyInteractionString(st.ID, interaction.Get("id").String()))
 		st.Model = strings.Clone(firstNonEmptyInteractionString(st.Model, interaction.Get("model").String(), modelName))
 		st.ServiceTier = strings.Clone(firstNonEmptyInteractionString(st.ServiceTier, interaction.Get("service_tier").String()))
-		chunk := buildInteractionsGeminiChunk(st, modelName, nil, "STOP", translatorcommon.InteractionsUsage(root), true)
+		chunk := buildInteractionsGeminiChunk(st, modelName, nil, mapInteractionsFinishReasonToGemini(root, interaction), translatorcommon.InteractionsUsage(root), true)
 		return [][]byte{chunk}
 	case "response.failed", "interaction.failed":
 		errNode := root.Get("error")
@@ -129,6 +158,29 @@ func convertInteractionsEventToGemini(modelName string, rawJSON []byte, st *inte
 		return [][]byte{errorResponseDoc.Bytes()}
 	}
 	return nil
+}
+
+func mapInteractionsFinishReasonToGemini(root, interaction ojson.Result) string {
+	finishReason := strings.ToLower(strings.TrimSpace(firstNonEmptyInteractionString(
+		interaction.Get("finish_reason").String(),
+		root.Get("finish_reason").String(),
+	)))
+	switch finishReason {
+	case "safety", "content_filter":
+		return "SAFETY"
+	case "recitation":
+		return "RECITATION"
+	case "max_tokens", "max_output_tokens", "length":
+		return "MAX_TOKENS"
+	}
+	status := strings.ToLower(strings.TrimSpace(firstNonEmptyInteractionString(
+		interaction.Get("status").String(),
+		root.Get("status").String(),
+	)))
+	if status == "incomplete" {
+		return "MAX_TOKENS"
+	}
+	return "STOP"
 }
 
 func mapInteractionsErrorToGemini(codeStr string) (int, string) {
@@ -166,9 +218,35 @@ func mapInteractionsErrorToGemini(codeStr string) (int, string) {
 func rememberInteractionsGeminiStep(root ojson.Result, st *interactionsToGeminiStreamState) {
 	index := int(root.Get("index").Int())
 	step := root.Get("step")
-	st.StepNames[index] = strings.Clone(step.Get("name").String())
-	st.StepIDs[index] = strings.Clone(firstNonEmptyInteractionString(step.Get("call_id").String(), step.Get("id").String()))
-	st.StepSignatures[index] = strings.Clone(firstNonEmptyInteractionString(step.Get("signature").String(), step.Get("thoughtSignature").String(), step.Get("thought_signature").String()))
+	if name := step.Get("name").String(); strings.TrimSpace(name) != "" {
+		st.StepNames[index] = strings.Clone(name)
+	}
+	if id := firstNonEmptyInteractionString(step.Get("call_id").String(), step.Get("id").String()); id != "" {
+		st.StepIDs[index] = strings.Clone(id)
+	}
+	if signature := firstNonEmptyInteractionString(step.Get("signature").String(), step.Get("thoughtSignature").String(), step.Get("thought_signature").String()); signature != "" {
+		st.StepSignatures[index] = strings.Clone(signature)
+	}
+	// Even an empty arguments object or JSON-encoded object string may be complete, or it may precede a delta.
+	if _, tracked := st.FunctionArguments[index]; !tracked && step.Get("type").String() == "function_call" && isInteractionsGeminiCompleteFunctionArgs(firstExistingInteractionResult(step, "arguments", "args")) {
+		if st.PendingFunctionSteps == nil {
+			st.PendingFunctionSteps = make(map[int]string)
+		}
+		st.PendingFunctionSteps[index] = strings.Clone(step.Raw)
+	} else {
+		delete(st.PendingFunctionSteps, index)
+	}
+}
+
+func isInteractionsGeminiCompleteFunctionArgs(value ojson.Result) bool {
+	if value.IsObject() {
+		return ojson.Valid(strings.TrimSpace(value.Raw))
+	}
+	if value.Type == ojson.String {
+		raw := strings.TrimSpace(value.String())
+		return raw != "" && ojson.Valid(raw) && ojson.Parse(raw).IsObject()
+	}
+	return false
 }
 
 func interactionsStepDeltaToGeminiChunk(modelName string, root ojson.Result, st *interactionsToGeminiStreamState) []byte {
@@ -176,19 +254,30 @@ func interactionsStepDeltaToGeminiChunk(modelName string, root ojson.Result, st 
 	delta := root.Get("delta")
 	switch delta.Get("type").String() {
 	case "arguments_delta":
-		partDoc := ojson.NewDocString(`{"functionCall":{"name":"","args":{}}}`)
-		_ = partDoc.Set("functionCall.name", firstNonEmptyInteractionString(st.StepNames[index], root.Get("step.name").String()))
-		if id := st.StepIDs[index]; id != "" {
-			_ = partDoc.Set("functionCall.id", id)
+		arguments, seen := st.FunctionArguments[index]
+		if seen && arguments == nil {
+			return nil
 		}
-		if signature := st.StepSignatures[index]; signature != "" {
-			_ = partDoc.Set("thoughtSignature", signature)
+		if name := root.Get("step.name").String(); st.StepNames[index] == "" && strings.TrimSpace(name) != "" {
+			st.StepNames[index] = strings.Clone(name)
 		}
-		arguments := strings.TrimSpace(delta.Get("arguments").String())
-		if arguments != "" && ojson.Valid(arguments) {
-			_ = partDoc.SetRaw("functionCall.args", arguments)
+		if fragment := delta.Get("arguments").String(); fragment != "" {
+			delete(st.PendingFunctionSteps, index)
+			if len(fragment) > maxInteractionsGeminiBufferedArguments-st.BufferedArgumentBytes {
+				st.closeFunctionArguments(index)
+				return nil
+			}
+			if !seen {
+				arguments = &interactionsGeminiArguments{}
+				st.FunctionArguments[index] = arguments
+			}
+			st.BufferedArgumentBytes += len(fragment)
+			if !arguments.appendFragment(fragment) {
+				st.closeFunctionArguments(index)
+				return nil
+			}
 		}
-		return buildInteractionsGeminiChunk(st, modelName, [][]byte{partDoc.Bytes()}, "", ojson.Result{}, false)
+		return emitInteractionsGeminiFunctionCall(modelName, index, st)
 	case "text":
 		text := firstNonEmptyInteractionString(delta.Get("text").String(), delta.Get("content.text").String())
 		if text == "" {
@@ -214,6 +303,76 @@ func interactionsStepDeltaToGeminiChunk(modelName string, root ojson.Result, st 
 	return nil
 }
 
+// appendFragment detects the outer object's end without re-parsing the buffered
+// prefix. Only the final document is validated by the JSON parser.
+func (a *interactionsGeminiArguments) appendFragment(fragment string) bool {
+	a.raw = append(a.raw, fragment...)
+	for i := 0; i < len(fragment); i++ {
+		c := fragment[i]
+		if a.inString {
+			if a.escaped {
+				a.escaped = false
+			} else if c == '\\' {
+				a.escaped = true
+			} else if c == '"' {
+				a.inString = false
+			}
+			continue
+		}
+		if a.depth == 0 {
+			switch c {
+			case ' ', '\t', '\r', '\n':
+				continue
+			case '{':
+				if !a.complete {
+					a.depth = 1
+					continue
+				}
+			}
+			return false
+		}
+		switch c {
+		case '"':
+			a.inString = true
+		case '{':
+			a.depth++
+		case '}':
+			a.depth--
+			if a.depth == 0 {
+				a.complete = ojson.ValidBytes(a.raw)
+				return a.complete
+			}
+		}
+	}
+	return true
+}
+
+func (st *interactionsToGeminiStreamState) closeFunctionArguments(index int) {
+	if arguments := st.FunctionArguments[index]; arguments != nil {
+		st.BufferedArgumentBytes -= len(arguments.raw)
+	}
+	st.FunctionArguments[index] = nil
+}
+
+func emitInteractionsGeminiFunctionCall(modelName string, index int, st *interactionsToGeminiStreamState) []byte {
+	arguments := st.FunctionArguments[index]
+	name := st.StepNames[index]
+	if arguments == nil || !arguments.complete || strings.TrimSpace(name) == "" {
+		return nil
+	}
+	st.closeFunctionArguments(index)
+	partDoc := ojson.NewDocString(`{"functionCall":{"name":"","args":{}}}`)
+	_ = partDoc.Set("functionCall.name", name)
+	if id := st.StepIDs[index]; id != "" {
+		_ = partDoc.Set("functionCall.id", id)
+	}
+	if signature := st.StepSignatures[index]; signature != "" {
+		_ = partDoc.Set("thoughtSignature", signature)
+	}
+	_ = partDoc.SetRawBytes("functionCall.args", bytes.TrimSpace(arguments.raw))
+	return buildInteractionsGeminiChunk(st, modelName, [][]byte{partDoc.Bytes()}, "", ojson.Result{}, false)
+}
+
 func interactionsStepToGeminiParts(step ojson.Result) [][]byte {
 	switch step.Get("type").String() {
 	case "function_call":
@@ -221,33 +380,65 @@ func interactionsStepToGeminiParts(step ojson.Result) [][]byte {
 	case "function_result":
 		return [][]byte{interactionsFunctionResponseStepToGeminiPart(step)}
 	case "thought":
-		return interactionsContentToGeminiParts(step.Get("content"), true)
+		partDocs := extractInteractionsThoughtPartDocsToGemini(step)
+		sig := firstNonEmptyString(
+			step.Get("signature").String(),
+			step.Get("thoughtSignature").String(),
+			step.Get("thought_signature").String(),
+			step.Get("extra_content.google.thought_signature").String(),
+		)
+		if sig != "" {
+			if len(partDocs) > 0 {
+				_ = partDocs[len(partDocs)-1].Set("thoughtSignature", sig)
+			} else {
+				partDoc := ojson.NewDocString(`{"text":"","thought":true}`)
+				_ = partDoc.Set("thoughtSignature", sig)
+				partDocs = append(partDocs, partDoc)
+			}
+		}
+		parts := make([][]byte, 0, len(partDocs))
+		for _, partDoc := range partDocs {
+			parts = append(parts, partDoc.Bytes())
+		}
+		return parts
 	default:
 		return interactionsContentToGeminiParts(step.Get("content"), false)
 	}
 }
 
-func interactionsContentToGeminiParts(content ojson.Result, thought bool) [][]byte {
-	var parts [][]byte
+func interactionsContentToGeminiPartDocs(content ojson.Result, thought bool) []*ojson.Doc {
+	var partDocs []*ojson.Doc
 	if !content.Exists() {
-		return parts
+		return partDocs
 	}
 	if content.Type == ojson.String {
-		return [][]byte{geminiTextPartJSON(content.String(), thought)}
+		return []*ojson.Doc{geminiTextPartDoc(content.String(), thought)}
 	}
 	if content.IsObject() {
-		if part := interactionsContentPartToGeminiPart(content, thought); len(part) > 0 {
-			parts = append(parts, part)
+		if partDoc := interactionsContentPartToGeminiPartDoc(content, thought); partDoc != nil {
+			partDocs = append(partDocs, partDoc)
 		}
-		return parts
+		return partDocs
 	}
 	if content.IsArray() {
 		content.ForEach(func(_, item ojson.Result) bool {
-			if part := interactionsContentPartToGeminiPart(item, thought); len(part) > 0 {
-				parts = append(parts, part)
+			if partDoc := interactionsContentPartToGeminiPartDoc(item, thought); partDoc != nil {
+				partDocs = append(partDocs, partDoc)
 			}
 			return true
 		})
+	}
+	return partDocs
+}
+
+func interactionsContentToGeminiParts(content ojson.Result, thought bool) [][]byte {
+	partDocs := interactionsContentToGeminiPartDocs(content, thought)
+	if len(partDocs) == 0 {
+		return nil
+	}
+	parts := make([][]byte, 0, len(partDocs))
+	for _, partDoc := range partDocs {
+		parts = append(parts, partDoc.Bytes())
 	}
 	return parts
 }
@@ -261,7 +452,7 @@ func interactionsFunctionCallStepToGeminiPart(step ojson.Result) []byte {
 	if signature := firstNonEmptyInteractionString(step.Get("signature").String(), step.Get("thoughtSignature").String(), step.Get("thought_signature").String()); signature != "" {
 		_ = partDoc.Set("thoughtSignature", signature)
 	}
-	setInteractionsGeminiRawObjectDoc(partDoc, "functionCall.args", firstExistingInteractionResult(step, "arguments", "args"))
+	translatorcommon.SetGeminiFunctionCallArgsDoc(partDoc, "functionCall.args", firstExistingInteractionResult(step, "arguments", "args"))
 	return partDoc.Bytes()
 }
 
@@ -311,6 +502,7 @@ func setGeminiUsageMetadataFromInteractionsUsageDoc(outDoc *ojson.Doc, usage ojs
 	}
 	inputTokens, hasInputTokens := interactionsUsageInt(usage, "input_tokens", "total_input_tokens")
 	outputTokens, hasOutputTokens := interactionsUsageInt(usage, "output_tokens", "total_output_tokens")
+	thoughtTokens, hasThoughtTokens := interactionsUsageInt(usage, "reasoning_tokens", "total_thought_tokens")
 	totalTokens, hasTotalTokens := interactionsUsageInt(usage, "total_tokens")
 	if hasInputTokens {
 		_ = outDoc.Set("usageMetadata.promptTokenCount", inputTokens)
@@ -321,10 +513,10 @@ func setGeminiUsageMetadataFromInteractionsUsageDoc(outDoc *ojson.Doc, usage ojs
 	}
 	if hasTotalTokens {
 		_ = outDoc.Set("usageMetadata.totalTokenCount", totalTokens)
-	} else if hasInputTokens || hasOutputTokens {
-		_ = outDoc.Set("usageMetadata.totalTokenCount", inputTokens+outputTokens)
+	} else if hasInputTokens || hasOutputTokens || hasThoughtTokens {
+		_ = outDoc.Set("usageMetadata.totalTokenCount", inputTokens+outputTokens+thoughtTokens)
 	}
-	if thoughtTokens, ok := interactionsUsageInt(usage, "reasoning_tokens", "total_thought_tokens"); ok {
+	if hasThoughtTokens {
 		_ = outDoc.Set("usageMetadata.thoughtsTokenCount", thoughtTokens)
 	}
 	if cachedTokens, ok := interactionsUsageInt(usage, "cached_tokens", "total_cached_tokens"); ok {
@@ -376,23 +568,6 @@ func firstExistingInteractionResult(root ojson.Result, paths ...string) ojson.Re
 	return ojson.Result{}
 }
 
-func setInteractionsGeminiRawObjectDoc(doc *ojson.Doc, path string, value ojson.Result) {
-	if !value.Exists() {
-		_ = doc.SetRaw(path, `{}`)
-		return
-	}
-	if value.Type == ojson.String {
-		raw := strings.TrimSpace(value.String())
-		if raw != "" && ojson.Valid(raw) {
-			_ = doc.SetRaw(path, raw)
-			return
-		}
-	}
-	if value.Raw != "" {
-		_ = doc.SetRaw(path, value.Raw)
-	}
-}
-
 func setInteractionsGeminiFunctionResponseDoc(doc *ojson.Doc, path string, value ojson.Result) {
 	if !value.Exists() {
 		_ = doc.SetRaw(path, `{}`)
@@ -428,5 +603,8 @@ func (st *interactionsToGeminiStreamState) ensureMaps() {
 	}
 	if st.StepSignatures == nil {
 		st.StepSignatures = make(map[int]string)
+	}
+	if st.FunctionArguments == nil {
+		st.FunctionArguments = make(map[int]*interactionsGeminiArguments)
 	}
 }

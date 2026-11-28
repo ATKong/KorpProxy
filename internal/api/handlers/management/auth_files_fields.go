@@ -3,7 +3,6 @@ package management
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
@@ -244,13 +244,18 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 	if auth == nil {
 		return
 	}
+	wasDisabled := auth.Disabled || auth.Status == coreauth.StatusDisabled
 	auth.Disabled = disabled
 	if disabled {
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "disabled via management API"
-	} else {
+	} else if wasDisabled {
 		auth.Status = coreauth.StatusActive
 		auth.StatusMessage = ""
+		auth.Unavailable = false
+		auth.LastError = nil
+	} else if auth.Status == "" {
+		auth.Status = coreauth.StatusActive
 	}
 	auth.UpdatedAt = time.Now()
 	if auth.Metadata == nil {
@@ -847,6 +852,7 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 	if !ok {
 		return
 	}
+	wasDisabled := auth.Disabled || auth.Status == coreauth.StatusDisabled
 	auth.Disabled = disabled
 	if disabled {
 		auth.Status = coreauth.StatusDisabled
@@ -855,8 +861,14 @@ func syncAuthFileDisabledState(auth *coreauth.Auth) {
 		}
 		return
 	}
-	auth.Status = coreauth.StatusActive
-	auth.StatusMessage = ""
+	if wasDisabled {
+		auth.Status = coreauth.StatusActive
+		auth.StatusMessage = ""
+		auth.Unavailable = false
+		auth.LastError = nil
+	} else if auth.Status == "" {
+		auth.Status = coreauth.StatusActive
+	}
 }
 
 func (h *Handler) removeAuth(ctx context.Context, id string) {
@@ -1115,7 +1127,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 				AuthDir:          authDir,
 				Now:              time.Now(),
 				IDGenerator:      synthesizer.NewStableIDGenerator(),
-				PluginAuthParser: h.pluginHost,
+				PluginAuthParser: h.pluginHostSnapshot(),
 			}, savedPath, data)
 			if errSynthesize != nil {
 				return savedPath, fmt.Errorf("synthesize persisted auth failed: %w", errSynthesize)
