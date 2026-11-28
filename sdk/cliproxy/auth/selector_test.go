@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -10,8 +9,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -205,16 +206,14 @@ func TestAuthWeight_InvalidAndOverflowValuesAreExcluded(t *testing.T) {
 	}
 }
 
-func TestPickSmoothWeightedAuth_SaturatesCorruptState(t *testing.T) {
+func TestSmoothWeightedStateCharge_SaturatesAndClampsCorruptState(t *testing.T) {
 	t.Parallel()
 
-	current := map[string]int64{"a": math.MaxInt64, "b": math.MinInt64}
-	picked := pickSmoothWeightedAuth([]*Auth{{ID: "a"}, {ID: "b"}}, current)
-	if picked == nil {
-		t.Fatal("pickSmoothWeightedAuth() returned nil")
-	}
-	if current["a"] != math.MaxInt64-2 || current["b"] != math.MinInt64+1 {
-		t.Fatalf("current state = %#v, want saturated arithmetic", current)
+	state := weightedPoolForTest("route", map[string]int64{"a": 1, "b": 1}, map[string]int64{"a": math.MaxInt64, "b": math.MinInt64})
+	state.charge(0, false)
+	limit := maxSmoothWeightedCreditRounds * 2
+	if state.currentForTest()["a"] != limit || state.currentForTest()["b"] != -limit {
+		t.Fatalf("current state = %#v, want saturated and clamped arithmetic", state.currentForTest())
 	}
 }
 
@@ -2043,38 +2042,41 @@ func TestSessionAffinitySelector_CrossProviderIsolation(t *testing.T) {
 func TestSessionCache_GetAndRefresh(t *testing.T) {
 	t.Parallel()
 
-	cache := NewSessionCache(100 * time.Millisecond)
-	defer cache.Stop()
+	// Keep the cache cleanup loop and all TTL checks on the same virtual clock.
+	// Scheduler delays must not consume the 40ms margin between accesses.
+	synctest.Test(t, func(t *testing.T) {
+		cache := NewSessionCache(100 * time.Millisecond)
+		defer cache.Stop()
 
-	cache.Set("session1", "auth1")
+		cache.Set("session1", "auth1")
 
-	// Verify initial value
-	got, ok := cache.GetAndRefresh("session1")
-	if !ok || got != "auth1" {
-		t.Fatalf("GetAndRefresh() = %q, %v, want auth1, true", got, ok)
-	}
+		// Verify initial value
+		got, ok := cache.GetAndRefresh("session1")
+		if !ok || got != "auth1" {
+			t.Fatalf("GetAndRefresh() = %q, %v, want auth1, true", got, ok)
+		}
 
-	// Wait half TTL and access again (should refresh)
-	time.Sleep(60 * time.Millisecond)
-	got, ok = cache.GetAndRefresh("session1")
-	if !ok || got != "auth1" {
-		t.Fatalf("GetAndRefresh() after 60ms = %q, %v, want auth1, true", got, ok)
-	}
+		// Advance virtual time within the TTL and refresh the binding.
+		time.Sleep(60 * time.Millisecond)
+		got, ok = cache.GetAndRefresh("session1")
+		if !ok || got != "auth1" {
+			t.Fatalf("GetAndRefresh() after 60ms = %q, %v, want auth1, true", got, ok)
+		}
 
-	// Wait another 60ms (total 120ms from original, but TTL refreshed at 60ms)
-	// Entry should still be valid because TTL was refreshed
-	time.Sleep(60 * time.Millisecond)
-	got, ok = cache.GetAndRefresh("session1")
-	if !ok || got != "auth1" {
-		t.Fatalf("GetAndRefresh() after refresh = %q, %v, want auth1, true (TTL should have been refreshed)", got, ok)
-	}
+		// Advance past the original deadline, but stay within the refreshed TTL.
+		time.Sleep(60 * time.Millisecond)
+		got, ok = cache.GetAndRefresh("session1")
+		if !ok || got != "auth1" {
+			t.Fatalf("GetAndRefresh() after refresh = %q, %v, want auth1, true (TTL should have been refreshed)", got, ok)
+		}
 
-	// Now wait full TTL without access
-	time.Sleep(110 * time.Millisecond)
-	got, ok = cache.GetAndRefresh("session1")
-	if ok {
-		t.Fatalf("GetAndRefresh() after expiry = %q, %v, want '', false", got, ok)
-	}
+		// Let the refreshed TTL expire without further access.
+		time.Sleep(110 * time.Millisecond)
+		got, ok = cache.GetAndRefresh("session1")
+		if ok {
+			t.Fatalf("GetAndRefresh() after expiry = %q, %v, want '', false", got, ok)
+		}
+	})
 }
 
 func TestSessionAffinitySelector_RoundRobinDistribution(t *testing.T) {

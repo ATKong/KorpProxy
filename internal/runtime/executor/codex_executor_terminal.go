@@ -161,7 +161,8 @@ func codexTerminalStreamErrWithCooling(eventData []byte, modelLevelCooling bool)
 	if !ok || !codexTerminalStreamErrShouldHandle(body) {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErrWithCooling(http.StatusBadRequest, body, modelLevelCooling), body, true
+	headers := parseCodexWebsocketErrorHeaders(eventData)
+	return newCodexStatusErrWithHeadersAndCooling(http.StatusBadRequest, headers, body, modelLevelCooling), body, true
 }
 
 func codexTerminalFailureErr(eventData []byte) (statusErr, []byte, bool) {
@@ -176,11 +177,12 @@ func codexTerminalFailureErrWithCooling(eventData []byte, modelLevelCooling bool
 	if !ok {
 		return statusErr{}, nil, false
 	}
-	return newCodexStatusErrWithCooling(codexTerminalFailureStatus(body), body, modelLevelCooling), body, true
+	headers := parseCodexWebsocketErrorHeaders(eventData)
+	return newCodexStatusErrWithHeadersAndCooling(codexTerminalFailureStatus(body), headers, body, modelLevelCooling), body, true
 }
 
 func codexTerminalFailureStatus(body []byte) int {
-	for _, path := range []string{"error.status_code", "error.status"} {
+	for _, path := range []string{"error.status_code", "error.status", "status_code", "status"} {
 		if status := int(ojson.GetBytesNoCopy(body, path).Int()); status >= 400 && status <= 599 {
 			return status
 		}
@@ -189,7 +191,13 @@ func codexTerminalFailureStatus(body []byte) int {
 	errorType := strings.ToLower(strings.TrimSpace(ojson.GetBytesNoCopy(body, "error.type").String()))
 	errorCode := strings.ToLower(strings.TrimSpace(ojson.GetBytesNoCopy(body, "error.code").String()))
 	switch {
-	case errorCode == "cyber_policy":
+	case errorCode == "cyber_policy",
+		errorCode == "cyber_policy_violation",
+		errorCode == "bio_policy",
+		errorCode == "misalignment_policy_violation",
+		errorCode == "invalid_prompt",
+		errorCode == "content_policy_violation",
+		errorCode == "image_content_policy_violation":
 		return http.StatusBadRequest
 	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
 		return http.StatusNotFound
@@ -197,7 +205,8 @@ func codexTerminalFailureStatus(body []byte) int {
 		return http.StatusUnauthorized
 	case errorType == "permission_error", errorCode == "forbidden", errorCode == "permission_denied":
 		return http.StatusForbidden
-	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
+	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded",
+		errorType == "insufficient_quota", errorCode == "insufficient_quota", errorCode == "credit_balance_exhausted":
 		return http.StatusTooManyRequests
 	case errorType == "invalid_request_error", errorType == "bad_request_error", errorType == "image_generation_user_error", errorCode == "invalid_value", errorCode == "invalid_request_error":
 		return http.StatusBadRequest
@@ -207,45 +216,53 @@ func codexTerminalFailureStatus(body []byte) int {
 }
 
 func codexTerminalFailureBody(eventData []byte) ([]byte, bool) {
-	eventType := ojson.GetBytesNoCopy(eventData, "type").String()
-	var body []byte
+	eventType := helps.CodexResponseEventType(eventData)
+	paths := []string{"error", "body.error", "response.error"}
 	switch eventType {
 	case "error":
-		body = codexTerminalErrorBody(eventData, "error")
-		if len(body) == 0 {
-			body = codexTerminalTopLevelErrorBody(eventData)
-		}
 	case "response.failed":
-		body = codexTerminalErrorBody(eventData, "response.error")
-		if len(body) == 0 {
-			body = codexTerminalErrorBody(eventData, "error")
-		}
+		paths = []string{"response.error", "error", "body.error"}
 	default:
 		return nil, false
 	}
-	if len(body) == 0 {
-		body = []byte(`{"error":{"message":"upstream stream failed without error details"}}`)
+	var doc *ojson.Doc
+	for _, path := range paths {
+		if doc = codexTerminalErrorBody(eventData, path); doc != nil {
+			break
+		}
+	}
+	if doc == nil && eventType == "error" {
+		doc = codexTerminalTopLevelErrorBody(eventData)
+	}
+	if doc == nil {
+		doc = ojson.NewDocString(`{"error":{"message":"upstream stream failed without error details"}}`)
+	}
+	for _, statusPath := range []string{"status_code", "status", "body.status_code", "body.status"} {
+		if status := int(ojson.GetBytesNoCopy(eventData, statusPath).Int()); status >= 400 && status <= 599 {
+			_ = doc.Set("status", status)
+			break
+		}
 	}
 	if seq := ojson.GetBytesNoCopy(eventData, "sequence_number"); seq.Exists() {
-		body, _ = ojson.SetBytes(body, "sequence_number", seq.Int())
+		_ = doc.Set("sequence_number", seq.Int())
 	}
-	return body, true
+	return doc.Bytes(), true
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {
 	if codexTerminalErrorIsContextLength(body) {
 		return true
 	}
-	if isCodexUsageLimitError(body) || isCodexTransientCapacityError(body) {
+	if isCodexUsageLimitError(body) || isCodexBillingQuotaError(body) || isCodexTransientCapacityError(body) {
 		return true
 	}
 	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
 	return ok && code == "thinking_signature_invalid"
 }
 
-func codexTerminalErrorBody(eventData []byte, path string) []byte {
+func codexTerminalErrorBody(eventData []byte, path string) *ojson.Doc {
 	errorResult := ojson.GetBytesNoCopy(eventData, path)
-	if !errorResult.Exists() {
+	if !errorResult.Exists() || errorResult.Type == ojson.Null {
 		return nil
 	}
 	doc := ojson.NewDoc([]byte(`{"error":{}}`))
@@ -261,7 +278,7 @@ func codexTerminalErrorBody(eventData []byte, path string) []byte {
 	}
 	if strings.TrimSpace(doc.Get("error.message").String()) == "" {
 		if code := strings.TrimSpace(doc.Get("error.code").String()); code != "" {
-			_ = doc.Set("error.message", code)
+			_ = doc.Set("error.message", codexPolicyFallbackMessage(code))
 		}
 	}
 	if strings.TrimSpace(doc.Get("error.message").String()) == "" {
@@ -276,10 +293,10 @@ func codexTerminalErrorBody(eventData []byte, path string) []byte {
 			_ = doc.Set("error.message", msg+` (Set tool_choice to {"type":"image_generation"}, use a compatible Responses model such as gpt-5.4-mini, or call /v1/images/generations directly.)`)
 		}
 	}
-	return doc.Bytes()
+	return doc
 }
 
-func codexTerminalTopLevelErrorBody(eventData []byte) []byte {
+func codexTerminalTopLevelErrorBody(eventData []byte) *ojson.Doc {
 	message := strings.TrimSpace(ojson.GetBytesNoCopy(eventData, "message").String())
 	code := strings.TrimSpace(ojson.GetBytesNoCopy(eventData, "code").String())
 	errorType := strings.TrimSpace(ojson.GetBytesNoCopy(eventData, "error_type").String())
@@ -303,12 +320,27 @@ func codexTerminalTopLevelErrorBody(eventData []byte) []byte {
 	}
 	if strings.TrimSpace(doc.Get("error.message").String()) == "" {
 		if code != "" {
-			_ = doc.Set("error.message", code)
+			_ = doc.Set("error.message", codexPolicyFallbackMessage(code))
 		} else if errorType != "" {
 			_ = doc.Set("error.message", errorType)
 		}
 	}
-	return doc.Bytes()
+	return doc
+}
+
+func codexPolicyFallbackMessage(code string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "bio_policy":
+		return "This content was flagged for possible biological risk."
+	case "cyber_policy", "cyber_policy_violation":
+		return "This request has been flagged for possible cybersecurity risk."
+	case "misalignment_policy_violation":
+		return "This request was blocked due to a misalignment policy violation."
+	case "invalid_prompt":
+		return "Invalid request."
+	default:
+		return code
+	}
 }
 
 func codexTerminalErrorIsContextLength(body []byte) bool {
@@ -336,19 +368,21 @@ func newCodexStatusErrWithCooling(statusCode int, body []byte, modelLevelCooling
 func newCodexStatusErrWithHeadersAndCooling(statusCode int, headers http.Header, body []byte, modelLevelCooling bool) statusErr {
 	errCode := statusCode
 	isUsageLimit := isCodexUsageLimitError(body)
-	credentialScoped := isUsageLimit && !modelLevelCooling
-	transientCapacity := !isUsageLimit && isCodexTransientCapacityError(body)
-	if transientCapacity || isUsageLimit {
+	isBillingQuota := isCodexBillingQuotaError(body)
+	credentialScoped := isBillingQuota || (isUsageLimit && !modelLevelCooling)
+	transientCapacity := !isUsageLimit && !isBillingQuota && isCodexTransientCapacityError(body)
+	if transientCapacity || isUsageLimit || isBillingQuota {
 		errCode = http.StatusTooManyRequests
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body), credentialScoped: credentialScoped, transientRateLimit: transientCapacity && errCode == http.StatusTooManyRequests}
 	// A usage_limit_reached body reset describes quota recovery and wins over
-	// the generic Retry-After header. Every other 429 honours the upstream
-	// header so per-turn admission limits cool until their real deadline.
+	// the generic Retry-After header. Other 429s and recoverable transient
+	// upstream errors honour the upstream header so capacity rejections cool
+	// until their real deadline.
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
-	} else if errCode == http.StatusTooManyRequests {
+	} else if shouldParseCodexRetryAfterHeader(errCode) {
 		if retryAfter := parseRetryAfterHeader(headers, time.Now()); retryAfter != nil {
 			err.retryAfter = retryAfter
 		}
@@ -529,6 +563,28 @@ func isCodexUsageLimitError(errorBody []byte) bool {
 	}
 	for _, candidate := range candidates {
 		if strings.EqualFold(strings.TrimSpace(candidate), "usage_limit_reached") {
+			return true
+		}
+	}
+	return false
+}
+
+// isCodexBillingQuotaError reports whether the error body represents a
+// structured account/API-key billing quota exhaustion (insufficient_quota or
+// credit_balance_exhausted). Billing exhaustion belongs to the credential rather
+// than a single model, so it always produces a credential-scoped 429 cooldown.
+func isCodexBillingQuotaError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	for _, path := range []string{"error.type", "type", "body.error.type", "response.error.type"} {
+		if strings.EqualFold(strings.TrimSpace(ojson.GetBytesNoCopy(errorBody, path).String()), "insufficient_quota") {
+			return true
+		}
+	}
+	for _, path := range []string{"error.code", "code", "body.error.code", "response.error.code"} {
+		switch strings.ToLower(strings.TrimSpace(ojson.GetBytesNoCopy(errorBody, path).String())) {
+		case "insufficient_quota", "credit_balance_exhausted":
 			return true
 		}
 	}
@@ -721,7 +777,16 @@ func observeCodexTokenEvent(reporter *helps.UsageReporter, payload []byte) {
 // change would alter cooldown classification and retry-after parsing for everyone. Keeping 503
 // scoped to this path means disabling the feature restores the previous behaviour exactly.
 func newCodexBootstrapOverloadErr(body []byte) statusErr {
-	return newCodexStatusErr(http.StatusServiceUnavailable, body)
+	return newCodexStatusErrWithHeaders(http.StatusServiceUnavailable, parseCodexWebsocketErrorHeaders(body), body)
+}
+
+func newCodexBootstrapOverloadErrWithRetryAfter(body []byte, preferredRetryAfter *time.Duration) statusErr {
+	err := newCodexStatusErr(http.StatusServiceUnavailable, body)
+	if preferredRetryAfter != nil {
+		delay := *preferredRetryAfter
+		err.retryAfter = &delay
+	}
+	return err
 }
 
 // isCodexOverloadBootstrapFailure reports whether a terminal failure delivered inside an HTTP 200

@@ -3,9 +3,10 @@ package util
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/MoeForge/moego/regexp"
 )
 
 // inPlaceSJSONTokens are the sjson knobs that let a write reuse the caller's
@@ -111,11 +112,13 @@ var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
 	"internal/runtime/executor/claude_executor_cloaking.go":         {4, "shifts []string headers to prepend a block, or copies streamed tokens into private scanner/quote scratch buffers; no byte of any payload is rewritten"},
 	"internal/runtime/executor/claude_executor_request.go":          {3, "shifts []string headers to insert a part; no byte of any payload is rewritten"},
 	"internal/runtime/executor/xai_executor_request.go":             {5, "copies streamed tokens into private scanner/quote scratch buffers; no byte of any payload is rewritten"},
+	"internal/runtime/executor/helps/antigravity_payload_order.go":  {2, "compacts the private doc.Bytes() serialization before key ordering, logging, or transport can retain any view"},
 	"internal/runtime/executor/helps/claude_credential_identity.go": {1, "copies key bytes into a local stack-allocated quote array for json.Unmarshal"},
 	"internal/runtime/executor/helps/claude_mcp_alias.go":           {1, "copies an HMAC sum into a local fixed-size digest array"},
 	"internal/client/codex/live/tcp_proxy.go":                       {1, "copies header and payload into a freshly allocated frame"},
 	"internal/home/client.go":                                       {1, "zeroes a secret buffer after json.Unmarshal has copied every value out"},
 	"internal/pluginstore/auth.go":                                  {1, "zeroes a locally built credential buffer after base64 encoding copied it out"},
+	"sdk/cliproxy/auth/selector_weighted.go":                        {2, "shifts weightedPoolMember bookkeeping structs when inserting or removing members; no byte of any JSON payload is rewritten"},
 }
 
 // TestInPlaceByteWritesAreReviewed keeps the set of in-place byte writes small

@@ -1,6 +1,10 @@
 package pluginabi
 
-import "encoding/json"
+import (
+	"strings"
+
+	"github.com/MoeForge/moego/json"
+)
 
 const (
 	// ABIVersion tracks the native C ABI shape (native plugin exports).
@@ -34,7 +38,11 @@ const (
 	// Version 10 lets a plugin expose multiple OAuth/auth provider identifiers and
 	// per-entry display metadata via auth.identifier (identifiers/entries) or
 	// Capabilities.AuthProviders / MultiAuthProvider / AuthProviderEntries.
-	SchemaVersion uint32 = 10
+	// Version 11 lets scheduler plugins opt into push cancellation via
+	// scheduler.pick.cancel (capabilities.scheduler_pick_cancel), attaches
+	// host_callback_id to scheduler.pick requests, and exposes host.context.done
+	// and host.context.wait host callbacks for observing request cancellation.
+	SchemaVersion uint32 = 11
 	// SchemaVersionStreamChunkOmitRequestBody is the first schema version that omits
 	// request bodies on payload stream-chunk interceptor calls.
 	SchemaVersionStreamChunkOmitRequestBody uint32 = 3
@@ -62,6 +70,9 @@ const (
 	// SchemaVersionMultiAuthProviders is the first schema version where a plugin
 	// may register multiple auth provider identifiers.
 	SchemaVersionMultiAuthProviders uint32 = 10
+	// SchemaVersionSchedulerPickCancel is the first schema version where a scheduler
+	// plugin may opt into scheduler.pick.cancel push notifications.
+	SchemaVersionSchedulerPickCancel uint32 = 11
 )
 
 const (
@@ -85,6 +96,10 @@ const (
 
 	// MethodSchedulerPick asks a scheduler plugin to select an auth candidate.
 	MethodSchedulerPick = "scheduler.pick"
+	// MethodSchedulerPickCancel notifies a scheduler plugin that an in-flight scheduler.pick request was canceled.
+	MethodSchedulerPickCancel = "scheduler.pick.cancel"
+	// MethodSchedulerContinuity asks a scheduler plugin whether a request should proceed, wait, or disable continuity.
+	MethodSchedulerContinuity = "scheduler.continuity"
 	// MethodModelRoute asks a router plugin to select a plugin executor for a matching request.
 	MethodModelRoute = "model.route"
 
@@ -145,8 +160,47 @@ const (
 	MethodHostAuthSave           = "host.auth.save"
 	MethodHostAuthModels         = "host.auth.models"
 	MethodHostAffinityLookup     = "host.affinity.lookup"
+	MethodHostContextDone        = "host.context.done"
+	MethodHostContextWait        = "host.context.wait"
 
 	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
+)
+
+// ErrorCode constants define the machine-readable Error.Code values recognized
+// by CPA's routing and cooldown pipeline.
+const (
+	// ErrorCodeCredentialQuota marks a 429 refusal as exhausting or limiting the
+	// entire credential across all of its models (sets Result.CredentialScope and
+	// records quota reason "credential_quota"). Plugins may also set
+	// Error.CredentialScoped = true while keeping a provider-specific Code.
+	ErrorCodeCredentialQuota = "credential_quota"
+	// ErrorCodeTransientRateLimit marks a 429 refusal as a transient per-model
+	// capacity/admission limit that cools only the reporting model until
+	// RetryAfterSeconds without recording quota exhaustion or advancing backoff.
+	ErrorCodeTransientRateLimit = "transient_rate_limit"
+	// ErrorCodeRequestScoped marks a failure as caused by the request itself:
+	// CPA skips credential/model cooldown and stops credential rotation.
+	ErrorCodeRequestScoped = "request_scoped"
+	// ErrorCodeForceCooldown forces cooldown scheduling even when cooling is
+	// disabled for the credential, falling back to the default transient cooldown
+	// when no status-specific deadline applies.
+	ErrorCodeForceCooldown = "force_cooldown"
+	// ErrorCodeStreamTruncated marks an accepted upstream stream that terminated
+	// without a completion frame: CPA skips credential cooldown and does not
+	// replay the request on another credential.
+	ErrorCodeStreamTruncated = "stream_truncated"
+	// ErrorCodeConnectionLifecycle marks a client disconnect or session-close
+	// failure that must skip credential cooldown.
+	ErrorCodeConnectionLifecycle = "connection_lifecycle"
+	// ErrorCodeTransientTransport marks a pre-HTTP dial/TLS/DNS/reset failure
+	// that skips credential cooldown and remains eligible for request retries.
+	ErrorCodeTransientTransport = "transient_transport"
+	// ErrorCodeModelNotFound marks the requested model as unavailable on the
+	// selected credential so CPA cools only that model for 12h (or RetryAfterSeconds).
+	ErrorCodeModelNotFound = "model_not_found"
+	// ErrorCodeNotImplemented marks an optional capability (such as count_tokens)
+	// as unsupported so CPA keeps the credential and model available.
+	ErrorCodeNotImplemented = "not_implemented"
 )
 
 type Envelope struct {
@@ -155,6 +209,22 @@ type Envelope struct {
 	Error  *Error          `json:"error,omitempty"`
 }
 
+// Error carries a structured plugin failure across RPC envelopes and stream
+// error_detail callbacks (host.stream.emit and host.stream.close).
+//
+// Routing and cooldown behavior is controlled by HTTPStatus, RetryAfterSeconds,
+// CredentialScoped, and the recognized ErrorCode* values in Code:
+//   - CredentialScoped: true (or Code: ErrorCodeCredentialQuota) on a 429 marks
+//     the entire credential as rate-limited across all of its models
+//     (reason "credential_quota") until RetryAfterSeconds or the quota backoff.
+//   - Code: ErrorCodeTransientRateLimit on a 429 cools only the reporting model
+//     until RetryAfterSeconds without marking quota exceeded.
+//   - Code: ErrorCodeRequestScoped, ErrorCodeStreamTruncated,
+//     ErrorCodeConnectionLifecycle, or ErrorCodeTransientTransport skips
+//     credential/model cooldown.
+//   - Code: ErrorCodeForceCooldown enforces cooldown even when cooling is disabled.
+//   - Code: ErrorCodeModelNotFound cools only the requested model as unsupported.
+//   - Code: ErrorCodeNotImplemented keeps count_tokens failures availability-neutral.
 type Error struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
@@ -168,6 +238,10 @@ type Error struct {
 	// for correctness. The same pair is accepted as error_detail on host.stream.emit
 	// and host.stream.close.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+	// CredentialScoped reports whether the failure applies to the whole credential
+	// across all models (for example, an account-wide 429 quota or spend limit)
+	// rather than only the requested model.
+	CredentialScoped bool `json:"credential_scoped,omitempty"`
 }
 
 // Error implements the error interface for Error.
@@ -192,6 +266,38 @@ func (e *Error) StatusCode() int {
 		return 0
 	}
 	return e.HTTPStatus
+}
+
+// IsCredentialScoped reports whether the Error applies to the entire credential.
+func (e *Error) IsCredentialScoped() bool {
+	if e == nil {
+		return false
+	}
+	return e.CredentialScoped || strings.EqualFold(strings.TrimSpace(e.Code), ErrorCodeCredentialQuota)
+}
+
+// IsRequestScoped reports whether the Error is tied to the request rather than the credential.
+func (e *Error) IsRequestScoped() bool {
+	if e == nil || e.IsCredentialScoped() {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(e.Code), ErrorCodeRequestScoped)
+}
+
+// IsTransientRateLimit reports whether the Error is a transient per-model capacity 429.
+func (e *Error) IsTransientRateLimit() bool {
+	if e == nil || e.IsCredentialScoped() {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(e.Code), ErrorCodeTransientRateLimit)
+}
+
+// IsStreamTruncated reports whether the Error represents a truncated accepted upstream stream.
+func (e *Error) IsStreamTruncated() bool {
+	if e == nil || e.IsCredentialScoped() {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(e.Code), ErrorCodeStreamTruncated)
 }
 
 // NewError creates an Error instance with an optional HTTP status code.

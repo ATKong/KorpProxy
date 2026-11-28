@@ -2501,3 +2501,430 @@ func BenchmarkConvertClaudeResponseToOpenAIResponses_TextDelta(b *testing.B) {
 		ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", request, nil, delta, &param)
 	}
 }
+
+func TestConvertClaudeResponseToOpenAIResponses_PreTokenAndMidStreamFallbackTransparency(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Pre-token fallback with requestRawJSON fallbacks: created, in_progress, completed, and non-stream all surface claude-opus-4-8 + fallback metadata.
+	originalReq := []byte(`{"model":"claude-opus-5-5","input":[{"role":"user","content":"hi"}]}`)
+	translatedReq := []byte(`{"model":"claude-opus-5-5","fallbacks":[{"model":"claude-opus-4-8"}],"messages":[{"role":"user","content":"hi"}]}`)
+	preEvents := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_resp_pre","model":"claude-opus-4-8","usage":{"input_tokens":8,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"fallback answer"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3,"iterations":[{"type":"message","model":"claude-opus-5-5","output_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","output_tokens":3}]}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+	var preParam any
+	var createdData, completedData ojson.Result
+	for _, ev := range preEvents {
+		for _, out := range ConvertClaudeResponseToOpenAIResponses(ctx, "claude-opus-5-5", originalReq, translatedReq, ev, &preParam) {
+			event, data := parseClaudeResponsesSSEEvent(t, out)
+			switch event {
+			case "response.created":
+				createdData = data
+			case "response.completed":
+				completedData = data
+			}
+		}
+	}
+	if got := createdData.Get("response.model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("pre-token response.created model = %q, want claude-opus-4-8", got)
+	}
+	if createdData.Get("response.fallback.from.model").String() != "claude-opus-5-5" || createdData.Get("response.fallback.to.model").String() != "claude-opus-4-8" {
+		t.Fatalf("pre-token response.created fallback = %s, want from=5-5 to=4-8", createdData.Get("response.fallback").Raw)
+	}
+	if got := completedData.Get("response.model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("pre-token response.completed model = %q, want claude-opus-4-8", got)
+	}
+	if completedData.Get("response.fallback.from.model").String() != "claude-opus-5-5" || completedData.Get("response.fallback.to.model").String() != "claude-opus-4-8" {
+		t.Fatalf("pre-token response.completed fallback = %s, want from=5-5 to=4-8", completedData.Get("response.fallback").Raw)
+	}
+
+	preNonStreamSSE := bytes.Join(preEvents, []byte("\n\n"))
+	preNonStreamOut := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-opus-5-5", originalReq, translatedReq, preNonStreamSSE, nil)
+	if got := ojson.GetBytesNoCopy(preNonStreamOut, "model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("pre-token non-stream Responses model = %q, want claude-opus-4-8; payload=%s", got, string(preNonStreamOut))
+	}
+	if fb := ojson.GetBytesNoCopy(preNonStreamOut, "fallback"); !fb.Exists() || fb.Get("from.model").String() != "claude-opus-5-5" || fb.Get("to.model").String() != "claude-opus-4-8" {
+		t.Fatalf("pre-token non-stream Responses fallback = %s, want from=5-5 to=4-8", fb.Raw)
+	}
+
+	// 2. Mid-stream fallback: output[0] closes at fallback boundary, response.in_progress announces fallback + output_index=1, and completed/non-stream preserve serving model + boundary.
+	midEvents := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_resp_mid","model":"claude-opus-5-5","usage":{"input_tokens":8,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial "}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"content_block_start","index":1,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}}}`),
+		[]byte(`data: {"type":"content_block_stop","index":1}`),
+		[]byte(`data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"fallback text"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":2}`),
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6,"iterations":[{"type":"message","model":"claude-opus-5-5","output_tokens":2},{"type":"fallback_message","model":"claude-opus-4-8","output_tokens":4}]}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var midParam any
+	var boundaryInProgress, midCompleted ojson.Result
+	for _, ev := range midEvents {
+		for _, out := range ConvertClaudeResponseToOpenAIResponses(ctx, "claude-opus-5-5", originalReq, translatedReq, ev, &midParam) {
+			event, data := parseClaudeResponsesSSEEvent(t, out)
+			if event == "response.in_progress" && data.Get("response.fallback").Exists() {
+				boundaryInProgress = data
+			}
+			if event == "response.completed" {
+				midCompleted = data
+			}
+		}
+	}
+	if !boundaryInProgress.Exists() {
+		t.Fatal("expected mid-stream fallback to emit response.in_progress with response.fallback")
+	}
+	if got := boundaryInProgress.Get("response.model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("boundary response.in_progress model = %q, want claude-opus-4-8", got)
+	}
+	if boundaryInProgress.Get("response.fallback.trigger.category").String() != "cyber" || boundaryInProgress.Get("response.fallback.output_index").Int() != 1 {
+		t.Fatalf("boundary response.in_progress fallback = %s, want trigger=cyber output_index=1", boundaryInProgress.Get("response.fallback").Raw)
+	}
+	if got := midCompleted.Get("response.model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("mid-stream response.completed model = %q, want claude-opus-4-8", got)
+	}
+	if midCompleted.Get("response.fallback.output_index").Int() != 1 || len(midCompleted.Get("response.output").Array()) != 2 {
+		t.Fatalf("mid-stream response.completed = %s, want fallback.output_index=1 and 2 split message items", midCompleted.Get("response").Raw)
+	}
+
+	midNativeRaw := []byte(`{"id":"msg_resp_mid","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"partial "},{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}},{"type":"text","text":"fallback text"}],"stop_reason":"end_turn","usage":{"input_tokens":8,"output_tokens":6,"iterations":[{"type":"message","model":"claude-opus-5-5","output_tokens":2},{"type":"fallback_message","model":"claude-opus-4-8","output_tokens":4}]}}`)
+	midNonStreamOut := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-opus-5-5", originalReq, translatedReq, midNativeRaw, nil)
+	if got := ojson.GetBytesNoCopy(midNonStreamOut, "model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("mid-stream non-stream Responses model = %q, want claude-opus-4-8; payload=%s", got, string(midNonStreamOut))
+	}
+	midFB := ojson.GetBytesNoCopy(midNonStreamOut, "fallback")
+	if !midFB.Exists() || midFB.Get("trigger.category").String() != "cyber" || midFB.Get("output_index").Int() != 1 {
+		t.Fatalf("mid-stream non-stream Responses fallback = %s, want trigger=cyber output_index=1", midFB.Raw)
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_DefaultStringFallbackAndStickyRouting(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. "fallbacks": "default" + sticky routing (upstream serves claude-opus-4-8 directly in message_start with no fallback block and no usage.iterations).
+	origReq := []byte(`{"model":"claude-opus-5-5","input":[{"role":"user","content":"turn 2"}]}`)
+	translatedDefaultReq := []byte(`{"model":"claude-opus-5-5","fallbacks":"default","messages":[{"role":"user","content":"turn 2"}]}`)
+	stickyEvents := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_sticky","model":"claude-opus-4-8","usage":{"input_tokens":12,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"sticky answer"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var param any
+	var created, inProgress, completed ojson.Result
+	for _, ev := range stickyEvents {
+		for _, out := range ConvertClaudeResponseToOpenAIResponses(ctx, "claude-opus-5-5", origReq, translatedDefaultReq, ev, &param) {
+			event, data := parseClaudeResponsesSSEEvent(t, out)
+			switch event {
+			case "response.created":
+				created = data
+			case "response.in_progress":
+				if !inProgress.Exists() {
+					inProgress = data
+				}
+			case "response.completed":
+				completed = data
+			}
+		}
+	}
+	if created.Get("response.model").String() != "claude-opus-4-8" || inProgress.Get("response.model").String() != "claude-opus-4-8" || completed.Get("response.model").String() != "claude-opus-4-8" {
+		t.Fatalf("sticky default fallback models = (%q, %q, %q), want all claude-opus-4-8",
+			created.Get("response.model").String(), inProgress.Get("response.model").String(), completed.Get("response.model").String())
+	}
+	if created.Get("response.fallback.from.model").String() != "claude-opus-5-5" || created.Get("response.fallback.to.model").String() != "claude-opus-4-8" {
+		t.Fatalf("sticky created fallback = %s, want from=5-5 to=4-8", created.Get("response.fallback").Raw)
+	}
+
+	stickyNonStream := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-opus-5-5", origReq, translatedDefaultReq, bytes.Join(stickyEvents, []byte("\n\n")), nil)
+	if got := ojson.GetBytesNoCopy(stickyNonStream, "model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("sticky non-stream model = %q, want claude-opus-4-8", got)
+	}
+
+	// 2. Dated snapshot of the primary model (claude-opus-5-5-20260501) must NOT be misclassified as a fallback.
+	var snapParam any
+	snapStart := []byte(`data: {"type":"message_start","message":{"id":"msg_snap","model":"claude-opus-5-5-20260501","usage":{"input_tokens":4,"output_tokens":0}}}`)
+	for _, out := range ConvertClaudeResponseToOpenAIResponses(ctx, "claude-opus-5-5", origReq, translatedDefaultReq, snapStart, &snapParam) {
+		event, data := parseClaudeResponsesSSEEvent(t, out)
+		if event == "response.created" && data.Get("response.fallback").Exists() {
+			t.Fatalf("dated primary snapshot should not emit fallback metadata: %s", data.Get("response.fallback").Raw)
+		}
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_MultiHopFallbackChainPreservesAllBoundaries(t *testing.T) {
+	ctx := context.Background()
+	origReq := []byte(`{"model":"claude-fable-5-1","input":[{"role":"user","content":"chain"}]}`)
+	translatedReq := []byte(`{"model":"claude-fable-5-1","fallbacks":[{"model":"claude-opus-5"},{"model":"claude-opus-4-8"}],"messages":[{"role":"user","content":"chain"}]}`)
+
+	events := [][]byte{
+		[]byte(`data: {"type":"message_start","message":{"id":"msg_chain","model":"claude-fable-5-1","usage":{"input_tokens":10,"output_tokens":0}}}`),
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partA "}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+		[]byte(`data: {"type":"content_block_start","index":1,"content_block":{"type":"fallback","from":{"model":"claude-fable-5-1"},"to":{"model":"claude-opus-5"},"trigger":{"type":"refusal","category":"reasoning_extraction"}}}`),
+		[]byte(`data: {"type":"content_block_stop","index":1}`),
+		[]byte(`data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"partB "}}`),
+		[]byte(`data: {"type":"content_block_stop","index":2}`),
+		[]byte(`data: {"type":"content_block_start","index":3,"content_block":{"type":"fallback","from":{"model":"claude-opus-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}}}`),
+		[]byte(`data: {"type":"content_block_stop","index":3}`),
+		[]byte(`data: {"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":4,"delta":{"type":"text_delta","text":"partC"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":4}`),
+		[]byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9,"iterations":[{"type":"message","model":"claude-fable-5-1","output_tokens":3},{"type":"fallback_message","model":"claude-opus-5","output_tokens":3},{"type":"fallback_message","model":"claude-opus-4-8","output_tokens":3}]}}`),
+		[]byte(`data: {"type":"message_stop"}`),
+	}
+
+	var param any
+	var completed ojson.Result
+	for _, ev := range events {
+		for _, out := range ConvertClaudeResponseToOpenAIResponses(ctx, "claude-fable-5-1", origReq, translatedReq, ev, &param) {
+			event, data := parseClaudeResponsesSSEEvent(t, out)
+			if event == "response.completed" {
+				completed = data
+			}
+		}
+	}
+	if got := completed.Get("response.model").String(); got != "claude-opus-4-8" {
+		t.Fatalf("multi-hop completed model = %q, want claude-opus-4-8", got)
+	}
+	hops := completed.Get("response.fallbacks").Array()
+	if len(hops) != 2 {
+		t.Fatalf("multi-hop response.fallbacks len = %d, want 2; raw=%s", len(hops), completed.Get("response.fallbacks").Raw)
+	}
+	if hops[0].Get("from.model").String() != "claude-fable-5-1" || hops[0].Get("to.model").String() != "claude-opus-5" || hops[0].Get("output_index").Int() != 1 {
+		t.Fatalf("hop[0] = %s, want fable-5-1 -> opus-5 at output_index=1", hops[0].Raw)
+	}
+	if hops[1].Get("from.model").String() != "claude-opus-5" || hops[1].Get("to.model").String() != "claude-opus-4-8" || hops[1].Get("output_index").Int() != 2 {
+		t.Fatalf("hop[1] = %s, want opus-5 -> opus-4-8 at output_index=2", hops[1].Raw)
+	}
+	if len(completed.Get("response.output").Array()) != 3 {
+		t.Fatalf("multi-hop response.output len = %d, want 3 message items", len(completed.Get("response.output").Array()))
+	}
+
+	nonStreamOut := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-fable-5-1", origReq, translatedReq, bytes.Join(events, []byte("\n\n")), nil)
+	nonStreamHops := ojson.GetBytesNoCopy(nonStreamOut, "fallbacks").Array()
+	if len(nonStreamHops) != 2 || nonStreamHops[0].Get("output_index").Int() != 1 || nonStreamHops[1].Get("output_index").Int() != 2 {
+		t.Fatalf("non-stream multi-hop fallbacks = %s, want 2 hops with output_index 1 and 2", ojson.GetBytesNoCopy(nonStreamOut, "fallbacks").Raw)
+	}
+}
+
+func TestConvertClaudeResponseToOpenAIResponses_ErrorEventStream(t *testing.T) {
+	ctx := context.Background()
+	origReq := []byte(`{"model":"claude-sonnet-4-5","input":"Hello"}`)
+
+	t.Run("standalone error event emits response.failed and terminates stream", func(t *testing.T) {
+		var param any
+		errChunk := []byte(`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
+		out := ConvertClaudeResponseToOpenAIResponses(ctx, "claude-sonnet-4-5", origReq, nil, errChunk, &param)
+		if len(out) != 1 {
+			t.Fatalf("len(out) = %d, want 1", len(out))
+		}
+		event, data := parseClaudeResponsesSSEEvent(t, out[0])
+		if event != "response.failed" || data.Get("type").String() != "response.failed" {
+			t.Fatalf("event=%q data.type=%q, want response.failed", event, data.Get("type").String())
+		}
+		if data.Get("sequence_number").Int() != 1 {
+			t.Fatalf("sequence_number = %d, want 1", data.Get("sequence_number").Int())
+		}
+		if data.Get("response.status").String() != "failed" {
+			t.Fatalf("response.status = %q, want failed", data.Get("response.status").String())
+		}
+		if data.Get("response.error.code").String() != "overloaded_error" || data.Get("response.error.message").String() != "Overloaded" {
+			t.Fatalf("response.error = %s, want overloaded_error / Overloaded", data.Get("response.error").Raw)
+		}
+		if data.Get("response.created_at").Int() <= 0 {
+			t.Fatalf("response.created_at = %d, want > 0", data.Get("response.created_at").Int())
+		}
+		if data.Get("response.model").String() != "claude-sonnet-4-5" {
+			t.Fatalf("response.model = %q, want claude-sonnet-4-5", data.Get("response.model").String())
+		}
+		// Subsequent events after error must be ignored.
+		after := ConvertClaudeResponseToOpenAIResponses(ctx, "claude-sonnet-4-5", origReq, nil, []byte(`data: {"type":"message_stop"}`), &param)
+		if len(after) != 0 {
+			t.Fatalf("expected no events after response.failed, got %d", len(after))
+		}
+	})
+
+	t.Run("mid-stream error preserves response id, usage, and partial outputs without completing unfinished tool calls", func(t *testing.T) {
+		var param any
+		chunks := [][]byte{
+			[]byte(`data: {"type":"message_start","message":{"id":"msg_err_1","model":"claude-sonnet-4-5","usage":{"input_tokens":7,"output_tokens":2}}}`),
+			[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+			[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial text"}}`),
+			[]byte(`data: {"type":"content_block_stop","index":0}`),
+			[]byte(`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}`),
+			[]byte(`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Tok"}}`),
+			[]byte(`data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}`),
+		}
+		var failed ojson.Result
+		foundFailed := false
+		for _, ch := range chunks {
+			for _, emitted := range ConvertClaudeResponseToOpenAIResponses(ctx, "claude-sonnet-4-5", origReq, nil, ch, &param) {
+				event, data := parseClaudeResponsesSSEEvent(t, emitted)
+				if event == "response.failed" {
+					foundFailed = true
+					failed = data
+				}
+			}
+		}
+		if !foundFailed {
+			t.Fatalf("expected response.failed event")
+		}
+		if failed.Get("response.id").String() != "msg_err_1" {
+			t.Fatalf("response.id = %q, want msg_err_1", failed.Get("response.id").String())
+		}
+		if failed.Get("response.error.code").String() != "api_error" || failed.Get("response.error.message").String() != "Internal server error" {
+			t.Fatalf("response.error = %s", failed.Get("response.error").Raw)
+		}
+		if failed.Get("response.usage.input_tokens").Int() != 7 || failed.Get("response.usage.output_tokens").Int() != 2 {
+			t.Fatalf("response.usage = %s, want input_tokens=7 output_tokens=2", failed.Get("response.usage").Raw)
+		}
+		outputs := failed.Get("response.output").Array()
+		if len(outputs) != 2 {
+			t.Fatalf("response.output len = %d, want 2; raw=%s", len(outputs), failed.Get("response.output").Raw)
+		}
+		if outputs[0].Get("type").String() != "message" || outputs[0].Get("status").String() != "completed" || outputs[0].Get("content.0.text").String() != "partial text" {
+			t.Fatalf("output[0] = %s, want completed message with partial text", outputs[0].Raw)
+		}
+		if outputs[1].Get("type").String() != "function_call" || outputs[1].Get("status").String() != "incomplete" || outputs[1].Get("arguments").String() != `{"city":"Tok` {
+			t.Fatalf("output[1] = %s, want incomplete function_call with partial arguments", outputs[1].Raw)
+		}
+	})
+
+	t.Run("error event with missing fields falls back to default code and message", func(t *testing.T) {
+		var param any
+		out := ConvertClaudeResponseToOpenAIResponses(ctx, "claude-sonnet-4-5", origReq, nil, []byte(`data: {"type":"error","error":{}}`), &param)
+		if len(out) != 1 {
+			t.Fatalf("len(out) = %d, want 1", len(out))
+		}
+		_, data := parseClaudeResponsesSSEEvent(t, out[0])
+		if data.Get("response.error.code").String() != "api_error" || data.Get("response.error.message").String() != "Upstream Claude error" {
+			t.Fatalf("response.error = %s, want defaults", data.Get("response.error").Raw)
+		}
+	})
+}
+
+func TestConvertClaudeResponseToOpenAIResponsesNonStream_ErrorEvent(t *testing.T) {
+	ctx := context.Background()
+	origReq := []byte(`{"model":"claude-sonnet-4-5","input":"Hello"}`)
+
+	t.Run("SSE error event returns failed response with error payload", func(t *testing.T) {
+		rawSSE := []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n")
+		out := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-sonnet-4-5", origReq, nil, rawSSE, nil)
+		root := ojson.ParseBytes(out)
+		if root.Get("status").String() != "failed" {
+			t.Fatalf("status = %q, want failed; out=%s", root.Get("status").String(), string(out))
+		}
+		if root.Get("error.code").String() != "overloaded_error" || root.Get("error.message").String() != "Overloaded" {
+			t.Fatalf("error = %s, want overloaded_error / Overloaded", root.Get("error").Raw)
+		}
+		if root.Get("created_at").Int() <= 0 {
+			t.Fatalf("created_at = %d, want > 0", root.Get("created_at").Int())
+		}
+		if root.Get("model").String() != "claude-sonnet-4-5" {
+			t.Fatalf("model = %q, want claude-sonnet-4-5", root.Get("model").String())
+		}
+	})
+
+	t.Run("SSE error after message_start preserves response id, usage, and partial outputs without completing unfinished tool calls", func(t *testing.T) {
+		rawSSE := bytes.Join([][]byte{
+			[]byte(`data: {"type":"message_start","message":{"id":"msg_ns_err","model":"claude-sonnet-4-5","usage":{"input_tokens":7,"output_tokens":2}}}`),
+			[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
+			[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial text"}}`),
+			[]byte(`data: {"type":"content_block_stop","index":0}`),
+			[]byte(`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_ns_1","name":"get_weather","input":{}}}`),
+			[]byte(`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Tok"}}`),
+			[]byte(`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`),
+		}, []byte("\n\n"))
+		out := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-sonnet-4-5", origReq, nil, rawSSE, nil)
+		root := ojson.ParseBytes(out)
+		if root.Get("status").String() != "failed" || root.Get("id").String() != "msg_ns_err" {
+			t.Fatalf("out = %s, want status=failed and id=msg_ns_err", string(out))
+		}
+		if root.Get("error.code").String() != "overloaded_error" || root.Get("error.message").String() != "Overloaded" {
+			t.Fatalf("error = %s", root.Get("error").Raw)
+		}
+		if root.Get("usage.input_tokens").Int() != 7 || root.Get("usage.output_tokens").Int() != 2 {
+			t.Fatalf("usage = %s, want input_tokens=7 output_tokens=2", root.Get("usage").Raw)
+		}
+		outputs := root.Get("output").Array()
+		if len(outputs) != 2 {
+			t.Fatalf("output len = %d, want 2; raw=%s", len(outputs), root.Get("output").Raw)
+		}
+		if outputs[0].Get("type").String() != "message" || outputs[0].Get("status").String() != "completed" || outputs[0].Get("content.0.text").String() != "partial text" {
+			t.Fatalf("output[0] = %s, want completed message with partial text", outputs[0].Raw)
+		}
+		if outputs[1].Get("type").String() != "function_call" || outputs[1].Get("status").String() != "incomplete" || outputs[1].Get("arguments").String() != `{"city":"Tok` {
+			t.Fatalf("output[1] = %s, want incomplete function_call with partial arguments", outputs[1].Raw)
+		}
+	})
+
+	t.Run("SSE error after stopped web_search without result marks web_search_call incomplete", func(t *testing.T) {
+		chunks := [][]byte{
+			[]byte(`data: {"type":"message_start","message":{"id":"msg_ws_err","model":"claude-sonnet-4-5","usage":{"input_tokens":11,"output_tokens":3}}}`),
+			[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"weather tokyo"}}}`),
+			[]byte(`data: {"type":"content_block_stop","index":0}`),
+			[]byte(`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`),
+		}
+		rawSSE := bytes.Join(chunks, []byte("\n\n"))
+		out := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-sonnet-4-5", origReq, nil, rawSSE, nil)
+		root := ojson.ParseBytes(out)
+		if root.Get("status").String() != "failed" || root.Get("id").String() != "msg_ws_err" {
+			t.Fatalf("non-stream out = %s, want status=failed and id=msg_ws_err", string(out))
+		}
+		if root.Get("usage.input_tokens").Int() != 11 || root.Get("usage.output_tokens").Int() != 3 {
+			t.Fatalf("non-stream usage = %s, want input_tokens=11 output_tokens=3", root.Get("usage").Raw)
+		}
+		outputs := root.Get("output").Array()
+		if len(outputs) != 1 || outputs[0].Get("type").String() != "web_search_call" || outputs[0].Get("status").String() != "incomplete" {
+			t.Fatalf("non-stream output = %s, want single incomplete web_search_call", root.Get("output").Raw)
+		}
+
+		var param any
+		var failed ojson.Result
+		foundFailed := false
+		for _, ch := range chunks {
+			for _, emitted := range ConvertClaudeResponseToOpenAIResponses(ctx, "claude-sonnet-4-5", origReq, nil, ch, &param) {
+				event, data := parseClaudeResponsesSSEEvent(t, emitted)
+				if event == "response.failed" {
+					foundFailed = true
+					failed = data
+				}
+			}
+		}
+		if !foundFailed {
+			t.Fatalf("expected streaming response.failed event")
+		}
+		streamOutputs := failed.Get("response.output").Array()
+		if len(streamOutputs) != 1 || streamOutputs[0].Get("type").String() != "web_search_call" || streamOutputs[0].Get("status").String() != "incomplete" {
+			t.Fatalf("stream response.output = %s, want single incomplete web_search_call", failed.Get("response.output").Raw)
+		}
+	})
+
+	t.Run("native non-SSE JSON error returns failed response", func(t *testing.T) {
+		rawJSON := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}`)
+		out := ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, "claude-sonnet-4-5", origReq, nil, rawJSON, nil)
+		root := ojson.ParseBytes(out)
+		if root.Get("status").String() != "failed" {
+			t.Fatalf("status = %q, want failed; out=%s", root.Get("status").String(), string(out))
+		}
+		if root.Get("error.code").String() != "rate_limit_error" || root.Get("error.message").String() != "Rate limited" {
+			t.Fatalf("error = %s, want rate_limit_error / Rate limited", root.Get("error").Raw)
+		}
+		if root.Get("created_at").Int() <= 0 {
+			t.Fatalf("created_at = %d, want > 0", root.Get("created_at").Int())
+		}
+	})
+}
