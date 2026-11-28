@@ -2,15 +2,17 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/json"
+	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -81,6 +83,9 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 // StopAutoRefresh cancels the background refresh loop, if running.
 // It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	cancel := m.refreshCancel
 	m.refreshCancel = nil
@@ -93,6 +98,39 @@ func (m *Manager) StopAutoRefresh() {
 	sel := m.Selector()
 	if stoppable, ok := sel.(StoppableSelector); ok && stoppable != nil {
 		stoppable.Stop()
+	}
+}
+
+// StopAutoRefreshContext cancels the background refresh loop and waits, within ctx,
+// for in-flight auto-refresh workers to finish persisting refreshed credentials.
+func (m *Manager) StopAutoRefreshContext(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.StopAutoRefresh()
+
+	m.mu.Lock()
+	if m.autoRefreshInFlight == 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	idleCh := m.autoRefreshIdleCh
+	m.mu.Unlock()
+
+	select {
+	case <-idleCh:
+		return nil
+	default:
+	}
+
+	select {
+	case <-idleCh:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("stop auth auto-refresh: %w", ctx.Err())
 	}
 }
 
@@ -396,6 +434,29 @@ func (m *Manager) markRefreshPending(loop *authAutoRefreshLoop, id string, regis
 	return job
 }
 
+type autoRefreshPersistDoneKey struct{}
+
+func withAutoRefreshPersistDone(ctx context.Context, fn func()) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, autoRefreshPersistDoneKey{}, fn)
+}
+
+func detachAutoRefreshPersistDone(ctx context.Context) (context.Context, func()) {
+	if ctx == nil {
+		return context.Background(), nil
+	}
+	fn, _ := ctx.Value(autoRefreshPersistDoneKey{}).(func())
+	if fn == nil {
+		return ctx, nil
+	}
+	return context.WithValue(ctx, autoRefreshPersistDoneKey{}, (func())(nil)), fn
+}
+
 func (m *Manager) beginRefreshJob(ctx context.Context, job *authRefreshJob) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -405,6 +466,39 @@ func (m *Manager) beginRefreshJob(ctx context.Context, job *authRefreshJob) bool
 	}
 	job.running = true
 	return true
+}
+
+func (m *Manager) beginAutoRefreshJob(ctx context.Context, job *authRefreshJob) (func(), bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.auths[job.id]
+	if ctx.Err() != nil || m.refreshJobs[job.id] != job || auth == nil || auth.RegistrationEpoch != job.registrationEpoch {
+		return nil, false
+	}
+	job.running = true
+	m.autoRefreshInFlight++
+	if m.autoRefreshIdleCh == nil {
+		m.autoRefreshIdleCh = make(chan struct{})
+	}
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			m.finishAutoRefreshInFlight()
+		})
+	}
+	return release, true
+}
+
+func (m *Manager) finishAutoRefreshInFlight() {
+	m.mu.Lock()
+	if m.autoRefreshInFlight > 0 {
+		m.autoRefreshInFlight--
+	}
+	if m.autoRefreshInFlight == 0 && m.autoRefreshIdleCh != nil {
+		close(m.autoRefreshIdleCh)
+		m.autoRefreshIdleCh = nil
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) finishRefreshJob(job *authRefreshJob, retryAt time.Time, queuedOnly bool) {
@@ -426,7 +520,44 @@ func (m *Manager) finishRefreshJob(job *authRefreshJob, retryAt time.Time, queue
 }
 
 type authRefreshLock struct {
-	mu sync.Mutex
+	gate    chan struct{}
+	waiters atomic.Int32
+}
+
+// lockRefreshContext acquires the per-credential refresh lock while honoring ctx cancellation
+// whenever lock acquisition would block behind another holder.
+func (m *Manager) lockRefreshContext(ctx context.Context, id string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{gate: make(chan struct{}, 1)})
+	lock, ok := lockValue.(*authRefreshLock)
+	if !ok || lock == nil || lock.gate == nil {
+		lock = &authRefreshLock{gate: make(chan struct{}, 1)}
+		m.refreshLocks.Store(id, lock)
+	}
+	select {
+	case lock.gate <- struct{}{}:
+	default:
+		lock.waiters.Add(1)
+		select {
+		case lock.gate <- struct{}{}:
+			lock.waiters.Add(-1)
+			if errCtx := ctx.Err(); errCtx != nil {
+				<-lock.gate
+				return nil, errCtx
+			}
+		case <-ctx.Done():
+			lock.waiters.Add(-1)
+			return nil, ctx.Err()
+		}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-lock.gate
+		})
+	}, nil
 }
 
 func authOuterAccessToken(auth *Auth) string {
@@ -998,7 +1129,17 @@ func applyDevinQuotaRestoration(auth, existing *Auth, now time.Time) bool {
 	if hasUnauthorizedAuthFailure(existing) {
 		return false
 	}
+	releaseCredentialQuota(auth, existing, now, true)
+	return true
+}
 
+// releaseCredentialQuota clears an auth-level credential_quota cooldown on auth.
+// Model states wrapped by credential_quota propagation have their independent
+// shadow cooldown reinstated (if still live) or are reset, while an independent
+// auth-level force cooldown recorded on existing is preserved. When
+// includeLegacyUnwrappedQuota is true, unwrapped "quota" model states are also
+// cleared (used by legacy Devin quota restoration).
+func releaseCredentialQuota(auth, existing *Auth, now time.Time, includeLegacyUnwrappedQuota bool) {
 	applyCooldownFields(&auth.Quota, QuotaState{})
 	for _, state := range auth.ModelStates {
 		if state == nil {
@@ -1006,14 +1147,13 @@ func applyDevinQuotaRestoration(auth, existing *Auth, now time.Time) bool {
 		}
 		reason := strings.TrimSpace(state.Quota.Reason)
 		wrapped := state.credentialQuotaPropagated || reason == "credential_quota"
-		if !state.Quota.Exceeded || (reason != "quota" && !wrapped) {
+		if !state.Quota.Exceeded || (!wrapped && (!includeLegacyUnwrappedQuota || reason != "quota")) {
 			continue
 		}
 		// A wrapped sibling carries its independent layer in the shadow.
 		// Reinstate that exact block (if still live) instead of erasing it;
-		// the reporting model ("quota" unwrapped) and pure propagation
-		// targets (no shadow) fully release. Deadline or status heuristics
-		// cannot recover this provenance reliably.
+		// pure propagation targets (no shadow) fully release. Deadline or
+		// status heuristics cannot recover this provenance reliably.
 		if shadow := state.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
 			*state = *shadow.cloneShallow()
 			state.UpdatedAt = now
@@ -1021,15 +1161,41 @@ func applyDevinQuotaRestoration(auth, existing *Auth, now time.Time) bool {
 		}
 		resetModelState(state, now)
 	}
-	auth.Status = StatusActive
-	auth.StatusMessage = ""
-	auth.LastError = nil
-	auth.Unavailable = false
-	auth.NextRetryAfter = time.Time{}
+	independentForce := effectiveAuthForceUntil(existing)
+	auth.credQuotaForceUntil = time.Time{}
+	auth.forceCooldownSeeded = true
+	if independentForce.After(now) {
+		auth.forceCooldownUntil = independentForce
+		auth.Unavailable = true
+		auth.NextRetryAfter = independentForce
+		auth.Status = StatusError
+		if isForceCooldownError(existing.LastError) {
+			auth.LastError = cloneError(existing.LastError)
+			auth.StatusMessage = existing.StatusMessage
+		} else {
+			auth.LastError = nil
+			auth.StatusMessage = ErrorCodeForceCooldown
+		}
+	} else {
+		auth.forceCooldownUntil = time.Time{}
+		auth.Status = StatusActive
+		auth.StatusMessage = ""
+		auth.LastError = nil
+		auth.Unavailable = false
+		auth.NextRetryAfter = time.Time{}
+	}
 	if len(auth.ModelStates) > 0 {
 		updateAggregatedAvailability(auth, now)
+		if auth.Unavailable && auth.Status == StatusActive {
+			auth.Status = StatusError
+		}
+	} else if auth.credentialRetryAfter.After(now) {
+		auth.Unavailable = true
+		if auth.NextRetryAfter.Before(auth.credentialRetryAfter) {
+			auth.NextRetryAfter = auth.credentialRetryAfter
+		}
+		auth.Status = StatusError
 	}
-	return true
 }
 
 // isDevinQuotaExhaustionMessage reports whether text is Devin's explicit
@@ -1070,6 +1236,22 @@ func devinRemainingPercent(raw string) (int64, bool) {
 	return value, true
 }
 
+func isUnauthorizedModelState(state *ModelState) bool {
+	if state == nil {
+		return false
+	}
+	if state.LastError != nil {
+		if state.LastError.StatusCode() == http.StatusUnauthorized ||
+			strings.EqualFold(state.LastError.Code, "unauthorized") ||
+			isUnauthorizedError(state.LastError) ||
+			isInvalidGrantResultError(state.LastError) {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(state.StatusMessage), "unauthorized") ||
+		isInvalidGrantErrorMessage(state.StatusMessage)
+}
+
 func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 	if auth == nil || len(auth.ModelStates) == 0 {
 		return nil
@@ -1080,23 +1262,108 @@ func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 		if state == nil {
 			continue
 		}
-		isUnauth := false
-		if state.LastError != nil {
-			if state.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(state.LastError.Code, "unauthorized") || isUnauthorizedError(state.LastError) || isInvalidGrantResultError(state.LastError) {
-				isUnauth = true
-			}
-		}
-		if !isUnauth && (strings.Contains(strings.ToLower(state.StatusMessage), "unauthorized") || isInvalidGrantErrorMessage(state.StatusMessage)) {
-			isUnauth = true
-		}
-		if !isUnauth {
+		isUnauth := isUnauthorizedModelState(state)
+		shadowUnauth := state.credentialQuotaShadow != nil && isUnauthorizedModelState(state.credentialQuotaShadow)
+		if !isUnauth && !shadowUnauth {
 			continue
 		}
 		anyChanged = true
+		if (state.credentialQuotaPropagated || state.Quota.Reason == "credential_quota") &&
+			(!state.Quota.Exceeded || (!state.Quota.NextRecoverAt.IsZero() && !state.Quota.NextRecoverAt.After(now))) {
+			if shadow := state.credentialQuotaShadow; shadow != nil && isModelStateActiveCooldown(shadow, now) {
+				*state = *shadow.cloneShallow()
+				state.UpdatedAt = now
+				isUnauth = isUnauthorizedModelState(state)
+				shadowUnauth = false
+				if !isUnauth {
+					continue
+				}
+			}
+		}
 		if state.Quota.Exceeded && (state.Quota.NextRecoverAt.IsZero() || state.Quota.NextRecoverAt.After(now)) {
+			if shadowUnauth {
+				shadow := state.credentialQuotaShadow
+				shadowHasQuota := shadow.Quota.Exceeded && shadow.Quota.NextRecoverAt.After(now)
+				shadowHasForce := shadow.forceCooldownUntil.After(now)
+				if shadowHasQuota || shadowHasForce {
+					shadow.LastError = nil
+					if strings.Contains(strings.ToLower(shadow.StatusMessage), "unauthorized") || isInvalidGrantErrorMessage(shadow.StatusMessage) {
+						if shadowHasQuota {
+							shadow.StatusMessage = shadow.Quota.Reason
+						} else {
+							shadow.StatusMessage = ErrorCodeForceCooldown
+						}
+					}
+					shadowNext := time.Time{}
+					if shadowHasQuota && shadow.Quota.NextRecoverAt.After(shadowNext) {
+						shadowNext = shadow.Quota.NextRecoverAt
+					}
+					if shadowHasForce && shadow.forceCooldownUntil.After(shadowNext) {
+						shadowNext = shadow.forceCooldownUntil
+					}
+					if shadowHasForce && !shadow.quotaForceCooldownUntil.Equal(shadow.forceCooldownUntil) {
+						shadow.nonQuotaCooldownUntil = shadow.forceCooldownUntil
+						shadow.nonCapacityCooldownUntil = shadow.forceCooldownUntil
+					} else {
+						shadow.nonQuotaCooldownUntil = time.Time{}
+						shadow.nonCapacityCooldownUntil = time.Time{}
+					}
+					shadow.NextRetryAfter = shadowNext
+					shadow.UpdatedAt = now
+				} else {
+					state.credentialQuotaShadow = nil
+				}
+			}
+			if isUnauth {
+				state.LastError = nil
+				if strings.Contains(strings.ToLower(state.StatusMessage), "unauthorized") || isInvalidGrantErrorMessage(state.StatusMessage) {
+					state.StatusMessage = state.Quota.Reason
+				}
+			}
+			if !state.Quota.NextRecoverAt.IsZero() {
+				effectiveNext := state.Quota.NextRecoverAt
+				if state.forceCooldownUntil.After(effectiveNext) {
+					effectiveNext = state.forceCooldownUntil
+				}
+				if (state.credentialQuotaPropagated || state.Quota.Reason == "credential_quota") && auth.credQuotaForceUntil.After(effectiveNext) {
+					effectiveNext = auth.credQuotaForceUntil
+				}
+				nonQuota := time.Time{}
+				nonCapacity := time.Time{}
+				if state.forceCooldownUntil.After(now) && !state.quotaForceCooldownUntil.Equal(state.forceCooldownUntil) {
+					nonQuota = state.forceCooldownUntil
+					nonCapacity = state.forceCooldownUntil
+				}
+				if state.credentialQuotaShadow != nil && isModelStateActiveCooldown(state.credentialQuotaShadow, now) {
+					if state.credentialQuotaShadow.NextRetryAfter.After(effectiveNext) {
+						effectiveNext = state.credentialQuotaShadow.NextRetryAfter
+					}
+					if state.credentialQuotaShadow.nonQuotaCooldownUntil.After(nonQuota) {
+						nonQuota = state.credentialQuotaShadow.nonQuotaCooldownUntil
+					}
+					if state.credentialQuotaShadow.nonCapacityCooldownUntil.After(nonCapacity) {
+						nonCapacity = state.credentialQuotaShadow.nonCapacityCooldownUntil
+					}
+				}
+				state.nonQuotaCooldownUntil = nonQuota
+				state.nonCapacityCooldownUntil = nonCapacity
+				state.NextRetryAfter = effectiveNext
+			}
+			state.UpdatedAt = now
+			continue
+		}
+		if state.forceCooldownUntil.After(now) {
 			state.LastError = nil
 			if strings.Contains(strings.ToLower(state.StatusMessage), "unauthorized") || isInvalidGrantErrorMessage(state.StatusMessage) {
-				state.StatusMessage = state.Quota.Reason
+				state.StatusMessage = ErrorCodeForceCooldown
+			}
+			state.NextRetryAfter = state.forceCooldownUntil
+			if !state.quotaForceCooldownUntil.Equal(state.forceCooldownUntil) {
+				state.nonQuotaCooldownUntil = state.forceCooldownUntil
+				state.nonCapacityCooldownUntil = state.forceCooldownUntil
+			} else {
+				state.nonQuotaCooldownUntil = time.Time{}
+				state.nonCapacityCooldownUntil = time.Time{}
 			}
 			state.UpdatedAt = now
 			continue
@@ -1108,6 +1375,152 @@ func clearUnauthorizedModelStates(auth *Auth, now time.Time) []string {
 		updateAggregatedAvailability(auth, now)
 	}
 	return resumed
+}
+
+// reconcileAuthGrantCooldownAfterRefresh clears refresh-recoverable auth/grant
+// credential cooldowns on auth while preserving any still-active non-auth
+// credential cooldown (such as 403 VALIDATION_REQUIRED) or active quota layer.
+// It reports whether an auth/grant retry layer was cleared.
+func reconcileAuthGrantCooldownAfterRefresh(auth, existing *Auth, preserveNonAuth bool, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	survivingNonAuth := time.Time{}
+	var survivingNonAuthErr *Error
+	if preserveNonAuth {
+		if auth.nonAuthCredentialRetryAfter.After(now) {
+			survivingNonAuth = auth.nonAuthCredentialRetryAfter
+			survivingNonAuthErr = auth.nonAuthCredentialLastError
+		}
+		if existing != nil && existing.nonAuthCredentialRetryAfter.After(survivingNonAuth) && existing.nonAuthCredentialRetryAfter.After(now) {
+			survivingNonAuth = existing.nonAuthCredentialRetryAfter
+			if existing.nonAuthCredentialLastError != nil {
+				survivingNonAuthErr = existing.nonAuthCredentialLastError
+			}
+		} else if existing != nil && survivingNonAuthErr == nil && existing.nonAuthCredentialLastError != nil && survivingNonAuth.After(now) {
+			survivingNonAuthErr = existing.nonAuthCredentialLastError
+		}
+	}
+
+	isAuthOrGrantErr := func(a *Auth, err *Error) bool {
+		if err == nil {
+			return false
+		}
+		return isUnauthorizedError(err) || isInvalidGrantResultError(err) || isTerminalRefreshError(a, err)
+	}
+	isAuthOrGrantFailure := (existing != nil && (hasUnauthorizedAuthFailure(existing) ||
+		existing.RequiresSignIn ||
+		(existing.RefreshError != nil && isTerminalRefreshError(existing, existing.RefreshError)) ||
+		isAuthOrGrantErr(existing, existing.LastError))) ||
+		isAuthOrGrantErr(auth, auth.LastError)
+
+	hadAuthGrantCredRetry := auth.credentialRetryAfter.After(survivingNonAuth) ||
+		(existing != nil && existing.credentialRetryAfter.After(survivingNonAuth))
+
+	if !isAuthOrGrantFailure && !hadAuthGrantCredRetry {
+		if preserveNonAuth && survivingNonAuth.After(now) {
+			if survivingNonAuth.After(auth.credentialRetryAfter) {
+				auth.credentialRetryAfter = survivingNonAuth
+			}
+			auth.nonAuthCredentialRetryAfter = survivingNonAuth
+			if survivingNonAuthErr != nil {
+				auth.nonAuthCredentialLastError = cloneError(survivingNonAuthErr)
+			}
+			if survivingNonAuth.After(auth.nonQuotaCooldownUntil) {
+				auth.nonQuotaCooldownUntil = survivingNonAuth
+			}
+			if existing != nil {
+				if existing.forceCooldownUntil.After(auth.forceCooldownUntil) {
+					auth.forceCooldownUntil = existing.forceCooldownUntil
+				}
+				auth.forceCooldownSeeded = existing.forceCooldownSeeded || auth.forceCooldownSeeded
+				if existing.cooldownRecordedSeq > auth.cooldownRecordedSeq {
+					auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+				}
+				if auth.LastError == nil && existing.LastError != nil {
+					auth.LastError = cloneError(existing.LastError)
+				}
+				if auth.StatusMessage == "" {
+					auth.StatusMessage = existing.StatusMessage
+				}
+				if auth.Status == StatusActive {
+					auth.Status = existing.Status
+				}
+			}
+			updateAggregatedAvailability(auth, now)
+		}
+		return false
+	}
+
+	if preserveNonAuth && existing != nil {
+		if existing.forceCooldownUntil.After(auth.forceCooldownUntil) {
+			auth.forceCooldownUntil = existing.forceCooldownUntil
+		}
+		auth.forceCooldownSeeded = existing.forceCooldownSeeded || auth.forceCooldownSeeded
+		if existing.cooldownRecordedSeq > auth.cooldownRecordedSeq {
+			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
+		}
+	}
+
+	auth.credentialRetryAfter = survivingNonAuth
+	auth.nonAuthCredentialRetryAfter = survivingNonAuth
+	if survivingNonAuth.After(now) {
+		auth.nonAuthCredentialLastError = cloneError(survivingNonAuthErr)
+	} else {
+		auth.nonAuthCredentialLastError = nil
+	}
+
+	survivingNonQuota := survivingNonAuth
+	if preserveNonAuth && auth.forceCooldownUntil.After(survivingNonQuota) && !auth.quotaForceCooldownUntil.Equal(auth.forceCooldownUntil) {
+		survivingNonQuota = auth.forceCooldownUntil
+	}
+	auth.nonQuotaCooldownUntil = survivingNonQuota
+
+	hasActiveQuota := auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now)
+	hasSurvivingCredBlock := survivingNonAuth.After(now) || (preserveNonAuth && effectiveAuthForceUntil(auth).After(now))
+
+	if hasSurvivingCredBlock {
+		if isAuthOrGrantErr(auth, auth.LastError) || auth.LastError == nil {
+			if survivingNonAuthErr != nil {
+				auth.LastError = cloneError(survivingNonAuthErr)
+				auth.StatusMessage = survivingNonAuthErr.Message
+			} else {
+				auth.LastError = nil
+				if hasActiveQuota {
+					auth.StatusMessage = auth.Quota.Reason
+				} else if auth.StatusMessage == "" || strings.Contains(strings.ToLower(auth.StatusMessage), "unauthorized") || isInvalidGrantErrorMessage(auth.StatusMessage) {
+					auth.StatusMessage = "cooldown"
+				}
+			}
+		}
+		auth.Status = StatusError
+		auth.NextRetryAfter = time.Time{}
+		updateAggregatedAvailability(auth, now)
+		return true
+	}
+
+	if hasActiveQuota {
+		auth.Unavailable = true
+		auth.NextRetryAfter = auth.Quota.NextRecoverAt
+		if activeAuthForce := effectiveAuthForceUntil(auth); activeAuthForce.After(auth.NextRetryAfter) {
+			auth.NextRetryAfter = activeAuthForce
+		}
+		auth.LastError = nil
+		auth.StatusMessage = auth.Quota.Reason
+		return true
+	}
+
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.cooldownRecordedSeq = 0
+	if !preserveNonAuth {
+		auth.forceCooldownUntil = time.Time{}
+		auth.quotaForceCooldownUntil = time.Time{}
+	}
+	auth.LastError = nil
+	auth.StatusMessage = ""
+	auth.Status = StatusActive
+	return true
 }
 
 // RefreshHomeSelectionAfterUnauthorized only reuses a newer snapshot already
@@ -1130,19 +1543,25 @@ func (m *Manager) RefreshHomeSelectionAfterUnauthorized(ctx context.Context, sel
 	return current, false, nil
 }
 
+// RefreshAfterUnauthorized refreshes a local credential once after an upstream 401
+// using the same rejection-marking and single-refresh rules as request execution.
+func (m *Manager) RefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool, clientHeaders ...http.Header) (*Auth, bool) {
+	return m.tryRefreshAfterUnauthorized(ctx, auth, execErr, alreadyTried, clientHeaders...)
+}
+
 // tryRefreshAfterUnauthorized refreshes local OAuth credentials once after a
 // 401 so the current auth can be retried before fallback/suspend.
 func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool, clientHeaders ...http.Header) (*Auth, bool) {
 	if m == nil || auth == nil || execErr == nil {
 		return auth, false
 	}
-	// Request-scoped failures describe this request, not stale credentials.
-	// Refreshing would turn a direct error response into an implicit retry.
-	if isRequestScopedError(execErr) || !isUnauthorizedError(execErr) {
+	// Request-scoped and explicit hard-stop failures describe this request, not stale credentials.
+	// Refreshing would turn a direct stop/error response into an implicit retry.
+	if isRequestScopedError(execErr) || isRequestStopError(execErr) || isRequestTerminatedError(execErr) || isTOSViolationError(execErr) || !isUnauthorizedError(execErr) {
 		return auth, false
 	}
 	// A 401 matched by a configured request-scoped rule is the rule's to handle: no rejection, no refresh.
-	if _, ruleMatched := matchRequestScopedErrorAction(auth, execErr, m.runtimeConfigSnapshot()); ruleMatched {
+	if _, ruleMatched := matchRequestScopedErrorAction(auth, execErr, m.requestScopedErrorConfig(ctx)); ruleMatched {
 		return auth, false
 	}
 	failedToken := authAccessTokenForRequest(ctx, auth, clientHeaders...)
@@ -1228,6 +1647,7 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 		current.Generation++
 		current.UpdatedAt = time.Now()
 		m.auths[id] = current
+		m.notifyAuthChangeLocked(id)
 		if m.scheduler != nil {
 			m.scheduler.upsertAuth(current.Clone())
 		}
@@ -1235,10 +1655,21 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 	m.mu.Unlock()
 }
 
+var (
+	errVerifyCredentialRemoved    = errors.New("credential removed before or during refresh")
+	errVerifyCredentialSuperseded = errors.New("credential superseded before or during refresh")
+)
+
 func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAccessToken string, registrationEpoch uint64) (*Auth, error) {
+	return m.refreshAuthForRequestAtVersion(ctx, id, failedAccessToken, registrationEpoch, 0)
+}
+
+func (m *Manager) refreshAuthForRequestAtVersion(ctx context.Context, id, failedAccessToken string, registrationEpoch, credentialVersion uint64) (*Auth, error) {
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
 	}
+	var onPersistDone func()
+	ctx, onPersistDone = detachAutoRefreshPersistDone(ctx)
 	forceRefresh := isForceRefreshContext(ctx)
 	ctx = cliproxyexecutor.WithoutRequestProxyURL(ctx)
 	if ctx == nil {
@@ -1251,18 +1682,15 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if id == "" {
 		return nil, errors.New("auth id is empty")
 	}
-	if failedAccessToken != "" {
+	if credentialVersion == 0 && failedAccessToken != "" {
 		m.markRejectedAccessToken(id, failedAccessToken)
 	}
 
-	lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
-	lock, _ := lockValue.(*authRefreshLock)
-	if lock == nil {
-		lock = &authRefreshLock{}
-		m.refreshLocks.Store(id, lock)
+	releaseRefresh, errLock := m.lockRefreshContext(ctx, id)
+	if errLock != nil {
+		return nil, errLock
 	}
-	lock.mu.Lock()
-	defer lock.mu.Unlock()
+	defer releaseRefresh()
 
 	m.mu.RLock()
 	auth := m.auths[id].Clone()
@@ -1274,7 +1702,13 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		exec, _ = m.executorLocked(executorKeyFromAuth(auth))
 	}
 	m.mu.RUnlock()
-	if auth == nil || exec == nil {
+	if auth == nil {
+		if credentialVersion != 0 {
+			return nil, errVerifyCredentialRemoved
+		}
+		return nil, errors.New("auth or executor not found")
+	}
+	if exec == nil {
 		return nil, errors.New("auth or executor not found")
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
@@ -1291,7 +1725,16 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		}
 	}
 	if registrationEpoch != 0 && auth.RegistrationEpoch != registrationEpoch {
+		if credentialVersion != 0 {
+			return nil, errVerifyCredentialSuperseded
+		}
 		return nil, errors.New("auth registration changed before refresh")
+	}
+	if credentialVersion != 0 && auth.CredentialVersion != credentialVersion {
+		return nil, errVerifyCredentialSuperseded
+	}
+	if credentialVersion != 0 && failedAccessToken != "" {
+		m.markRejectedAccessToken(id, failedAccessToken)
 	}
 	if hasDisabledInvalidGrantFailure(auth) && !forceRefresh {
 		return nil, errors.New("auth is disabled with invalid grant")
@@ -1377,8 +1820,13 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			current.LastError = refreshAccessError(current, msg, accessTokenRejected, wasTerminalUnauthorized)
 			if current.LastError.Code == "refresh_outcome_unknown" {
 				current.StatusMessage = current.LastError.Message
+				if current.Status != StatusDisabled {
+					// Job completion reschedules this recovery state, so retain a positive delay.
+					current.NextRefreshAfter = checkNow.Add(refreshCheckInterval)
+				}
 			}
 			m.auths[id] = current
+			m.notifyAuthChangeLocked(id)
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
@@ -1393,13 +1841,39 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())
+	if credentialVersion != 0 && err != nil && ctx != nil && ctx.Err() != nil && !codex.IsRefreshOutcomeUnknown(err) {
+		return nil, ctx.Err()
+	}
 	now := time.Now()
-	if err != nil && errors.Is(err, context.Canceled) && !codex.IsRefreshOutcomeUnknown(err) {
+	isRefreshDeferred := errors.Is(err, baseauth.ErrRefreshDeferred) || errors.Is(err, codex.ErrSIWCRefreshDeferred)
+	refreshCanceled := (errors.Is(err, context.Canceled) || isRefreshDeferred) && !codex.IsRefreshOutcomeUnknown(err)
+	if refreshCanceled {
+		var partitions interface {
+			OuterRefreshError() error
+			SIWCRefreshError() error
+		}
+		if errors.As(err, &partitions) {
+			for _, partitionErr := range []error{partitions.OuterRefreshError(), partitions.SIWCRefreshError()} {
+				if partitionErr != nil && !errors.Is(partitionErr, context.Canceled) && !errors.Is(partitionErr, baseauth.ErrRefreshDeferred) && !errors.Is(partitionErr, codex.ErrSIWCRefreshDeferred) {
+					refreshCanceled = false
+					break
+				}
+			}
+		}
+	}
+	if refreshCanceled {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
+		backoff := time.Second
+		if isRefreshDeferred {
+			backoff = refreshCheckInterval
+		}
+		retryAfter := now.Add(backoff)
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
-				current.NextRefreshAfter = now.Add(time.Second)
+			pendingJob := m.refreshJobs[id]
+			isJobPending := pendingJob != nil && current.NextRefreshAfter.Equal(pendingJob.pendingUntil)
+			if isJobPending || current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(retryAfter) {
+				current.NextRefreshAfter = retryAfter
 			}
 			m.auths[id] = current
 			if m.scheduler != nil {
@@ -1439,6 +1913,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		if current := m.auths[id]; current != nil {
 			if base != nil && (current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion || secretGrantChanged(base, current)) {
 				m.mu.Unlock()
+				if credentialVersion != 0 {
+					return nil, errVerifyCredentialSuperseded
+				}
 				return nil, err
 			}
 			if hasUnauthorizedAuthFailure(current) && !forceRefresh {
@@ -1466,6 +1943,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 					current.StatusMessage = "unauthorized (refresh token invalid)"
 				}
 				m.auths[id] = current
+				m.notifyAuthChangeLocked(id)
 				if m.scheduler != nil {
 					m.scheduler.upsertAuth(current.Clone())
 				}
@@ -1625,6 +2103,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				}
 			}
 			m.auths[id] = current
+			if shouldUnschedule || hasUnauthorizedAuthFailure(current) {
+				m.notifyAuthChangeLocked(id)
+			}
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
@@ -1656,14 +2137,20 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	applyPreservedRejectedTokens(base, updated, true)
 	canServeWithAccessToken := !updated.RequiresSignIn || updated.HasValidAccessToken(now)
 	if canServeWithAccessToken && (updated.RejectedAccessToken == "" || authAccessToken(updated) != updated.RejectedAccessToken) {
-		updated.LastError = nil
-		updated.StatusMessage = ""
-		updated.Unavailable = false
 		updated.RefreshFailures = 0
-		if updated.Status == StatusError || updated.Status == "" {
-			updated.Status = StatusActive
+		cleared := reconcileAuthGrantCooldownAfterRefresh(updated, base, true, now)
+		if !cleared && !updated.credentialRetryAfter.After(now) && !effectiveAuthForceUntil(updated).After(now) && !(updated.Quota.Exceeded && updated.Quota.NextRecoverAt.After(now)) {
+			updated.LastError = nil
+			updated.StatusMessage = ""
+			updated.Unavailable = false
+			if updated.Status == StatusError || updated.Status == "" {
+				updated.Status = StatusActive
+			}
 		}
 		_ = clearUnauthorizedModelStates(updated, now)
+		if updated.credentialRetryAfter.After(now) || effectiveAuthForceUntil(updated).After(now) {
+			updateAggregatedAvailability(updated, now)
+		}
 	} else if !canServeWithAccessToken && !updated.Disabled && updated.Status != StatusDisabled {
 		updated.Unavailable = true
 		updated.Status = StatusError
@@ -1683,14 +2170,27 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	}
 	// A successful refresh may have rotated upstream tokens after cancellation.
 	// Commit its result with context values intact; keep epoch checks and save ordering.
-	saved, errUpdate := m.UpdateRefreshedAuth(context.WithoutCancel(ctx), base, updated)
+	commitCtx := context.WithoutCancel(ctx)
+	if onPersistDone != nil {
+		commitCtx = withAutoRefreshPersistDone(commitCtx, onPersistDone)
+	}
+	saved, committed, baseSuperseded, errUpdate := m.updateRefreshedAuthWithStatus(commitCtx, base, updated)
 	if errUpdate != nil {
 		// Warn, not debug: a restart after a lost persist fails with invalid_grant.
 		log.WithFields(log.Fields{"auth_id": auth.ID, "credential": auth.ID, "provider": auth.Provider}).Warnf("persist refreshed auth %s (%s) failed: %v", auth.Provider, auth.ID, errUpdate)
+		if credentialVersion != 0 && strings.Contains(errUpdate.Error(), "stale registration epoch") {
+			return nil, errVerifyCredentialSuperseded
+		}
 		return nil, errUpdate
 	}
 	if saved == nil {
+		if credentialVersion != 0 {
+			return nil, errVerifyCredentialRemoved
+		}
 		return nil, fmt.Errorf("auth %s not found", id)
+	}
+	if credentialVersion != 0 && (!committed || baseSuperseded) {
+		return nil, errVerifyCredentialSuperseded
 	}
 	targetAuth := saved
 	supportedModels, regEpoch := registry.GetGlobalRegistry().GetModelsAndEpochForClient(id)

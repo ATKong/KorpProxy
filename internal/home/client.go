@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -19,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/maintnotifications"
@@ -190,6 +190,7 @@ type Client struct {
 	// releaseReady belongs to this acknowledged membership and is never copied to a replacement.
 	releaseReady bool
 
+	schedulerProtocol atomic.Int64
 	heartbeatOK       atomic.Bool
 	dispatchFenced    atomic.Bool
 	releaseFenced     atomic.Bool
@@ -1007,6 +1008,9 @@ func (c *Client) GetConfig(ctx context.Context) ([]byte, error) {
 	if len(raw) == 0 {
 		return nil, ErrEmptyResponse
 	}
+	if errDecode := c.updateSchedulerProtocol(raw); errDecode != nil {
+		return nil, errDecode
+	}
 	return raw, nil
 }
 
@@ -1035,6 +1039,32 @@ func (c *Client) GetModels(ctx context.Context, headers http.Header, query url.V
 		return nil, ErrEmptyResponse
 	}
 	return raw, nil
+}
+
+func (c *Client) AuthorizeLocalExecutor(ctx context.Context, model string, headers http.Header, query url.Values) (LocalExecutorDecision, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return LocalExecutorDecision{}, errClient
+	}
+	request, errMarshal := json.Marshal(modelsRequest{
+		Type: "local-plugin-dispatch", Model: model,
+		Headers: headersToLowerMap(headers), Query: queryToLowerMap(query),
+	})
+	if errMarshal != nil {
+		return LocalExecutorDecision{}, errMarshal
+	}
+	raw, errGet := cmd.Get(ctx, string(request)).Bytes()
+	if errGet != nil {
+		return LocalExecutorDecision{}, errGet
+	}
+	if c.dispatchFenced.Load() {
+		return LocalExecutorDecision{}, ErrDispatchFenced
+	}
+	var decision LocalExecutorDecision
+	if errDecode := json.Unmarshal(raw, &decision); errDecode != nil {
+		return LocalExecutorDecision{}, errDecode
+	}
+	return decision, nil
 }
 
 func buildKVSetArgs(key string, value []byte, opts KVSetOptions) ([]any, error) {
@@ -1386,6 +1416,10 @@ func (c *Client) rPopAuth(ctx context.Context, requestedModel string, sessionID 
 	} else {
 		req = newAuthDispatchRequestWithRetryRound(requestedModel, sessionID, parentSessionID, headers, count, credentialPolicy, *retryRound, excludedAuthIDs, pinnedAuthID)
 	}
+	if input, ok := ctx.Value(schedulerContextKey{}).(SchedulerContext); ok {
+		req.SchedulerContext = &input
+	}
+	req.ExecutorPlugins, _ = ctx.Value(executorPluginsContextKey{}).(map[string][]string)
 	keyBytes, errMarshal := json.Marshal(&req)
 	if errMarshal != nil {
 		return nil, errMarshal
@@ -1948,10 +1982,12 @@ func (c *Client) handleSubscriptionPayload(ctx context.Context, channel string, 
 
 	switch strings.ToLower(strings.TrimSpace(channel)) {
 	case redisChannelConfig:
-		if onConfig == nil {
-			return nil
+		if onConfig != nil {
+			if errApply := onConfig([]byte(payload)); errApply != nil {
+				return errApply
+			}
 		}
-		return onConfig([]byte(payload))
+		return c.updateSchedulerProtocol([]byte(payload))
 	case redisChannelCluster:
 		if errUpdate := c.updateClusterNodesFromPayload([]byte(payload)); errUpdate != nil {
 			return errUpdate
@@ -2018,6 +2054,7 @@ func (c *Client) RunConfigSubscriberLifetime(ctx context.Context, onConfig func(
 		}
 		return c.endConfigSubscriberLifetimeWithSubscription(errACK, pubsub, "failed ACK")
 	}
+	heartbeatStarted := time.Now()
 	// A protocol-one ACK means Home already committed this membership. Preserve it if the command probe fails.
 	if len(args) > 1 {
 		c.markMembershipTakeoverEligible()
@@ -2065,10 +2102,16 @@ func (c *Client) RunConfigSubscriberLifetime(ctx context.Context, onConfig func(
 	}()
 	go func() {
 		defer close(receiveDone)
+		lastHeartbeat := heartbeatStarted
 		for {
 			_, timeout := c.subscriptionParameters()
-			event, errReceive := receiveSubscriptionEvent(receiveCtx, pubsub, sampler, timeout)
+			event, errReceive := receiveSubscriptionEvent(receiveCtx, pubsub, sampler, lastHeartbeat.Add(timeout))
 			if errReceive == nil {
+				// Only a persisted heartbeat PONG renews liveness. Config, cluster traffic,
+				// and RTT echoes cannot extend the deadline while the consumer is busy.
+				if pong, ok := event.(*redis.Pong); ok && pong != nil && pong.Payload == "" {
+					lastHeartbeat = time.Now()
+				}
 				select {
 				case events <- event:
 					continue
@@ -2144,16 +2187,17 @@ func (c *Client) RunConfigSubscriberLifetime(ctx context.Context, onConfig func(
 				log.Warn("failed to apply config update from home control center, ignoring")
 			}
 		case *redis.Pong:
-			c.resetReconnectFailures()
+			if msg != nil && msg.Payload == "" {
+				c.resetReconnectFailures()
+			}
 		default:
 			log.Debugf("home subscription returned unsupported message type %T", event)
 		}
 	}
 }
 
-// receiveSubscriptionEvent consumes telemetry without extending the heartbeat deadline.
-func receiveSubscriptionEvent(ctx context.Context, pubsub *redis.PubSub, sampler *clusterRTTSampler, timeout time.Duration) (any, error) {
-	deadline := time.Now().Add(timeout)
+// receiveSubscriptionEvent preserves the absolute heartbeat deadline across ordinary messages.
+func receiveSubscriptionEvent(ctx context.Context, pubsub *redis.PubSub, sampler *clusterRTTSampler, deadline time.Time) (any, error) {
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -2162,6 +2206,9 @@ func receiveSubscriptionEvent(ctx context.Context, pubsub *redis.PubSub, sampler
 		event, errReceive := pubsub.ReceiveTimeout(ctx, remaining)
 		if errReceive != nil {
 			return nil, errReceive
+		}
+		if !time.Now().Before(deadline) {
+			return nil, os.ErrDeadlineExceeded
 		}
 		if _, ok := event.(*redis.Subscription); ok {
 			return nil, fmt.Errorf("unexpected Home subscription ACK after initialization")

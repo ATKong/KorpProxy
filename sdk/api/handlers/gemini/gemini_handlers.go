@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
@@ -19,6 +21,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 )
+
+// geminiSSEKeepAliveFrame is an empty SSE frame used for Gemini SSE heartbeats.
+// google.golang.org/genai's iterateResponseStream skips empty frames but rejects
+// SSE comment lines (": keep-alive") with "invalid stream chunk".
+var geminiSSEKeepAliveFrame = []byte("\n\n")
 
 // GeminiAPIHandler contains the handlers for Gemini API endpoints.
 // It holds a pool of clients to interact with the backend service.
@@ -140,8 +147,9 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		})
 		return
 	}
-	action := strings.Split(strings.TrimPrefix(request.Action, "/"), ":")
-	if len(action) != 2 {
+	trimmedAction := strings.TrimPrefix(request.Action, "/")
+	colonIdx := strings.LastIndex(trimmedAction, ":")
+	if colonIdx <= 0 || colonIdx == len(trimmedAction)-1 {
 		c.JSON(http.StatusNotFound, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("%s not found.", c.Request.URL.Path),
@@ -151,7 +159,8 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 		return
 	}
 
-	method := action[1]
+	modelName := trimmedAction[:colonIdx]
+	method := trimmedAction[colonIdx+1:]
 	rawJSON, errRead := c.GetRawData()
 	if errRead != nil && c.Request != nil && c.Request.Body != nil {
 		c.JSON(clienterror.HTTPStatusFromErrorOr(errRead, http.StatusBadRequest), handlers.ErrorResponse{
@@ -165,11 +174,18 @@ func (h *GeminiAPIHandler) GeminiHandler(c *gin.Context) {
 
 	switch method {
 	case "generateContent":
-		h.handleGenerateContent(c, action[0], rawJSON)
+		h.handleGenerateContent(c, modelName, rawJSON)
 	case "streamGenerateContent":
-		h.handleStreamGenerateContent(c, action[0], rawJSON)
+		h.handleStreamGenerateContent(c, modelName, rawJSON)
 	case "countTokens":
-		h.handleCountTokens(c, action[0], rawJSON)
+		h.handleCountTokens(c, modelName, rawJSON)
+	default:
+		c.JSON(http.StatusNotFound, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Unsupported method: %s", method),
+				Type:    "invalid_request_error",
+			},
+		})
 	}
 }
 
@@ -218,7 +234,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 	writeKeepAlive := func() bool {
 		commitHeaders()
-		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+		_, _ = c.Writer.Write(geminiSSEKeepAliveFrame)
 		flusher.Flush()
 		return true
 	}
@@ -236,6 +252,8 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		return
 	}
 	upstreamHeaders = resolvedHeaders
+	waitKeepAliveC, canWriteWaitKeepAlive, stopWaitKeepAlive := h.StartContinuityWaitKeepAliveForPeek(c, keepAliveC)
+	defer stopWaitKeepAlive()
 
 	// Peek at the first chunk
 	for {
@@ -251,6 +269,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			}
 			if committed {
 				stopKeepAlive()
+				stopWaitKeepAlive()
 				pendingErrors := make(chan *interfaces.ErrorMessage, 1)
 				pendingErrors <- errMsg
 				close(pendingErrors)
@@ -268,6 +287,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		case chunk, ok := <-dataChan:
 			if !ok {
 				stopKeepAlive()
+				stopWaitKeepAlive()
 				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
 					if committed {
 						pendingErrors := make(chan *interfaces.ErrorMessage, 1)
@@ -293,6 +313,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 
 			// Success! Set headers.
 			stopKeepAlive()
+			stopWaitKeepAlive()
 			commitHeaders()
 
 			// Write first chunk
@@ -308,8 +329,14 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			// Continue
 			h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
+		case <-waitKeepAliveC:
+			if canWriteWaitKeepAlive() && !writeKeepAlive() {
+				return
+			}
 		case <-keepAliveC:
-			writeKeepAlive()
+			if !writeKeepAlive() {
+				return
+			}
 		}
 	}
 }
@@ -371,6 +398,11 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		KeepAliveInterval: keepAliveInterval,
+		WriteKeepAlive: func() {
+			if alt == "" {
+				_, _ = c.Writer.Write(geminiSSEKeepAliveFrame)
+			}
+		},
 		WriteChunk: func(chunk []byte) {
 			if alt == "" {
 				_, _ = c.Writer.Write([]byte("data: "))
@@ -393,12 +425,131 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 			if errMsg.Error != nil && errMsg.Error.Error() != "" {
 				errText = errMsg.Error.Error()
 			}
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := buildGeminiErrorResponseBody(status, errText)
 			if alt == "" {
-				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+				// Emit a raw Google APIError JSON frame without "event: error" or "data:"
+				// wrapping so google.golang.org/genai's iterateResponseStream decodes it
+				// as *genai.APIError in its default branch across all SDK versions.
+				_, _ = fmt.Fprintf(c.Writer, "%s\n\n", string(body))
 			} else {
 				_, _ = c.Writer.Write(body)
 			}
 		},
 	})
+}
+
+type geminiErrorResponse struct {
+	Error *geminiErrorDetail `json:"error"`
+}
+
+type geminiErrorDetail struct {
+	Code    int              `json:"code"`
+	Message string           `json:"message"`
+	Status  string           `json:"status"`
+	Details []map[string]any `json:"details,omitempty"`
+}
+
+func geminiRPCStatusFromHTTPStatus(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return "DEADLINE_EXCEEDED"
+	case http.StatusConflict:
+		return "ABORTED"
+	case http.StatusTooManyRequests:
+		return "RESOURCE_EXHAUSTED"
+	case 499:
+		return "CANCELLED"
+	case http.StatusNotImplemented:
+		return "UNIMPLEMENTED"
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		return "UNAVAILABLE"
+	default:
+		if status >= http.StatusInternalServerError {
+			return "INTERNAL"
+		}
+		if status >= http.StatusBadRequest {
+			return "INVALID_ARGUMENT"
+		}
+		return "UNKNOWN"
+	}
+}
+
+func extractGeminiErrorMessage(raw, fallback string) string {
+	if !ojson.Valid(raw) {
+		return fallback
+	}
+	root := ojson.Parse(raw)
+	for _, path := range []string{"error.message", "0.error.message", "message"} {
+		res := root.Get(path)
+		if res.Type == ojson.String {
+			if msg := strings.TrimSpace(res.String()); msg != "" {
+				return msg
+			}
+		}
+	}
+	return fallback
+}
+
+// buildGeminiErrorResponseBody builds a compact single-line Google RPC error
+// JSON body compatible with google.golang.org/genai's APIError struct.
+func buildGeminiErrorResponseBody(status int, errText string) []byte {
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	trimmed := strings.TrimSpace(errText)
+	if trimmed == "" {
+		trimmed = http.StatusText(status)
+	}
+
+	if trimmed != "" && ojson.Valid(trimmed) {
+		var existing geminiErrorResponse
+		if errUnmarshal := json.Unmarshal([]byte(trimmed), &existing); errUnmarshal == nil && existing.Error != nil && existing.Error.Code > 0 {
+			if strings.TrimSpace(existing.Error.Status) == "" {
+				existing.Error.Status = geminiRPCStatusFromHTTPStatus(existing.Error.Code)
+			}
+			if strings.TrimSpace(existing.Error.Message) == "" {
+				existing.Error.Message = http.StatusText(existing.Error.Code)
+			}
+			if payload, errMarshal := json.Marshal(existing); errMarshal == nil {
+				return payload
+			}
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			var existingList []geminiErrorResponse
+			if errUnmarshal := json.Unmarshal([]byte(trimmed), &existingList); errUnmarshal == nil && len(existingList) > 0 && existingList[0].Error != nil && existingList[0].Error.Code > 0 {
+				entry := existingList[0]
+				if strings.TrimSpace(entry.Error.Status) == "" {
+					entry.Error.Status = geminiRPCStatusFromHTTPStatus(entry.Error.Code)
+				}
+				if strings.TrimSpace(entry.Error.Message) == "" {
+					entry.Error.Message = http.StatusText(entry.Error.Code)
+				}
+				if payload, errMarshal := json.Marshal(entry); errMarshal == nil {
+					return payload
+				}
+			}
+		}
+	}
+
+	message := extractGeminiErrorMessage(trimmed, trimmed)
+	rpcStatus := geminiRPCStatusFromHTTPStatus(status)
+	payload, errMarshal := json.Marshal(geminiErrorResponse{
+		Error: &geminiErrorDetail{
+			Code:    status,
+			Message: message,
+			Status:  rpcStatus,
+		},
+	})
+	if errMarshal != nil {
+		return []byte(fmt.Sprintf(`{"error":{"code":%d,"message":%q,"status":%q}}`, status, message, rpcStatus))
+	}
+	return payload
 }

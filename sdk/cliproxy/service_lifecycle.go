@@ -108,6 +108,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if !homeEnabled {
+		s.startCopilotCatalogRefresh(ctx)
 		tokenResult, err := s.tokenProvider.Load(ctx, cfg)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
@@ -261,17 +262,45 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var refreshErr error
+	if s.coreManager != nil {
+		s.shutdownRefreshWaiters.Add(1)
+		errStopRefresh := s.coreManager.StopAutoRefreshContext(ctx)
+		if errStopRefresh != nil {
+			log.Errorf("failed to stop auth auto-refresh: %v", errStopRefresh)
+			refreshErr = errStopRefresh
+			if s.shutdownRefreshWaiters.Add(-1) > 0 || !s.shutdownCleanupStarted.CompareAndSwap(false, true) {
+				return refreshErr
+			}
+		} else {
+			s.shutdownRefreshWaiters.Add(-1)
+		}
+	}
+
 	var shutdownErr error
 	s.shutdownOnce.Do(func() {
-		if ctx == nil {
-			ctx = context.Background()
-		}
+		s.shutdownCleanupStarted.Store(true)
 
 		s.homeMu.Lock()
 		runCancel := s.runCancel
 		s.homeMu.Unlock()
 		if runCancel != nil {
 			runCancel()
+		}
+		s.cfgMu.RLock()
+		catalogs := s.copilotCatalogs
+		s.cfgMu.RUnlock()
+		if catalogs != nil {
+			catalogs.cancel()
+			select {
+			case <-catalogs.done:
+			case <-ctx.Done():
+				shutdownErr = ctx.Err()
+			}
 		}
 
 		s.homeLifecycleMu.Lock()
@@ -328,13 +357,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if watcherCancel != nil {
 			watcherCancel()
 		}
-		if s.coreManager != nil {
-			s.coreManager.StopAutoRefresh()
-		}
 		if watcher := s.currentWatcher(); watcher != nil {
 			if err := watcher.Stop(); err != nil {
 				log.Errorf("failed to stop file watcher: %v", err)
-				shutdownErr = err
+				shutdownErr = errors.Join(shutdownErr, err)
 			}
 		}
 		if s.wsGateway != nil {
@@ -403,7 +429,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
 		usage.StopDefault()
 	})
-	return shutdownErr
+	return errors.Join(refreshErr, shutdownErr)
 }
 
 func (s *Service) ensureAuthDir() error {
@@ -440,4 +466,13 @@ func (s *Service) startModelCatalogUpdaters(ctx context.Context) {
 		proxyURL = cfg.ProxyURL
 	}
 	executor.StartXAIVersionUpdater(ctx, proxyURL)
+	sdkAuth.StartAntigravityVersionUpdaterWithProxyProvider(ctx, s.antigravityVersionProxyURL)
+}
+
+func (s *Service) antigravityVersionProxyURL() string {
+	cfg := s.currentConfig()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.ProxyURL
 }

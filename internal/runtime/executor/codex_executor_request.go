@@ -72,6 +72,17 @@ func translateCodexRequestPairWithUpdateIntentContext(ctx context.Context, from,
 // Codex backend accepts; smaller integers are rejected with invalid_request_error.
 const codexMinOutputTokens = 16
 
+// shouldPreserveFullCodexOpenAIInclude reports whether the target Codex upstream
+// is a non-ChatGPT OpenAI Responses API endpoint (SIWC or custom codex-api-key)
+// that should preserve the full official OpenAI ResponseIncludable set in
+// addition to Codex's opt-in output.encrypted_content.
+func shouldPreserveFullCodexOpenAIInclude(ctx context.Context, auth *cliproxyauth.Auth, baseURL string, headers http.Header) bool {
+	if !codexUseSIWCForRequest(ctx, auth, headers) && !codexAuthUsesAPIKey(auth) {
+		return false
+	}
+	return !helps.IsChatGPTCodexBackendBaseURL(baseURL)
+}
+
 // normalizeCodexOutputBudgetDoc raises small positive integer output budgets to the
 // Codex minimum. It judges the translated payload (max_output_tokens) rather than the
 // client payload so every source format and budget field (max_tokens,
@@ -195,6 +206,9 @@ func (e *CodexExecutor) cacheHelperDoc(ctx context.Context, from sdktranslator.F
 	var rawJSON []byte
 	if doc != nil {
 		rawJSON = doc.Bytes()
+	}
+	if errMarker := helps.ValidateCodexSessionInstructionMarker(rawJSON, from); errMarker != nil {
+		return nil, nil, errMarker
 	}
 	wireBody := rawJSON
 	if e.cfg != nil && e.cfg.Codex.UpstreamRequestCompression && auth != nil &&
@@ -808,27 +822,59 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 	return doc.Bytes()
 }
 
-func ensureImageGenerationToolDoc(doc *ojson.Doc, baseModel string, auth *cliproxyauth.Auth, headers http.Header) bool {
-	if doc == nil || isCodexResponsesLiteRequestDoc(doc, headers) || isCodexResponsesLiteModel(baseModel) {
-		return false
-	}
-	if strings.HasSuffix(baseModel, "spark") {
-		return false
-	}
-	if isCodexFreePlanAuth(auth) {
-		return false
-	}
+func codexRequestHasReasoningForHostedImageDoc(doc *ojson.Doc, model string) bool {
+	return helps.CodexRequestHasReasoningForHostedImageDoc(doc, model)
+}
 
+func isCodexResponsesLiteRequestForAuthDoc(doc *ojson.Doc, modelName string, auth *cliproxyauth.Auth, headers http.Header) bool {
+	return helps.CodexResponsesLiteRequestForAuthDoc(doc, modelName, auth, headers)
+}
+
+func codexToolsAlreadyContainImageGenDoc(doc *ojson.Doc) bool {
+	if doc == nil {
+		return false
+	}
+	tools := doc.Get("tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return false
+	}
+	for _, t := range tools.Array() {
+		if t.Get("type").String() == "image_generation" || isImageGenerationFunctionTool(t) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendImageGenerationToolDoc(doc *ojson.Doc) bool {
+	if doc == nil {
+		return false
+	}
 	tools := doc.Get("tools")
 	if !tools.Exists() || !tools.IsArray() {
 		return doc.SetRawBytes("tools", imageGenToolArrayJSON) == nil
 	}
-	for _, t := range tools.Array() {
-		if t.Get("type").String() == "image_generation" || isImageGenerationFunctionTool(t) {
-			return false
-		}
-	}
 	return doc.SetRawBytes("tools.-1", imageGenToolJSON) == nil
+}
+
+func ensureImageGenerationToolDoc(doc *ojson.Doc, baseModel string, auth *cliproxyauth.Auth, headers http.Header) bool {
+	if doc == nil || isCodexFreePlanAuth(auth) || codexToolsAlreadyContainImageGenDoc(doc) {
+		return false
+	}
+	modelName := strings.TrimSpace(thinking.ParseSuffix(baseModel).ModelName)
+	if modelName == "" {
+		modelName = strings.TrimSpace(thinking.ParseSuffix(doc.Get("model").String()).ModelName)
+	}
+	if isCodexResponsesLiteRequestForAuthDoc(doc, modelName, auth, headers) {
+		return false
+	}
+	if isCodexResponsesLiteModel(modelName) && codexRequestHasReasoningForHostedImageDoc(doc, baseModel) {
+		return false
+	}
+	if strings.HasSuffix(strings.ToLower(modelName), "spark") {
+		return false
+	}
+	return appendImageGenerationToolDoc(doc)
 }
 
 func resolveCodexGPTImage2BaseModel(cfg *config.Config) string {
